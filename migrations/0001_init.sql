@@ -228,6 +228,7 @@ CREATE TABLE jobs (
   attempts    INTEGER NOT NULL DEFAULT 0,
   last_error  TEXT,
   run_after   TEXT,                              -- backoff scheduling
+  claimed_at  TEXT,                              -- set on claim; lease for stuck-job reclaim
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX idx_jobs_status ON jobs(status, run_after);

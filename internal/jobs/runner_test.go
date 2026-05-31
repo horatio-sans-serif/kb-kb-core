@@ -126,6 +126,72 @@ func TestRunner_ExhaustsRetriesThenFails(t *testing.T) {
 	}
 }
 
+func TestRunner_MaxAttemptsOne_RunsExactlyOnce(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	r := NewRunner(st, WithMaxAttempts(1), WithBackoff(func(int) time.Duration { return 0 }))
+	calls := 0
+	r.Handle("bad", func(context.Context, store.Job) error {
+		calls++
+		return errors.New("nope")
+	})
+
+	id, err := st.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "bad"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := r.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	job, err := st.Jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("handler called %d times, want exactly 1 (no off-by-one)", calls)
+	}
+	if job.Status != "failed" || job.Attempts != 1 {
+		t.Errorf("job status=%q attempts=%d, want failed/1", job.Status, job.Attempts)
+	}
+}
+
+func TestRunner_CascadeFailsDependents(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	r := NewRunner(st, WithMaxAttempts(1), WithBackoff(func(int) time.Duration { return 0 }))
+	r.Handle("a", func(context.Context, store.Job) error { return errors.New("boom") })
+	bRan := false
+	r.Handle("b", func(context.Context, store.Job) error { bRan = true; return nil })
+
+	a, err := st.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "a"})
+	if err != nil {
+		t.Fatalf("enqueue a: %v", err)
+	}
+	b, err := st.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "b", DependsOn: []string{a}})
+	if err != nil {
+		t.Fatalf("enqueue b: %v", err)
+	}
+
+	if _, err := r.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	ja, _ := st.Jobs.Get(ctx, a)
+	jb, _ := st.Jobs.Get(ctx, b)
+	if ja.Status != "failed" {
+		t.Errorf("a status = %q, want failed", ja.Status)
+	}
+	if jb.Status != "failed" {
+		t.Errorf("b status = %q, want failed (cascade)", jb.Status)
+	}
+	if bRan {
+		t.Error("b's handler ran, but it should have been cascade-failed without running")
+	}
+}
+
 func TestRunner_UnknownTypeFails(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()

@@ -198,6 +198,29 @@ Deferred: the separate read-only connection pool moves to Stage 5, where the
 HTTP API first introduces concurrent reads; the Stage 3 runner drains
 single-threaded on the one writer, so it is not needed yet.
 
+Review fixes applied (24 tests total under `-race`):
+
+- **Dependency stranding (major):** `MarkFailed` now cascade-fails pending
+  dependents to a fixpoint, so a broken stage doesn't silently freeze its
+  downstream subtree (`TestJobs_CascadeFailOnDependencyFailure`,
+  `TestRunner_CascadeFailsDependents`). `Blocked()` surfaces jobs stranded on a
+  missing dependency id (`TestJobs_Blocked`) for Stage 4 to emit as events.
+- **Claim lease (major):** added a `claimed_at` column, stamped on claim;
+  `ReclaimStuck(olderThan)` reclaims only leases at/before a cutoff
+  (`TestJobs_ReclaimByLease`). Startup still reclaims all; a `TODO(Stage 5)` marks
+  the switch to a lease cutoff for the continuous runner.
+- **Drain resilience (major):** a per-job infra error is recorded (joined) and
+  draining continues; only a claim error (likely persistent) stops it. Handler
+  errors are wrapped into the infra error so they're never lost.
+- **Status-guarded transitions (minor):** `MarkDone`/`Reschedule`/`MarkFailed` are
+  scoped to `status='running'`, so a terminal job can't be resurrected by a
+  lost-claim race.
+- Single shared timestamp formatter (`tsFormat`); `ExpBackoff` guards `base<=0`
+  and `max<base`; `Handle` panics on duplicate registration.
+- Coverage: concurrent claim has no double-dispatch over an 8-connection pool
+  (`TestJobs_ConcurrentClaim_NoDoubleDispatch`, `-race`); `maxAttempts=1` runs a
+  handler exactly once (`TestRunner_MaxAttemptsOne_RunsExactlyOnce`).
+
 ---
 
 ## Stage 4: Event bus + SSE

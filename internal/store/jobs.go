@@ -34,6 +34,8 @@ type EnqueueSpec struct {
 
 type JobRepo struct{ q Querier }
 
+// jobCols is the column list for SELECT/RETURNING; scanJob depends on this exact
+// order. claimed_at is intentionally omitted — it is internal lease state.
 const jobCols = `id, type, artifact_id, depends_on, payload, status, attempts, last_error, run_after, created_at`
 
 // Enqueue inserts a pending job. Call it inside Store.Tx alongside the write
@@ -59,12 +61,17 @@ func (r *JobRepo) Enqueue(ctx context.Context, spec EnqueueSpec) (string, error)
 }
 
 // Claim atomically selects the oldest runnable job — pending, past its run_after,
-// and with every dependency 'done' — marks it running, increments attempts, and
-// returns it. Returns (nil, nil) when nothing is runnable. The single UPDATE ...
-// RETURNING makes claiming race-free across workers.
+// and with every dependency 'done' — marks it running, stamps claimed_at,
+// increments attempts, and returns it. Returns (nil, nil) when nothing is
+// runnable. The single UPDATE ... RETURNING makes claiming race-free across
+// concurrent workers (verified with a multi-connection pool).
+//
+// A job whose dependency is 'failed' or references a missing id is never
+// runnable; cascade-fail (MarkFailed) handles the former and Blocked surfaces
+// the latter.
 func (r *JobRepo) Claim(ctx context.Context, nowTS string) (*Job, error) {
 	row := r.q.QueryRowContext(ctx,
-		`UPDATE jobs SET status = 'running', attempts = attempts + 1
+		`UPDATE jobs SET status = 'running', attempts = attempts + 1, claimed_at = ?
 		 WHERE id = (
 		   SELECT j.id FROM jobs j
 		   WHERE j.status = 'pending'
@@ -75,7 +82,7 @@ func (r *JobRepo) Claim(ctx context.Context, nowTS string) (*Job, error) {
 		       WHERE d.status IS NULL OR d.status <> 'done')
 		   ORDER BY j.created_at, j.id
 		   LIMIT 1)
-		 RETURNING `+jobCols, nowTS)
+		 RETURNING `+jobCols, nowTS, nowTS)
 
 	job, err := scanJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -87,39 +94,72 @@ func (r *JobRepo) Claim(ctx context.Context, nowTS string) (*Job, error) {
 	return job, nil
 }
 
-// MarkDone marks a job complete.
+// MarkDone marks a running job complete. Scoped to status='running' so it cannot
+// resurrect a terminal job; a lost claim (0 rows) is a no-op.
 func (r *JobRepo) MarkDone(ctx context.Context, id string) error {
-	if _, err := r.q.ExecContext(ctx, `UPDATE jobs SET status = 'done' WHERE id = ?`, id); err != nil {
+	if _, err := r.q.ExecContext(ctx,
+		`UPDATE jobs SET status = 'done', claimed_at = NULL WHERE id = ? AND status = 'running'`, id); err != nil {
 		return fmt.Errorf("mark job %q done: %w", id, err)
 	}
 	return nil
 }
 
-// Reschedule returns a job to pending for retry, recording the error and an
-// optional run_after (nil = immediately runnable).
+// Reschedule returns a running job to pending for retry, recording the error and
+// an optional run_after (nil = immediately runnable). Scoped to status='running'.
 func (r *JobRepo) Reschedule(ctx context.Context, id string, runAfter *string, errMsg string) error {
 	if _, err := r.q.ExecContext(ctx,
-		`UPDATE jobs SET status = 'pending', run_after = ?, last_error = ? WHERE id = ?`,
+		`UPDATE jobs SET status = 'pending', run_after = ?, last_error = ?, claimed_at = NULL
+		 WHERE id = ? AND status = 'running'`,
 		runAfter, errMsg, id); err != nil {
 		return fmt.Errorf("reschedule job %q: %w", id, err)
 	}
 	return nil
 }
 
-// MarkFailed marks a job permanently failed with the final error.
+// MarkFailed marks a running job permanently failed, then cascade-fails any
+// pending jobs that (transitively) depend on a failed job, so a broken stage
+// does not silently strand its downstream subtree as pending forever.
 func (r *JobRepo) MarkFailed(ctx context.Context, id, errMsg string) error {
 	if _, err := r.q.ExecContext(ctx,
-		`UPDATE jobs SET status = 'failed', last_error = ? WHERE id = ?`, errMsg, id); err != nil {
+		`UPDATE jobs SET status = 'failed', last_error = ?, claimed_at = NULL
+		 WHERE id = ? AND status = 'running'`, errMsg, id); err != nil {
 		return fmt.Errorf("mark job %q failed: %w", id, err)
 	}
-	return nil
+	return r.cascadeFailDependents(ctx)
 }
 
-// ReclaimStuck returns all 'running' jobs to 'pending'. Called on startup: with
-// no live worker, any 'running' job was orphaned by a crash. Attempts are
-// preserved so the retry budget accounts for the crash.
-func (r *JobRepo) ReclaimStuck(ctx context.Context) (int, error) {
-	res, err := r.q.ExecContext(ctx, `UPDATE jobs SET status = 'pending' WHERE status = 'running'`)
+// cascadeFailDependents repeatedly fails pending jobs that have a failed
+// dependency until a fixpoint (the pending set strictly shrinks each pass).
+func (r *JobRepo) cascadeFailDependents(ctx context.Context) error {
+	for {
+		res, err := r.q.ExecContext(ctx,
+			`UPDATE jobs SET status = 'failed', last_error = 'dependency failed', claimed_at = NULL
+			 WHERE status = 'pending' AND EXISTS (
+			   SELECT 1 FROM json_each(jobs.depends_on) dep
+			   JOIN jobs d ON d.id = dep.value
+			   WHERE d.status = 'failed')`)
+		if err != nil {
+			return fmt.Errorf("cascade-fail dependents: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("cascade-fail dependents (rows affected): %w", err)
+		}
+		if n == 0 {
+			return nil
+		}
+	}
+}
+
+// ReclaimStuck returns 'running' jobs claimed at or before olderThan to
+// 'pending' (clearing the lease and run_after). On startup, pass the current
+// time to reclaim every running job (no worker survived a crash). A continuous
+// runner (Stage 5) passes now-minus-lease so it does not reclaim jobs a live
+// worker still holds. Attempts are preserved: a crash consumes one retry.
+func (r *JobRepo) ReclaimStuck(ctx context.Context, olderThan string) (int, error) {
+	res, err := r.q.ExecContext(ctx,
+		`UPDATE jobs SET status = 'pending', run_after = NULL, claimed_at = NULL
+		 WHERE status = 'running' AND (claimed_at IS NULL OR claimed_at <= ?)`, olderThan)
 	if err != nil {
 		return 0, fmt.Errorf("reclaim stuck jobs: %w", err)
 	}
@@ -128,6 +168,32 @@ func (r *JobRepo) ReclaimStuck(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("reclaim stuck jobs (rows affected): %w", err)
 	}
 	return int(n), nil
+}
+
+// Blocked returns pending jobs that can never become runnable because a
+// dependency is 'failed' or references a missing job id. Cascade-fail converts
+// the failed-dependency case to failed, so in practice this surfaces the
+// missing-dependency (mis-enqueue) case for monitoring.
+func (r *JobRepo) Blocked(ctx context.Context) ([]*Job, error) {
+	rows, err := r.q.QueryContext(ctx,
+		`SELECT `+jobCols+` FROM jobs j WHERE j.status = 'pending' AND EXISTS (
+		   SELECT 1 FROM json_each(j.depends_on) dep
+		   LEFT JOIN jobs d ON d.id = dep.value
+		   WHERE d.id IS NULL OR d.status = 'failed')`)
+	if err != nil {
+		return nil, fmt.Errorf("query blocked jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
 }
 
 func (r *JobRepo) Get(ctx context.Context, id string) (*Job, error) {

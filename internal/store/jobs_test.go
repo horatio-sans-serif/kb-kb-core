@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -116,7 +117,7 @@ func TestJobs_ReclaimStuck(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	n, err := st.Jobs.ReclaimStuck(ctx)
+	n, err := st.Jobs.ReclaimStuck(ctx, now())
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
@@ -130,5 +131,137 @@ func TestJobs_ReclaimStuck(t *testing.T) {
 	}
 	if job == nil || job.ID != id {
 		t.Errorf("reclaimed job not claimable again: %v", job)
+	}
+}
+
+func TestJobs_CascadeFailOnDependencyFailure(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "a"})
+	if err != nil {
+		t.Fatalf("enqueue a: %v", err)
+	}
+	b, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "b", DependsOn: []string{a}})
+	if err != nil {
+		t.Fatalf("enqueue b: %v", err)
+	}
+	c, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "c", DependsOn: []string{b}})
+	if err != nil {
+		t.Fatalf("enqueue c: %v", err)
+	}
+
+	if _, err := st.Jobs.Claim(ctx, now()); err != nil { // claims a (→running)
+		t.Fatalf("claim: %v", err)
+	}
+	if err := st.Jobs.MarkFailed(ctx, a, "boom"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	// b (direct) and c (transitive) must both be cascade-failed.
+	for _, id := range []string{b, c} {
+		j, err := st.Jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if j.Status != "failed" {
+			t.Errorf("job %s status = %q, want failed (cascade)", id, j.Status)
+		}
+	}
+}
+
+func TestJobs_Blocked(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	b, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "b", DependsOn: []string{"01MISSINGDEP"}})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	blocked, err := st.Jobs.Blocked(ctx)
+	if err != nil {
+		t.Fatalf("blocked: %v", err)
+	}
+	if len(blocked) != 1 || blocked[0].ID != b {
+		t.Errorf("blocked = %v, want [%s] (missing dependency)", blocked, b)
+	}
+}
+
+func TestJobs_ReclaimByLease(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "x"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := st.Jobs.Claim(ctx, "2026-05-31T12:00:00Z"); err != nil { // stamps claimed_at
+		t.Fatalf("claim: %v", err)
+	}
+
+	n, err := st.Jobs.ReclaimStuck(ctx, "2026-05-31T11:00:00Z") // cutoff before claim
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("reclaimed %d with cutoff before the claim, want 0 (lease not expired)", n)
+	}
+
+	n, err = st.Jobs.ReclaimStuck(ctx, "2026-05-31T13:00:00Z") // cutoff after claim
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("reclaimed %d with cutoff after the claim, want 1", n)
+	}
+}
+
+func TestJobs_ConcurrentClaim_NoDoubleDispatch(t *testing.T) {
+	st := newTestStore(t)
+	st.db.SetMaxOpenConns(8) // override the single-writer pool to force real concurrency
+	ctx := context.Background()
+
+	const m = 50
+	for range m {
+		if _, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "x"}); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+
+	var mu sync.Mutex
+	seen := make(map[string]int)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				job, err := st.Jobs.Claim(ctx, now())
+				if err != nil {
+					t.Errorf("claim: %v", err)
+					return
+				}
+				if job == nil {
+					return
+				}
+				mu.Lock()
+				seen[job.ID]++
+				mu.Unlock()
+				if err := st.Jobs.MarkDone(ctx, job.ID); err != nil {
+					t.Errorf("mark done: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(seen) != m {
+		t.Errorf("claimed %d distinct jobs, want %d", len(seen), m)
+	}
+	for id, c := range seen {
+		if c != 1 {
+			t.Errorf("job %s claimed %d times, want exactly 1", id, c)
+		}
 	}
 }
