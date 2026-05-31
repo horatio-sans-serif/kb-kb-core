@@ -245,7 +245,23 @@ so local tools and the future web UI can subscribe to lifecycle events.
 - `TestSSE_DeliversAfterConnect`: HTTP test client connected to `/events`
   receives an event published post-connection.
 
-**Status**: Not Started
+**Status**: Complete — `internal/events` (`Bus` with non-blocking fan-out,
+buffered per-subscriber channels, idempotent unsubscribe; `Event` + the
+Section 9 type constants) and `internal/api.SSEHandler` (subscribes before
+flushing headers, so a connected client misses nothing; ends on client
+disconnect). 4 new tests green under `go test -race`; `go vet`/`gofmt`/`build`
+clean.
+
+- Fan-out to multiple subscribers (`TestBus_FanOut`); a full slow subscriber
+  drops events without blocking publishers (`TestBus_SlowSubscriberDropped`);
+  unsubscribe closes the channel and is safe (`TestBus_UnsubscribeStopsDelivery`).
+- SSE stream delivers post-connect events (`TestSSE_DeliversAfterConnect`).
+
+Deferred to Stage 5: publishing `artifact.ingested` happens at the ingest point,
+which is the Stage 5 `POST /ingest` handler (write artifact + encounter +
+enqueue + publish, atomically via `Store.Tx`). The bus and stream this stage
+provides are what that handler will publish to. Keeping the publish out of the
+`store` package preserves layering (store has no dependency on `events`).
 
 ---
 
