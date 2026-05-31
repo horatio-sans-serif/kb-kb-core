@@ -177,7 +177,26 @@ pipeline stages respecting `depends_on`, with retry/backoff and crash-resume
 - `TestQueue_ResumeAfterCrash`: a `running` job with no live worker is reclaimed
   and completed.
 
-**Status**: Not Started
+**Status**: Complete — `store.JobRepo` (Enqueue / Claim / MarkDone / Reschedule /
+MarkFailed / ReclaimStuck / Get) + `jobs.Runner` (handlers, `RunOnce`, `Drain`,
+`ExpBackoff`, `ReclaimStuck`). 10 new tests green under `go test -race`;
+`go vet`/`gofmt`/`build` clean.
+
+- Transactional enqueue via `Store.Tx` + `Jobs.Enqueue`
+  (`TestJobs_TransactionalEnqueue`).
+- Dependency gating in a single race-free `UPDATE … WHERE id = (SELECT … WHERE
+NOT EXISTS json_each(depends_on) …) RETURNING` claim
+  (`TestJobs_ClaimBlockedByDependency`, `TestRunner_DAGOrder`).
+- Retry/backoff with attempt cap then permanent fail (`TestRunner_RetryThenSucceed`,
+  `TestRunner_ExhaustsRetriesThenFails`); backoff curve tested separately
+  (`TestBackoff_Increasing`). Unknown job type fails fast
+  (`TestRunner_UnknownTypeFails`).
+- Crash-resume via `ReclaimStuck` (`TestJobs_ReclaimStuck`,
+  `TestRunner_ResumeAfterCrash`).
+
+Deferred: the separate read-only connection pool moves to Stage 5, where the
+HTTP API first introduces concurrent reads; the Stage 3 runner drains
+single-threaded on the one writer, so it is not needed yet.
 
 ---
 

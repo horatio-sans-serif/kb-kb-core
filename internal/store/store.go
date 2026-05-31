@@ -37,6 +37,7 @@ type Store struct {
 	Artifacts   *ArtifactRepo
 	Encounters  *EncounterRepo
 	Enrichments *EnrichmentRepo
+	Jobs        *JobRepo
 }
 
 // New wires the repositories to db. db is expected to be already migrated.
@@ -51,6 +52,7 @@ func newStore(db *sql.DB, q Querier) *Store {
 		Artifacts:   &ArtifactRepo{q: q},
 		Encounters:  &EncounterRepo{q: q},
 		Enrichments: &EnrichmentRepo{q: q},
+		Jobs:        &JobRepo{q: q},
 	}
 }
 
