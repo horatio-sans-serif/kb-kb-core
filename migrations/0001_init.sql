@@ -64,7 +64,11 @@ CREATE TABLE artifacts (
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE UNIQUE INDEX idx_artifacts_canonical ON artifacts(canonical_url) WHERE canonical_url IS NOT NULL;
+-- Scoped to live rows: a tombstone frees the canonical-URL slot, so re-seeing a
+-- soft-deleted URL inserts a new artifact rather than hitting a UNIQUE error.
+-- UpsertByCanonical's ON CONFLICT target matches this exact predicate.
+CREATE UNIQUE INDEX idx_artifacts_canonical ON artifacts(canonical_url)
+  WHERE canonical_url IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX idx_artifacts_hash       ON artifacts(content_hash);
 -- Relevance is ranked within a lifecycle tier (the surfacing query, design 8.11),
 -- so the composite below covers it. No standalone relevance_score index:

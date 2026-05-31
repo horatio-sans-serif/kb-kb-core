@@ -117,11 +117,32 @@ merge primitive that the dedup keystone (§8.2) will build on.
 - `TestULID_Sortable`: IDs created in order sort lexicographically.
 - `TestSource_CreateGet`, `TestEnrichment_CreateGet`: round-trip CRUD.
 
-**Status**: Complete — `store.New` + `SourceRepo`/`ArtifactRepo`/`EncounterRepo`/
-`EnrichmentRepo`, `NewID` (oklog/ulid/v2), `UpsertByCanonical` dedup keystone,
-soft-delete with `List`/`ListIncludingDeleted`, repository-managed `updated_at`
-(no trigger). 6 new tests (10 total) green; `go vet`/`gofmt`/`build` clean.
-Nullable columns modeled as pointers for correct SQL NULL round-trips.
+**Status**: Complete (full review applied) — `store.New` + four repositories,
+`NewID` (oklog/ulid/v2), `UpsertByCanonical` dedup keystone, soft-delete with
+`List`/`ListIncludingDeleted`, repository-managed `updated_at` (no trigger).
+18 tests green under `go test -race`; `go vet`/`gofmt`/`build` clean.
+
+Full-review fixes applied:
+
+- **Soft-delete + dedup (critical):** the partial unique index on `canonical_url`
+  is scoped to live rows (`... AND deleted_at IS NULL`), and `UpsertByCanonical`
+  is now a single atomic `INSERT … ON CONFLICT(canonical_url) WHERE … DO UPDATE
+… RETURNING`. Re-seeing a tombstoned URL inserts a new artifact instead of
+  hitting a UNIQUE error (`TestArtifact_UpsertAfterSoftDelete`), and concurrent
+  upserts cannot duplicate (`TestArtifact_ConcurrentUpsert_NoDuplicates`, `-race`).
+- **NULL reads (critical):** `title`/`body_markdown` scanned via `sql.NullString`
+  so a NULL (e.g. from a replica merge) reads as "" instead of failing
+  (`TestArtifact_NullTitleBodyRead`).
+- **Transaction seam:** repos hold a `Querier` (satisfied by `*sql.DB` and
+  `*sql.Tx`); `Store.Tx(ctx, fn)` runs them in one immediate transaction; nested
+  Tx is disallowed (avoids the single-writer deadlock). Enables Stage 3/5 atomic
+  composition (`TestStore_TxCommit`/`_TxRollback`/`_NestedTxDisallowed`).
+- **Timestamps:** all repos write `created_at` via `now()` (uniform RFC3339);
+  artifact listing orders by ULID `id`, not a string timestamp.
+- **`ErrNotFound` sentinel** so callers don't import `database/sql`
+  (`TestArtifact_GetNotFound`).
+- `UpsertByCanonical` honors caller type/privacy/lifecycle/status/score on insert.
+- `cmd/kbd` `run()` covered by `TestRun_FreshDB`.
 
 ---
 

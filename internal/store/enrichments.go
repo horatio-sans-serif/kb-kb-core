@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -19,16 +20,16 @@ type Enrichment struct {
 	CreatedAt     string
 }
 
-type EnrichmentRepo struct{ db *sql.DB }
+type EnrichmentRepo struct{ q Querier }
 
 func (r *EnrichmentRepo) Create(ctx context.Context, e *Enrichment) error {
 	if e.ID == "" {
 		e.ID = NewID()
 	}
-	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO enrichments(id, artifact_id, kind, payload, model, prompt_version)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		e.ID, e.ArtifactID, e.Kind, e.Payload, e.Model, e.PromptVersion)
+	_, err := r.q.ExecContext(ctx,
+		`INSERT INTO enrichments(id, artifact_id, kind, payload, model, prompt_version, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.ArtifactID, e.Kind, e.Payload, e.Model, e.PromptVersion, now())
 	if err != nil {
 		return fmt.Errorf("create enrichment: %w", err)
 	}
@@ -37,11 +38,14 @@ func (r *EnrichmentRepo) Create(ctx context.Context, e *Enrichment) error {
 
 func (r *EnrichmentRepo) Get(ctx context.Context, id string) (*Enrichment, error) {
 	var e Enrichment
-	err := r.db.QueryRowContext(ctx,
+	err := r.q.QueryRowContext(ctx,
 		`SELECT id, artifact_id, kind, payload, model, prompt_version, created_at
 		 FROM enrichments WHERE id = ?`, id).
 		Scan(&e.ID, &e.ArtifactID, &e.Kind, &e.Payload, &e.Model, &e.PromptVersion, &e.CreatedAt)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("get enrichment %q: %w", id, ErrNotFound)
+		}
 		return nil, fmt.Errorf("get enrichment %q: %w", id, err)
 	}
 	return &e, nil
