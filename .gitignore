@@ -1,0 +1,13 @@
+# Build artifacts
+/kbd
+*.test
+*.out
+*.prof
+
+# Local databases (and WAL sidecars)
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS
+.DS_Store
