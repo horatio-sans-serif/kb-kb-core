@@ -1,6 +1,6 @@
 # KB Core — Implementation Plan: Phase 0 (Spine)
 
-Implements Phase 0 of `../UNIFIED_SYSTEM_DESIGN_PLAN.md` §12: the core daemon
+Implements Phase 0 of `UNIFIED_SYSTEM_DESIGN_PLAN.md` §12: the core daemon
 skeleton everything else depends on. Subsequent phases get their own plans.
 Delete this file when all stages are Complete.
 
