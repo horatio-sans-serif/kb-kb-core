@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 )
 
 func TestMigrate_FreshDB(t *testing.T) {
@@ -75,6 +76,57 @@ func TestMigrate_PragmasSet(t *testing.T) {
 	}
 	if fk != 1 {
 		t.Errorf("foreign_keys = %d, want 1 (on)", fk)
+	}
+}
+
+// TestMigrate_PartialFailureIsRecoverable proves a migration that fails partway
+// leaves the database at the previous version with none of its statements
+// persisted, and that fixing the migration and re-running recovers cleanly.
+func TestMigrate_PartialFailureIsRecoverable(t *testing.T) {
+	db := openTemp(t)
+
+	broken := fstest.MapFS{
+		"0001_good.sql": &fstest.MapFile{Data: []byte(`CREATE TABLE a (id TEXT PRIMARY KEY);`)},
+		"0002_bad.sql": &fstest.MapFile{Data: []byte(
+			"CREATE TABLE b (id TEXT PRIMARY KEY);\n" +
+				"INSERT INTO no_such_table(x) VALUES ('boom');")},
+	}
+
+	applied, err := migrateFS(db, broken)
+	if err == nil {
+		t.Fatalf("expected error from broken migration, got nil (applied=%d)", applied)
+	}
+	if applied != 1 {
+		t.Errorf("applied = %d, want 1 (only the good migration committed)", applied)
+	}
+
+	var v int
+	if err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v); err != nil {
+		t.Fatalf("read version: %v", err)
+	}
+	if v != 1 {
+		t.Errorf("version = %d, want 1 (failed migration must not advance it)", v)
+	}
+	if tableExists(t, db, "b") {
+		t.Error("table b persisted; the failed migration was not rolled back")
+	}
+	if !tableExists(t, db, "a") {
+		t.Error("table a missing; the good migration should have committed")
+	}
+
+	fixed := fstest.MapFS{
+		"0001_good.sql": &fstest.MapFile{Data: []byte(`CREATE TABLE a (id TEXT PRIMARY KEY);`)},
+		"0002_bad.sql":  &fstest.MapFile{Data: []byte(`CREATE TABLE b (id TEXT PRIMARY KEY);`)},
+	}
+	applied, err = migrateFS(db, fixed)
+	if err != nil {
+		t.Fatalf("re-run after fix: %v", err)
+	}
+	if applied != 1 {
+		t.Errorf("re-run applied = %d, want 1 (the fixed migration)", applied)
+	}
+	if !tableExists(t, db, "b") {
+		t.Error("table b missing after the fixed re-run")
 	}
 }
 

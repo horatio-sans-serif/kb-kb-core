@@ -11,16 +11,14 @@
 --     documents; the projector writes here.
 --
 -- IDs are client-generated ULIDs (TEXT) so any replica can mint records offline.
--- Timestamps are ISO-8601 TEXT (datetime('now')). JSON is stored as TEXT.
-
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
--- Migration bookkeeping (local-only; not synced).
-CREATE TABLE IF NOT EXISTS schema_migrations (
-  version    INTEGER PRIMARY KEY,
-  applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+-- Timestamps are ISO-8601 TEXT. created_at/updated_at use local wall-clock
+-- (datetime('now')); these are audit timestamps, not logical merge clocks (see
+-- the cr-sqlite readiness note in 6.0). JSON is stored as TEXT.
+--
+-- Connection PRAGMAs (journal_mode=WAL, foreign_keys=ON) are set by store.Open's
+-- DSN, not here, so this file is pure schema and the runner can wrap it in one
+-- transaction. The schema_migrations table and its version rows are owned by the
+-- migration runner (store.Migrate); migration files must not touch it.
 
 -- ============================================================================
 -- SYNCED (CRDT source of truth) — replicated to every device. See 6.0.
@@ -68,7 +66,9 @@ CREATE TABLE artifacts (
 );
 CREATE UNIQUE INDEX idx_artifacts_canonical ON artifacts(canonical_url) WHERE canonical_url IS NOT NULL;
 CREATE INDEX idx_artifacts_hash       ON artifacts(content_hash);
-CREATE INDEX idx_artifacts_relevance  ON artifacts(relevance_score DESC);
+-- Relevance is ranked within a lifecycle tier (the surfacing query, design 8.11),
+-- so the composite below covers it. No standalone relevance_score index:
+-- relevance is a hot-decay column, kept out of as many indexes as possible.
 CREATE INDEX idx_artifacts_lifecycle  ON artifacts(lifecycle_tier, relevance_score DESC);
 
 -- 6.3 Encounters (the dedup keystone — one artifact, many encounters)
@@ -253,11 +253,7 @@ CREATE TABLE audit_log (
 --
 --   CREATE VIRTUAL TABLE artifacts_fts USING fts5(artifact_id UNINDEXED, title, body);
 
--- updated_at maintenance (braindrain timestamp-trigger pattern)
-CREATE TRIGGER trg_artifacts_updated_at
-AFTER UPDATE ON artifacts
-FOR EACH ROW BEGIN
-  UPDATE artifacts SET updated_at = datetime('now') WHERE id = NEW.id;
-END;
-
-INSERT INTO schema_migrations(version) VALUES (1);
+-- No updated_at trigger: the repository layer (Stage 2) sets updated_at
+-- explicitly. An AFTER UPDATE trigger writing datetime('now') would self-fire,
+-- and under cr-sqlite it would overwrite a merged row's timestamp with local
+-- wall-clock time — non-deterministic across replicas. See 6.0 readiness note.

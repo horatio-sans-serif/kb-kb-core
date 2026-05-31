@@ -20,15 +20,25 @@ func main() {
 		os.Exit(2)
 	}
 
-	db, err := store.Open(*dbPath)
-	if err != nil {
+	if err := run(*dbPath); err != nil {
 		log.Fatalf("kbd: %v", err)
+	}
+}
+
+// run opens the database and applies migrations. Split out from main so that
+// deferred cleanup runs (main's log.Fatalf would skip defers) and so the
+// startup path is testable.
+func run(dbPath string) error {
+	db, err := store.Open(dbPath)
+	if err != nil {
+		return err
 	}
 	defer db.Close()
 
 	applied, err := store.Migrate(db)
 	if err != nil {
-		log.Fatalf("kbd: migrate: %v", err)
+		return fmt.Errorf("migrate: %w", err)
 	}
-	log.Printf("kbd: ready (migrations applied this run: %d, db=%s)", applied, *dbPath)
+	log.Printf("kbd: ready (migrations applied this run: %d, db=%s)", applied, dbPath)
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,27 +14,51 @@ import (
 	"kb/migrations"
 )
 
-// Open opens (creating if needed) the SQLite database at path with WAL journaling
-// and foreign-key enforcement applied to every pooled connection.
+// Open opens (creating if needed) the SQLite database at path with WAL
+// journaling, foreign-key enforcement, and immediate-locking transactions
+// applied to every pooled connection via the DSN.
 func Open(path string) (*sql.DB, error) {
-	dsn := "file:" + path + "?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open("sqlite3", dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
+	// SQLite is a single-writer store; cap the pool to one connection to
+	// serialize writers and avoid SQLITE_BUSY. A separate read-only pool can be
+	// added at Stage 3 when the HTTP API introduces concurrent reads.
+	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
 	}
 	return db, nil
 }
 
-// Migrate applies every embedded migration whose version is greater than the
-// highest already recorded in schema_migrations, in version order, and returns
-// the number applied. It is idempotent: re-running applies nothing.
-//
-// Convention: each migration file is named NNNN_description.sql and records its
-// own version with `INSERT INTO schema_migrations(version) VALUES (NNNN)`.
+// dsn builds a mattn/go-sqlite3 connection string, URL-escaping the path so
+// paths containing spaces, '?', or '#' do not corrupt the query parameters.
+func dsn(path string) string {
+	q := url.Values{
+		"_foreign_keys": {"on"},
+		"_journal_mode": {"WAL"},
+		"_busy_timeout": {"5000"},
+		"_txlock":       {"immediate"},
+	}
+	u := url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}
+	return u.String()
+}
+
+// Migrate applies the embedded migrations. See migrateFS.
 func Migrate(db *sql.DB) (int, error) {
+	return migrateFS(db, migrations.FS)
+}
+
+// migrateFS applies every migration in src whose version exceeds the highest
+// recorded in schema_migrations and returns the number applied.
+//
+// Each migration runs in its own transaction together with the row that records
+// its version, so a migration that fails rolls back completely, leaving the
+// database at the previous version and safely re-runnable. The runner is the
+// single source of truth for recorded versions (parsed from the filename);
+// migration files contain pure schema and must not touch schema_migrations.
+func migrateFS(db *sql.DB, src fs.FS) (int, error) {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,
 		applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -46,28 +71,53 @@ func Migrate(db *sql.DB) (int, error) {
 		return 0, fmt.Errorf("read current schema version: %w", err)
 	}
 
-	pending, err := loadMigrations()
+	all, err := loadMigrations(src)
 	if err != nil {
 		return 0, err
 	}
 
 	applied := 0
-	for _, m := range pending {
+	for _, m := range all {
 		if m.version <= current {
 			continue
 		}
-		body, err := migrations.FS.ReadFile(m.name)
-		if err != nil {
-			return applied, fmt.Errorf("read migration %s: %w", m.name, err)
-		}
-		// Not wrapped in a transaction: the migration sets PRAGMA journal_mode,
-		// which cannot run inside a transaction.
-		if _, err := db.Exec(string(body)); err != nil {
-			return applied, fmt.Errorf("apply migration %s: %w", m.name, err)
+		if err := applyMigration(db, src, m); err != nil {
+			return applied, err
 		}
 		applied++
 	}
 	return applied, nil
+}
+
+// applyMigration runs one migration body and records its version in a single
+// transaction. mattn/go-sqlite3 executes the multi-statement body sequentially
+// on the transaction's connection; any failure rolls the whole migration back.
+func applyMigration(db *sql.DB, src fs.FS, m migration) (err error) {
+	body, err := fs.ReadFile(src, m.name)
+	if err != nil {
+		return fmt.Errorf("read migration %s: %w", m.name, err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin %s: %w", m.name, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.Exec(string(body)); err != nil {
+		return fmt.Errorf("apply %s: %w", m.name, err)
+	}
+	if _, err = tx.Exec(`INSERT INTO schema_migrations(version) VALUES (?)`, m.version); err != nil {
+		return fmt.Errorf("record %s: %w", m.name, err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s: %w", m.name, err)
+	}
+	return nil
 }
 
 type migration struct {
@@ -75,12 +125,12 @@ type migration struct {
 	name    string
 }
 
-func loadMigrations() ([]migration, error) {
-	entries, err := fs.ReadDir(migrations.FS, ".")
+func loadMigrations(src fs.FS) ([]migration, error) {
+	entries, err := fs.ReadDir(src, ".")
 	if err != nil {
-		return nil, fmt.Errorf("read embedded migrations: %w", err)
+		return nil, fmt.Errorf("read migrations: %w", err)
 	}
-	var out []migration
+	var all []migration
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
 			continue
@@ -89,21 +139,24 @@ func loadMigrations() ([]migration, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, migration{version: v, name: e.Name()})
+		all = append(all, migration{version: v, name: e.Name()})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })
-	return out, nil
+	sort.Slice(all, func(i, j int) bool { return all[i].version < all[j].version })
+	return all, nil
 }
 
-// versionFromName parses "0001_init.sql" into 1.
+// versionFromName parses the leading integer of "0001_init.sql" into 1.
 func versionFromName(name string) (int, error) {
 	i := strings.IndexByte(name, '_')
 	if i <= 0 {
-		return 0, fmt.Errorf("bad migration name %q (want NNNN_description.sql)", name)
+		return 0, fmt.Errorf("bad migration name %q (want <version>_<description>.sql)", name)
 	}
 	v, err := strconv.Atoi(name[:i])
 	if err != nil {
 		return 0, fmt.Errorf("bad migration version in %q: %w", name, err)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("migration version in %q must be positive", name)
 	}
 	return v, nil
 }

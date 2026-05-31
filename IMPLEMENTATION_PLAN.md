@@ -58,12 +58,33 @@ migrations idempotently, and exits 0. Schema from `migrations/0001_init.sql`
 - `TestMigrate_PragmasSet`: assert `journal_mode = wal` and
   `foreign_keys = 1` after open.
 
-**Status**: Complete — `store.Open` / `store.Migrate` + embedded migrations
-(`kb/migrations`) + `cmd/kbd`. All three tests green, `go vet` clean,
-`kbd --db <path>` round-trips (applied 1, then 0 on re-run; missing `--db` exits
-2). FTS5 and vec0 indexes were moved out of `0001_init.sql` to Phase 2–3 search
-setup (they are local-only rebuilt indexes per §6.0 and FTS5 needs the driver
-built with `-tags sqlite_fts5`), keeping the Phase 0 build dependency-free.
+**Status**: Complete (reviewed; all findings fixed) — `store.Open` /
+`store.Migrate` + embedded migrations (`kb/migrations`) + `cmd/kbd`. 4 tests
+green, `go vet` and `gofmt` clean, `kbd --db <path>` round-trips (applied 1, then
+0; missing `--db` exits 2; verified with a space-containing path).
+
+FTS5 and vec0 indexes live in Phase 2–3 search setup (local-only rebuilt indexes
+per §6.0; FTS5 needs `-tags sqlite_fts5`), keeping the Phase 0 build
+dependency-free.
+
+Code-review fixes applied:
+
+- Each migration now runs in its own transaction with its version row, so a
+  partial failure rolls back fully and stays re-runnable (was: non-atomic, could
+  brick the DB). New test `TestMigrate_PartialFailureIsRecoverable` (via an
+  injectable `fs.FS`) proves it.
+- The runner is the single source of truth for recorded versions (parsed from
+  the filename and inserted by the runner); migration files are pure schema and
+  must not touch `schema_migrations`.
+- Connection PRAGMAs set only in the DSN (removed from the migration file);
+  `_txlock=immediate` added; DSN built with `net/url` so paths with spaces/`?`/`#`
+  are escaped.
+- `db.SetMaxOpenConns(1)` (single-writer WAL) — see Stage 3 read-pool note.
+- Removed the `updated_at` trigger (CRDT-hostile + self-firing); `updated_at` is
+  set by the repository layer (Stage 2).
+- Dropped the redundant standalone `relevance_score` index (hot-decay column).
+- `cmd/kbd` split into `run() error` so deferred cleanup runs and startup is
+  testable.
 
 ---
 
@@ -76,7 +97,9 @@ merge primitive that the dedup keystone (§8.2) will build on.
 **Success Criteria**:
 
 - `store.New(db)` exposes repositories with `Create`/`Get`/`List` for the four
-  tables; all IDs are server-minted ULIDs.
+  tables; all IDs are ULIDs minted locally (any replica may create offline).
+- Mutating methods set `updated_at` explicitly (no DB trigger — see Stage 1
+  review fixes and §6.0 cr-sqlite readiness).
 - `ArtifactRepo.UpsertByCanonical(url, ...)` returns the existing artifact (no
   duplicate row) when `canonical_url` matches, else creates one — the
   one-artifact-many-encounters invariant in code, not just schema.
@@ -113,6 +136,10 @@ pipeline stages respecting `depends_on`, with retry/backoff and crash-resume
 - Failed jobs retry with exponential backoff up to a cap, then stay `failed`
   with `last_error` populated.
 - On restart, `running` jobs orphaned by a crash are reclaimed.
+- Add a separate read-only connection pool so concurrent API reads (Stage 5+) do
+  not serialize behind the single writer set in `Open` (Stage 1 review, Minor 8):
+  one write connection (`SetMaxOpenConns(1)`) + a read pool over the same WAL
+  file.
 
 **Tests**:
 
