@@ -109,14 +109,19 @@ merge primitive that the dedup keystone (§8.2) will build on.
 **Tests**:
 
 - `TestArtifact_UpsertByCanonical_Dedups`: two upserts of the same canonical URL
-  yield one artifact, two encounters.
-- `TestArtifact_SoftDelete_Hidden`: deleted artifact absent from default list,
-  present in `IncludeDeleted` list.
+  yield one artifact.
+- `TestArtifact_SoftDelete_Hidden`: deleted artifact absent from `List`, present
+  in `ListIncludingDeleted`.
 - `TestEncounter_CountIsRelevanceSignal`: N records → `COUNT = N` for the
   artifact (feeds §8.9 `encounter_factor`).
 - `TestULID_Sortable`: IDs created in order sort lexicographically.
+- `TestSource_CreateGet`, `TestEnrichment_CreateGet`: round-trip CRUD.
 
-**Status**: Not Started
+**Status**: Complete — `store.New` + `SourceRepo`/`ArtifactRepo`/`EncounterRepo`/
+`EnrichmentRepo`, `NewID` (oklog/ulid/v2), `UpsertByCanonical` dedup keystone,
+soft-delete with `List`/`ListIncludingDeleted`, repository-managed `updated_at`
+(no trigger). 6 new tests (10 total) green; `go vet`/`gofmt`/`build` clean.
+Nullable columns modeled as pointers for correct SQL NULL round-trips.
 
 ---
 
