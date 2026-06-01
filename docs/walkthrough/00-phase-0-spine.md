@@ -94,6 +94,17 @@ ingest emits no phantom event (transactional-outbox in miniature).
 - **Single-writer pool (`SetMaxOpenConns(1)`)** serializes writes and avoids
   `SQLITE_BUSY`; the read pool is deferred until read-heavy endpoints exist.
 
+## Invariants after Phase 0
+
+- `/ingest` writes artifact + encounter + enrichment job in one transaction, or
+  nothing persists.
+- `artifact.ingested` is published only for committed artifacts (never on
+  rollback).
+- One canonical artifact per live canonical URL; encounters accumulate, one per
+  sighting.
+- The `jobs` table is the only mutable runtime state that is not synced; it is
+  reconstructable, and terminal rows are purged.
+
 ## What it is not yet
 
 The `ingest` job handler is a placeholder; real fetching, canonicalization,

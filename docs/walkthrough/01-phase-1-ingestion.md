@@ -72,6 +72,18 @@ survive on the encounters for provenance.
   model append-only migrations and to exercise the multi-migration runner; the
   migrate tests were made count-robust so they don't break each phase.
 
+## Invariants after Phase 1
+
+- Among **live** rows, `canonical_url` is unique and `content_hash` is unique
+  (two partial-unique indexes scoped to `deleted_at IS NULL`). A tombstone frees
+  both slots.
+- A URL artifact carries a NULL `content_hash` until fetched (Phase 2); a body
+  artifact carries a NULL `canonical_url`. The two upsert paths therefore never
+  collide.
+- `UpsertByContentHash` called with a NULL `ContentHash` matches no conflict
+  target and falls through to a plain insert — so URL artifacts always produce a
+  new row (no content dedup) until Phase 2 sets the hash.
+
 ## What it is not yet
 
 No fetching/extraction (Phase 2): a URL `/ingest` stores only the canonical URL,

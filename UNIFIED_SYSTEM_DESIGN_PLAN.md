@@ -339,9 +339,16 @@ CREATE TABLE artifacts (
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE UNIQUE INDEX idx_artifacts_canonical ON artifacts(canonical_url) WHERE canonical_url IS NOT NULL;
-CREATE INDEX idx_artifacts_hash ON artifacts(content_hash);
-CREATE INDEX idx_artifacts_relevance ON artifacts(relevance_score DESC);
+-- Dedup indexes are partial-unique, scoped to LIVE rows, so a tombstone frees
+-- the slot and the two upsert paths (canonical URL, content hash) never collide
+-- (a URL artifact has a NULL content_hash until fetched; a body artifact has a
+-- NULL canonical_url). relevance_score is a hot-decay column kept out of indexes;
+-- it is ranked within a lifecycle tier via the composite below.
+CREATE UNIQUE INDEX idx_artifacts_canonical ON artifacts(canonical_url)
+  WHERE canonical_url IS NOT NULL AND deleted_at IS NULL;
+CREATE UNIQUE INDEX idx_artifacts_content_hash ON artifacts(content_hash)
+  WHERE content_hash IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX idx_artifacts_lifecycle ON artifacts(lifecycle_tier, relevance_score DESC);
 ```
 
 ### 6.3 Encounters (the dedup keystone)
@@ -522,6 +529,7 @@ CREATE TABLE jobs (
   attempts    INTEGER NOT NULL DEFAULT 0,
   last_error  TEXT,
   run_after   TEXT,                              -- backoff scheduling
+  claimed_at  TEXT,                              -- set on claim; lease for stuck-job reclaim
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX idx_jobs_status ON jobs(status, run_after);
@@ -842,6 +850,17 @@ _Gap 12. Partial today (shelf ACL)._
 The core publishes events; subsystems subscribe. Inherited from `haus` (SSE) and
 `shelf` (lifecycle triggers).
 
+**Durability rule (load-bearing).** The bus is in-process, lossy (a slow
+subscriber drops events), and non-durable (a process restart loses in-flight
+events). It is therefore for **notifications only** — SSE, UI, and best-effort
+observers. Anything that _must_ durably happen is a **transactionally-enqueued
+job**, never a bus subscriber: the publishing code enqueues the job in the same
+transaction as the write that triggers it (the transactional-outbox pattern). So
+in the table below, "subscribers" like the enrichment runner and re-score jobs
+are reached via the **queue** (the writer enqueues), with the bus carrying only
+the human/UI-facing notification and a wake-up hint to the runner. Wiring durable
+work onto the bus would silently lose it on a drop or restart.
+
 | Event                 | Published when             | Key subscribers                  |
 | --------------------- | -------------------------- | -------------------------------- |
 | `artifact.ingested`   | artifact/encounter written | enrichment runner                |
@@ -965,14 +984,16 @@ enrichment pipeline exists (2->8).
 Decisions 1, 2, 3, and 5 were chosen explicitly; 4 and 6 took the recommended
 default. Each notes the phase it governs and its downstream impact.
 
-| #   | Decision           | Chosen                                       | Governs  | Downstream impact                                                                                                                            |
-| --- | ------------------ | -------------------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Sync model         | **CRDT peer sync** (AutoMerge or cr-sqlite)  | Phase 10 | Data model split into synced/local classes (6.0); SQLite becomes a CRDT projection (8.6); Mac is compute peer (8.16); client-generated ULIDs |
-| 2   | Embedding model    | **Local-only** (Ollama, nomic-embed 768-dim) | Phase 2  | One vector space across all tiers; private by construction; archive re-embeddable via versioned enrichment (6.5)                             |
-| 3   | RAG chunking       | **Structural + fixed-size fallback**         | Phase 3  | Splits on Markdown blocks (free from Principle 2); oversized blocks sub-split (6.5, 8.8)                                                     |
-| 4   | Job queue location | **In-SQLite** (default)                      | Phase 0  | Transactional enqueue (write artifact + enqueue in one tx); queue is local-only, not synced (6.0, 6.11)                                      |
-| 5   | Conflict scope     | **Within-topic / linked-cluster**            | Phase 11 | Compare claims only within shared topic / N hops, reusing the search vector pre-filter (8.13)                                                |
-| 6   | tldw cadence       | **Adaptive** (default)                       | Phase 8  | Sample faster on window change; vision-LLM only on perceptual-hash-changed frames (8.1, Phase 8)                                             |
+| #   | Decision                 | Chosen                                       | Governs  | Downstream impact                                                                                                                                                                                            |
+| --- | ------------------------ | -------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | Sync model               | **CRDT peer sync** (AutoMerge or cr-sqlite)  | Phase 10 | Data model split into synced/local classes (6.0); SQLite becomes a CRDT projection (8.6); Mac is compute peer (8.16); client-generated ULIDs                                                                 |
+| 2   | Embedding model          | **Local-only** (Ollama, nomic-embed 768-dim) | Phase 2  | One vector space across all tiers; private by construction; archive re-embeddable via versioned enrichment (6.5)                                                                                             |
+| 3   | RAG chunking             | **Structural + fixed-size fallback**         | Phase 3  | Splits on Markdown blocks (free from Principle 2); oversized blocks sub-split (6.5, 8.8)                                                                                                                     |
+| 4   | Job queue location       | **In-SQLite** (default)                      | Phase 0  | Transactional enqueue (write artifact + enqueue in one tx); queue is local-only, not synced (6.0, 6.11)                                                                                                      |
+| 5   | Conflict scope           | **Within-topic / linked-cluster**            | Phase 11 | Compare claims only within shared topic / N hops, reusing the search vector pre-filter (8.13)                                                                                                                |
+| 6   | tldw cadence             | **Adaptive** (default)                       | Phase 8  | Sample faster on window change; vision-LLM only on perceptual-hash-changed frames (8.1, Phase 8)                                                                                                             |
+| 7   | `updated_at` maintenance | **Repository-managed, no DB trigger**        | Phase 0  | A trigger writing `datetime('now')` self-fires and, under cr-sqlite, overwrites a merged row's timestamp with local wall-clock — non-deterministic across replicas (6.0). Repos set `updated_at` explicitly. |
+| 8   | Transaction locking      | **`_txlock=immediate`** in the DSN           | Phase 0  | `BEGIN IMMEDIATE` takes the write lock up front, so the single-writer pool + busy-timeout serialize writers instead of racing into `SQLITE_BUSY` (8.6)                                                       |
 
 ### Decision 1 consequences (CRDT peer sync)
 

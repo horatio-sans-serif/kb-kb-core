@@ -36,7 +36,7 @@ written as each phase completes.
 
 ## Phase 0 Tech Decisions
 
-- **Language**: Go 1.23+. Single static binary (design §4.2; rememberer precedent).
+- **Language**: Go 1.24 (`go.mod`). Single static binary (design §4.2; rememberer precedent).
 - **Module path**: `kb` (local; switch to a remote path if/when published).
 - **SQLite driver**: `github.com/mattn/go-sqlite3` (cgo). Chosen over pure-Go
   `modernc.org/sqlite` because it supports loadable extensions — required for
@@ -113,7 +113,7 @@ Code-review fixes applied:
 - Removed the `updated_at` trigger (CRDT-hostile + self-firing); `updated_at` is
   set by the repository layer (Stage 2).
 - Dropped the redundant standalone `relevance_score` index (hot-decay column).
-- `cmd/kbd` split into `run() error` so deferred cleanup runs and startup is
+- `cmd/kbd` split into a testable `serve(...)` so deferred cleanup runs and startup is
   testable.
 
 ---
@@ -172,7 +172,7 @@ Full-review fixes applied:
 - **`ErrNotFound` sentinel** so callers don't import `database/sql`
   (`TestArtifact_GetNotFound`).
 - `UpsertByCanonical` honors caller type/privacy/lifecycle/status/score on insert.
-- `cmd/kbd` `run()` covered by `TestRun_FreshDB`.
+- `cmd/kbd` `serve()` covered by `TestServe_HealthzThenGracefulShutdown`.
 
 ---
 
@@ -434,3 +434,84 @@ keep a NULL hash until fetched, so paths don't collide).
 `TestContent*\*`, `TestArtifact_UpsertByContentHash_Dedups`,
 `TestIngest_ContentDedup`. Migrate tests made count-robust for multi-migration.
 61 tests total green under `-race`; index swap verified at the SQL level.
+
+---
+
+# Phase 2 — Stage 0: Foundations (from the comprehensive review)
+
+The full-system review surfaced a cluster of architectural prerequisites: Phase 0
+built the mechanisms (queue, store, bus) but not the contracts that the
+enrichment pipeline plugs into. Do these **before** the first real enricher, in
+roughly this order — each is small now and a refactor later.
+
+## 0.1 Domain types package (`internal/kb`)
+
+Extract `Artifact`, `Enrichment`, `Encounter`, `Source` (and value types
+`PrivacyTier`, `SourceKind`, `ArtifactType`, `LifecycleTier`, `Status`) into a
+pure `internal/kb` package with no `database/sql` dependency. `store` maps
+domain types to/from rows. `jobs`, `api`, and the future `fetch`/`enrich`/`render`
+packages depend on `internal/kb`, not on `store` — so plugins don't import the
+SQL layer (the coupling design §7 forbids). Typed enums replace the `string`
+fields; storage-shaped fields (string timestamps, `*string` tombstones) stay in
+`store`'s row structs. **Why now:** a 5-file rename today vs. a codebase-wide one
+after three plugin packages exist.
+
+## 0.2 Pipeline / stage abstraction + `Enricher` contract
+
+Introduce a pipeline package that owns the `Enricher` interface (`Name`,
+`DependsOn() []string`, `PrivacyOK(PrivacyTier) bool`, `Enrich`), a registry, and
+a topological expansion that — given an artifact — enqueues one job per stage with
+`depends_on` wired from `DependsOn()`. Keep `jobs.Runner` the dumb executor it
+is; add the DAG/stage semantics above it. The placeholder `ingest` handler in
+`cmd/kbd` becomes this expansion. Declare the `Source`/`Fetcher`/`Renderer`
+interfaces in `internal/kb` now (even unimplemented) so the seam and its types
+(`ResourceRef`, `Extracted`, `Cursor`, `Health`, `RenderOpts`) are fixed.
+
+## 0.3 Privacy enforcement + SSRF guard (security-critical for Phase 2)
+
+- **Privacy gate:** make `PrivacyOK` a hard precondition in the enricher dispatch
+  path — a `sensitive`/`restricted` artifact is never dispatched to a cloud
+  enricher regardless of `KB_CLOUD_LLM`; the flag only *enables* cloud for
+  `public`/`personal`. Test that a sensitive artifact never reaches a cloud
+  handler. (Per-source tagging is already done; this enforces it.)
+- **SSRF guard:** a dedicated, unit-tested package the fetcher *must* call —
+  scheme allowlist (`http`/`https` only), resolve-then-pin the IP and reject
+  loopback / private / link-local / ULA / multicast / Tailscale CGNAT
+  (`100.64.0.0/10`) on every redirect hop, cap redirects and response size, set
+  per-fetch timeouts. The fetcher runs on a host next to localhost sidecars, so
+  this is required before any URL is fetched.
+
+## 0.4 Read pool
+
+Add a second, read-only `*sql.DB` (N connections) over the same WAL file; keep
+the writer at `SetMaxOpenConns(1)`. Route `Get`/`List` to the read pool,
+mutations and `Tx` to the writer. WAL already allows concurrent readers against
+the writer; this stops enricher writes (long, LLM-bound) and `/ingest` from
+serializing reads behind them.
+
+## 0.5 Source surface + connector registry
+
+`SourceRepo` needs `List`/`Update`/`SoftDelete` (the scheduler §8.1 and health
+monitor §8.15 enumerate and mutate sources). Add a `connector -> Source`
+registry and validate at source-create and at startup that every enabled
+source's connector is registered. Map the deferred `schedule`/`auth_state`/
+`storage_budget` columns.
+
+## 0.6 Audit + identity hardening
+
+- Write `audit_log` entries on ingest of (and future reads of) `sensitive`/
+  `restricted` artifacts (actor, action, artifact_id, tier).
+- Move from one static `KB_API_TOKEN` to **per-device tokens** (a credentials
+  table or signed tokens) so each device is individually revocable and populates
+  `audit_log.actor`; add a token-entropy floor in `config.Load`.
+- Reject invalid UTF-8 / control characters in ingest text (stored-injection
+  hardening for the Phase 10 renderers); output-encode at render time.
+
+## Already realized (Phase 1.x review)
+
+Event-driven runner + claim index + job purge; cascade-fail as a recursive CTE;
+per-source privacy tiering + tier validation; DB file `0600` + `0077` umask; slog;
+SSE write-error + heartbeat; bus RWMutex; canon allocation/typed-event cleanups;
+DB-file and HTTP hardening; tooling (Makefile, golangci-lint, CI); the
+notification-vs-durable-work bus rule (design §9). Coverage backfilled across all
+packages.
