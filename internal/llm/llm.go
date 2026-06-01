@@ -31,9 +31,22 @@ type GenerateRequest struct {
 	Format json.RawMessage
 }
 
-// Client is the minimal local-LLM surface the enrichers use.
+// Client is the minimal local-LLM generation surface the enrichers use.
 type Client interface {
 	Generate(ctx context.Context, req GenerateRequest) (string, error)
+}
+
+// EmbedRequest is one embedding request over a single text input.
+type EmbedRequest struct {
+	Model string
+	Input string
+}
+
+// Embedder produces a vector embedding for a text. Kept separate from Client so a
+// caller depends only on the capability it uses (the embed stage needs no
+// generation, the summarize stage needs no embeddings).
+type Embedder interface {
+	Embed(ctx context.Context, req EmbedRequest) ([]float32, error)
 }
 
 // Ollama calls a local Ollama server's /api/generate endpoint.
@@ -127,4 +140,60 @@ func (o *Ollama) Generate(ctx context.Context, req GenerateRequest) (string, err
 		return "", fmt.Errorf("llm: ollama returned an incomplete (not done) response")
 	}
 	return out.Response, nil
+}
+
+type ollamaEmbedRequest struct {
+	Model string `json:"model"`
+	Input string `json:"input"`
+}
+
+type ollamaEmbedResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
+	Error      string      `json:"error,omitempty"`
+}
+
+// Embed returns the embedding vector for req.Input. An empty model is rejected
+// before any network call; a non-2xx status, an `error` field, and a response
+// carrying no embedding are all errors. The single-input request yields a
+// one-element embeddings array, of which the first vector is returned.
+func (o *Ollama) Embed(ctx context.Context, req EmbedRequest) ([]float32, error) {
+	if req.Model == "" {
+		return nil, fmt.Errorf("llm: model is required")
+	}
+	body, err := json.Marshal(ollamaEmbedRequest(req))
+	if err != nil {
+		return nil, fmt.Errorf("llm: marshal embed request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/api/embed", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("llm: build embed request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := o.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("llm: call ollama embed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("llm: read embed response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("llm: ollama embed status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var out ollamaEmbedResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("llm: decode embed response: %w", err)
+	}
+	if out.Error != "" {
+		return nil, fmt.Errorf("llm: ollama embed error: %s", out.Error)
+	}
+	if len(out.Embeddings) == 0 || len(out.Embeddings[0]) == 0 {
+		return nil, fmt.Errorf("llm: ollama returned no embedding")
+	}
+	return out.Embeddings[0], nil
 }

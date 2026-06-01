@@ -18,6 +18,7 @@ type Config struct {
 	CloudLLMEnabled bool   // KB_CLOUD_LLM (default false)
 	OllamaURL       string // KB_OLLAMA_URL (default http://127.0.0.1:11434)
 	SummarizeModel  string // KB_SUMMARIZE_MODEL (default llama3.2)
+	EmbedModel      string // KB_EMBED_MODEL (default nomic-embed-text)
 	OllamaIsLocal   bool   // computed: true when OllamaURL is a loopback endpoint
 }
 
@@ -33,6 +34,7 @@ func Load(getenv func(string) string) (*Config, error) {
 		CloudLLMEnabled: parseBool(getenv("KB_CLOUD_LLM")),
 		OllamaURL:       orDefault(getenv("KB_OLLAMA_URL"), "http://127.0.0.1:11434"),
 		SummarizeModel:  orDefault(getenv("KB_SUMMARIZE_MODEL"), "llama3.2"),
+		EmbedModel:      orDefault(getenv("KB_EMBED_MODEL"), "nomic-embed-text"),
 	}
 
 	var missing []string

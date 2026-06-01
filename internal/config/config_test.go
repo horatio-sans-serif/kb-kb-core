@@ -35,6 +35,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.SummarizeModel != "llama3.2" {
 		t.Errorf("SummarizeModel = %q, want the default model", cfg.SummarizeModel)
 	}
+	if cfg.EmbedModel != "nomic-embed-text" {
+		t.Errorf("EmbedModel = %q, want the default embed model", cfg.EmbedModel)
+	}
 }
 
 func TestConfig_MissingTokenFails(t *testing.T) {

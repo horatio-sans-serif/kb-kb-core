@@ -442,14 +442,18 @@ func TestIngest_PipelineFetchesAndMarksReady(t *testing.T) {
 	}
 }
 
-// staticLLM returns the same canned completion for every call.
+// staticLLM returns the same canned completion and embedding for every call.
 type staticLLM struct{ resp string }
 
 func (s staticLLM) Generate(_ context.Context, _ llm.GenerateRequest) (string, error) {
 	return s.resp, nil
 }
 
-func TestIngest_FetchThenSummarize_EndToEnd(t *testing.T) {
+func (s staticLLM) Embed(_ context.Context, _ llm.EmbedRequest) ([]float32, error) {
+	return []float32{0.1, 0.2, 0.3}, nil
+}
+
+func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(w, `<html><head><title>P</title></head><body><p>Fetched body.</p></body></html>`)
@@ -459,10 +463,11 @@ func TestIngest_FetchThenSummarize_EndToEnd(t *testing.T) {
 	st := storetest.New(t)
 	bus := events.NewBus()
 	runner := jobs.NewRunner(st, jobs.WithLogger(discardLogger()))
+	model := staticLLM{resp: `{"summary":"S","tags":["go","kb"],"critical_analysis":"C"}`}
 	p := pipeline.New()
 	p.Register(enrich.NewFetch(fetch.NewWebFetcher(page.Client())))
-	p.Register(enrich.NewSummarize(
-		staticLLM{resp: `{"summary":"S","tags":["go","kb"],"critical_analysis":"C"}`}, "fake-model", true))
+	p.Register(enrich.NewSummarize(model, "fake-model", true))
+	p.Register(enrich.NewEmbed(model, "fake-embed", true))
 	p.RegisterHandlers(st, runner, bus)
 	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p})
 	h := srv.Handler()
@@ -483,14 +488,14 @@ func TestIngest_FetchThenSummarize_EndToEnd(t *testing.T) {
 
 	arts, _ := st.Artifacts.List(ctx)
 	if len(arts) != 1 || arts[0].Status != "ready" {
-		t.Fatalf("artifacts = %v, want one ready after fetch+summarize", arts)
+		t.Fatalf("artifacts = %v, want one ready after fetch+summarize+embed", arts)
 	}
 	ens, _ := st.Enrichments.ListForArtifact(ctx, arts[0].ID)
 	kinds := map[string]bool{}
 	for _, e := range ens {
 		kinds[e.Kind] = true
 	}
-	for _, want := range []string{"fetch", "summary", "tags", "critical_analysis"} {
+	for _, want := range []string{"fetch", "summary", "tags", "critical_analysis", "embedding"} {
 		if !kinds[want] {
 			t.Errorf("missing %q enrichment; got kinds %v", want, kinds)
 		}

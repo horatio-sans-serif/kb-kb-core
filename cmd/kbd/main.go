@@ -110,6 +110,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	enrichment := pipeline.New()
 	enrichment.Register(enrich.NewFetch(fetch.New()))
 	enrichment.Register(enrich.NewSummarize(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
+	enrichment.Register(enrich.NewEmbed(llmClient, cfg.EmbedModel, cfg.OllamaIsLocal))
 	enrichment.RegisterHandlers(st, runner, bus)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not

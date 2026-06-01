@@ -614,7 +614,30 @@ included), not just summarize. A later stage will make it exactly-once — eithe
 idempotent upsert keyed on `(artifact_id, kind, prompt_version)` or folding the
 `MarkDone` write into the enrichment transaction. Out of scope here.
 
-**Next (Stage 3 — embeddings + relevance):** `embed` (sqlite-vec — needs the
-vec0 runtime extension + a vector store) producing artifact- and chunk-level
-vectors, feeding relevance scoring against the static profile (§8.5/§8.9). Then
-retrieval (Phase 3).
+## Phase 2 — Stage 3.1: Artifact embeddings
+
+**Goal:** each text artifact gets a vector embedding from the local embed model,
+stored as an `enrichment` row so it syncs and every replica can rebuild its local
+ANN index (design §6.5 / §6.0; Decision 2 — local-only embeddings).
+
+**Status: Complete.** Verified end to end (fetch → summarize + embed → `ready`
+with an `embedding` row) against a fake embedder.
+
+- **`internal/llm`.** An `Embedder` interface (`Embed`) over Ollama's `/api/embed`
+  (`{model, input}` → `{embeddings: [[...]]}`), separate from `Client` so callers
+  depend only on what they use. `*Ollama` implements both. Returns `[]float32`
+  (matches the `vec0` `FLOAT[N]` storage type).
+- **`embed` enricher.** `DependsOn: ["fetch"]` (needs the body; runs in parallel
+  with `summarize`). Embeds the truncated body and writes one `embedding`
+  enrichment row whose payload carries the model, dimension, and vector. No
+  artifact patch. Same locality-aware `PrivacyOK` as `summarize` (the embed model
+  is local Ollama; a remote endpoint gates sensitive/restricted off). Empty body
+  is a graceful no-op.
+- **Config + wiring.** `KB_EMBED_MODEL` (default `nomic-embed-text`). `cmd/kbd`
+  registers `embed` after `fetch`.
+
+**Next (Stage 3.2 — relevance):** a relevance enricher scoring each artifact
+against the profile (`profile_match * recency * engagement * encounter *
+source_weight`, §8.9). Needs cross-table signals (encounter count, source weight)
+exposed to the enricher via an injected read-only context provider. Then the
+`vec0`/FTS5 local indexes and retrieval (Phase 3).
