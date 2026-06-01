@@ -37,3 +37,18 @@ func (r *EncounterRepo) CountForArtifact(ctx context.Context, artifactID string)
 	}
 	return n, nil
 }
+
+// MaxSourceWeightForArtifact returns the weight of the most authoritative source
+// that has encountered the artifact (the relevance source_weight factor, §8.9).
+// Defaults to 1.0 when the artifact has no encounters — a neutral weight that
+// neither boosts nor suppresses.
+func (r *EncounterRepo) MaxSourceWeightForArtifact(ctx context.Context, artifactID string) (float64, error) {
+	var w float64
+	if err := r.rq.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(s.source_weight), 1.0)
+		 FROM encounters e JOIN sources s ON s.id = e.source_id
+		 WHERE e.artifact_id = ?`, artifactID).Scan(&w); err != nil {
+		return 0, fmt.Errorf("max source weight for %q: %w", artifactID, err)
+	}
+	return w, nil
+}

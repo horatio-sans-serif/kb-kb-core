@@ -123,6 +123,16 @@ type Enrichment struct {
 	CreatedAt     string
 }
 
+// EmbeddingPayload is the JSON shape of an "embedding" enrichment row's payload.
+// Dim is stored alongside the vector so a reader can validate it against a local
+// index's fixed dimension (§6.5). The embed stage writes it; the relevance stage
+// (via its signal provider) reads it back.
+type EmbeddingPayload struct {
+	Model  string    `json:"model"`
+	Dim    int       `json:"dim"`
+	Vector []float32 `json:"vector"`
+}
+
 // Source is a registered origin of artifacts (design §6.1). Behavioral source
 // connectors implement the Source interface in contracts.go; this is the stored
 // configuration row.

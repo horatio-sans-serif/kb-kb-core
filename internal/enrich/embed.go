@@ -17,16 +17,6 @@ const (
 	maxEmbedInputBytes = 16000
 )
 
-// embeddingPayload is the JSON stored in the embedding enrichment row. The vector
-// travels as enrichment data so it syncs and every replica can rebuild its local
-// vec0 ANN index (design §6.5 / §6.0). Dim is stored so a reader can validate the
-// vector against the index's fixed dimension.
-type embeddingPayload struct {
-	Model  string    `json:"model"`
-	Dim    int       `json:"dim"`
-	Vector []float32 `json:"vector"`
-}
-
 // Embed is the artifact-level embedding stage (design §6.5): it embeds the
 // artifact body with the local embed model and writes one `embedding` enrichment
 // row. It does not patch the artifact.
@@ -71,7 +61,7 @@ func (e *Embed) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult, er
 		return kb.EnrichResult{}, fmt.Errorf("embed: model returned an empty vector")
 	}
 
-	payload := jsonString(embeddingPayload{Model: e.model, Dim: len(vec), Vector: vec})
+	payload := jsonString(kb.EmbeddingPayload{Model: e.model, Dim: len(vec), Vector: vec})
 	return kb.EnrichResult{Enrichments: []kb.Enrichment{{
 		ArtifactID:    a.ID,
 		Kind:          "embedding",

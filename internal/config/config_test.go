@@ -128,6 +128,20 @@ func TestConfig_RemoteOllamaAllowedWithOptIn(t *testing.T) {
 	}
 }
 
+func TestConfig_InterestsParsed(t *testing.T) {
+	cfg, err := Load(envFunc(map[string]string{
+		"KB_DB":        "/tmp/kb.db",
+		"KB_API_TOKEN": "0123456789abcdef0123456789abcdef",
+		"KB_INTERESTS": " go async ; ; distributed systems ;",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Interests) != 2 || cfg.Interests[0] != "go async" || cfg.Interests[1] != "distributed systems" {
+		t.Errorf("Interests = %q, want [go async, distributed systems] (trimmed, empties dropped)", cfg.Interests)
+	}
+}
+
 func TestConfig_InvalidOllamaURLFails(t *testing.T) {
 	_, err := Load(envFunc(map[string]string{
 		"KB_DB":         "/tmp/kb.db",

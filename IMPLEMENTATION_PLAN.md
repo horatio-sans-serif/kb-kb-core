@@ -636,8 +636,40 @@ with an `embedding` row) against a fake embedder.
 - **Config + wiring.** `KB_EMBED_MODEL` (default `nomic-embed-text`). `cmd/kbd`
   registers `embed` after `fetch`.
 
-**Next (Stage 3.2 — relevance):** a relevance enricher scoring each artifact
-against the profile (`profile_match * recency * engagement * encounter *
-source_weight`, §8.9). Needs cross-table signals (encounter count, source weight)
-exposed to the enricher via an injected read-only context provider. Then the
-`vec0`/FTS5 local indexes and retrieval (Phase 3).
+## Phase 2 — Stage 3.2: Relevance scoring
+
+**Goal:** score each artifact against the profile and write the score to the
+artifact (design §8.9): `relevance = profile_match * recency * encounter *
+engagement * source_weight`.
+
+**Status: Complete.** Verified end to end (the full pipeline patches a positive
+`relevance_score` and writes a `relevance` breakdown row).
+
+- **`internal/relevance` (pure math).** `Cosine`, a weighted-interest `Profile`
+  with `Match` (max weight-scaled cosine, clamped to [0,1]; empty profile is
+  neutral = 1), the factor functions (`RecencyFactor` 30-day half-life,
+  `EncounterFactor` log-growth, `EngagementFactor`), and `Score` combining them.
+  `BuildProfile` embeds interest phrases (injected embed func — no I/O in the
+  package). I/O-free and fully unit-tested.
+- **`enrich.Relevance`.** `DependsOn: ["embed"]`. Reads the artifact's embedding,
+  encounter count, and max source weight through an injected `SignalProvider`
+  (the enricher stays store-free), scores it, and returns a
+  `Patch{RelevanceScore}` plus a `relevance` enrichment row carrying the factor
+  breakdown for explainability. No embedding yet → graceful no-op. `PrivacyOK` is
+  always true (pure local computation over stored data).
+- **`internal/relsignals`.** Store-backed `SignalProvider`: pulls the latest
+  `embedding` enrichment (parsed via `kb.EmbeddingPayload`), encounter count, and
+  `MAX(source_weight)` join. A missing embedding yields an empty vector, not an
+  error.
+- **Store.** `EnrichmentRepo.LatestByKind` and
+  `EncounterRepo.MaxSourceWeightForArtifact` (defaults to 1.0 for no encounters).
+- **Config + wiring.** `KB_INTERESTS` (semicolon-separated). `cmd/kbd` builds the
+  profile at startup (best-effort: a neutral profile if the embed model is
+  unreachable) and registers `relevance` after `embed`.
+
+The enrichment DAG is now `fetch → {summarize, embed}; embed → relevance`.
+
+**Next (Phase 3 — retrieval):** the `vec0`/FTS5 local indexes (rebuilt from synced
+enrichment data, §6.0), hybrid search, and RAG. Plus the deferred items: chunk-
+level embeddings (Decision 3 chunking), the living profile and re-scoring on
+engagement/profile change (§9), and exactly-once enrichment writes.

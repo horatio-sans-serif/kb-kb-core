@@ -24,6 +24,8 @@ import (
 	"kb/internal/jobs"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
+	"kb/internal/relevance"
+	"kb/internal/relsignals"
 	"kb/internal/store"
 )
 
@@ -103,14 +105,28 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// fetch retrieves the body; summarize runs a local Ollama model over it to
 	// produce summary/tags/critical-analysis enrichment rows (design §8.5).
 	if !cfg.OllamaIsLocal {
-		logger.Warn("Ollama endpoint is not loopback; sensitive/restricted artifacts will skip summarization",
+		logger.Warn("Ollama endpoint is not loopback; sensitive/restricted artifacts will skip summarization/embedding",
 			"url", cfg.OllamaURL)
 	}
 	llmClient := llm.NewOllama(cfg.OllamaURL)
+
+	// Build the relevance profile by embedding the configured interest phrases.
+	// Best-effort: if the embed model is unreachable at startup, fall back to a
+	// neutral (empty) profile so the daemon still serves and enriches.
+	embedFn := func(ctx context.Context, text string) ([]float32, error) {
+		return llmClient.Embed(ctx, llm.EmbedRequest{Model: cfg.EmbedModel, Input: text})
+	}
+	profile, err := relevance.BuildProfile(ctx, embedFn, cfg.Interests)
+	if err != nil {
+		logger.Warn("building relevance profile failed; using a neutral profile", "err", err)
+		profile = relevance.NewProfile(nil)
+	}
+
 	enrichment := pipeline.New()
 	enrichment.Register(enrich.NewFetch(fetch.New()))
 	enrichment.Register(enrich.NewSummarize(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewEmbed(llmClient, cfg.EmbedModel, cfg.OllamaIsLocal))
+	enrichment.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	enrichment.RegisterHandlers(st, runner, bus)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not

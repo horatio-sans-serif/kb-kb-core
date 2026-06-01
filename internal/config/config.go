@@ -11,15 +11,16 @@ import (
 
 // Config is the daemon's runtime configuration.
 type Config struct {
-	DBPath          string // KB_DB (required)
-	ListenAddr      string // KB_LISTEN_ADDR (default 127.0.0.1:8087; binding beyond loopback exposes the token-guarded API, e.g. on a Tailscale interface)
-	APIToken        string // KB_API_TOKEN (required)
-	DefaultPrivacy  string // KB_DEFAULT_PRIVACY (default personal)
-	CloudLLMEnabled bool   // KB_CLOUD_LLM (default false)
-	OllamaURL       string // KB_OLLAMA_URL (default http://127.0.0.1:11434)
-	SummarizeModel  string // KB_SUMMARIZE_MODEL (default llama3.2)
-	EmbedModel      string // KB_EMBED_MODEL (default nomic-embed-text)
-	OllamaIsLocal   bool   // computed: true when OllamaURL is a loopback endpoint
+	DBPath          string   // KB_DB (required)
+	ListenAddr      string   // KB_LISTEN_ADDR (default 127.0.0.1:8087; binding beyond loopback exposes the token-guarded API, e.g. on a Tailscale interface)
+	APIToken        string   // KB_API_TOKEN (required)
+	DefaultPrivacy  string   // KB_DEFAULT_PRIVACY (default personal)
+	CloudLLMEnabled bool     // KB_CLOUD_LLM (default false)
+	OllamaURL       string   // KB_OLLAMA_URL (default http://127.0.0.1:11434)
+	SummarizeModel  string   // KB_SUMMARIZE_MODEL (default llama3.2)
+	EmbedModel      string   // KB_EMBED_MODEL (default nomic-embed-text)
+	Interests       []string // KB_INTERESTS (semicolon-separated phrases for the relevance profile)
+	OllamaIsLocal   bool     // computed: true when OllamaURL is a loopback endpoint
 }
 
 // Load reads configuration via getenv (pass os.Getenv in production). It returns
@@ -35,6 +36,7 @@ func Load(getenv func(string) string) (*Config, error) {
 		OllamaURL:       orDefault(getenv("KB_OLLAMA_URL"), "http://127.0.0.1:11434"),
 		SummarizeModel:  orDefault(getenv("KB_SUMMARIZE_MODEL"), "llama3.2"),
 		EmbedModel:      orDefault(getenv("KB_EMBED_MODEL"), "nomic-embed-text"),
+		Interests:       splitList(getenv("KB_INTERESTS")),
 	}
 
 	var missing []string
@@ -105,6 +107,18 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// splitList parses a semicolon-separated list, trimming whitespace and dropping
+// empty entries. Returns nil for an empty/blank value.
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ";") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseBool(v string) bool {

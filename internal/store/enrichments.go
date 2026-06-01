@@ -46,6 +46,25 @@ func (r *EnrichmentRepo) ListForArtifact(ctx context.Context, artifactID string)
 	return out, rows.Err()
 }
 
+// LatestByKind returns the most recent enrichment of a kind for an artifact, or
+// ErrNotFound. The relevance stage uses it to read back the embedding vector the
+// embed stage wrote (the stages communicate only through stored rows).
+func (r *EnrichmentRepo) LatestByKind(ctx context.Context, artifactID, kind string) (*Enrichment, error) {
+	var e Enrichment
+	err := r.rq.QueryRowContext(ctx,
+		`SELECT id, artifact_id, kind, payload, model, prompt_version, created_at
+		 FROM enrichments WHERE artifact_id = ? AND kind = ?
+		 ORDER BY created_at DESC, id DESC LIMIT 1`, artifactID, kind).
+		Scan(&e.ID, &e.ArtifactID, &e.Kind, &e.Payload, &e.Model, &e.PromptVersion, &e.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("latest %q enrichment for %q: %w", kind, artifactID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("latest %q enrichment for %q: %w", kind, artifactID, err)
+	}
+	return &e, nil
+}
+
 // Get returns the enrichment by id, or ErrNotFound.
 func (r *EnrichmentRepo) Get(ctx context.Context, id string) (*Enrichment, error) {
 	var e Enrichment

@@ -18,6 +18,8 @@ func newTestStore(t *testing.T) *Store {
 	return New(db)
 }
 
+func ptrStr(s string) *string { return &s }
+
 // TestReadPool_SnapshotIsolation pins the read/write split the daemon relies on:
 // an uncommitted write is invisible to the read pool, and a committed one is
 // visible. The pipeline's finalize hook reads job state through the read pool
@@ -204,6 +206,82 @@ func TestEncounter_CountIsRelevanceSignal(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("encounter count = %d, want 2 (seen from 2 sources)", n)
+	}
+}
+
+func TestEncounter_MaxSourceWeight(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	// No encounters yet → neutral default 1.0.
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "b", ContentHash: ptrStr("h")})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if w, err := st.Encounters.MaxSourceWeightForArtifact(ctx, a.ID); err != nil || w != 1.0 {
+		t.Errorf("no-encounter weight = %v (err %v), want 1.0", w, err)
+	}
+
+	light := &Source{Kind: "PULL", Connector: "a", SourceWeight: 0.5}
+	heavy := &Source{Kind: "PUSH", Connector: "b", SourceWeight: 3.0}
+	if err := st.Sources.Create(ctx, light); err != nil {
+		t.Fatalf("create light: %v", err)
+	}
+	if err := st.Sources.Create(ctx, heavy); err != nil {
+		t.Fatalf("create heavy: %v", err)
+	}
+	// Source.Create takes the schema default (1.0) and ignores SourceWeight, so
+	// set the weights explicitly via Update.
+	light.SourceWeight, heavy.SourceWeight = 0.5, 3.0
+	if err := st.Sources.Update(ctx, light); err != nil {
+		t.Fatalf("update light: %v", err)
+	}
+	if err := st.Sources.Update(ctx, heavy); err != nil {
+		t.Fatalf("update heavy: %v", err)
+	}
+	for _, sid := range []string{light.ID, heavy.ID} {
+		if err := st.Encounters.Record(ctx, &Encounter{ArtifactID: a.ID, SourceID: sid}); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+
+	w, err := st.Encounters.MaxSourceWeightForArtifact(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("max weight: %v", err)
+	}
+	if w != 3.0 {
+		t.Errorf("max source weight = %v, want 3.0 (the most authoritative source)", w)
+	}
+}
+
+func TestEnrichment_LatestByKind(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "b", ContentHash: ptrStr("h")})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+
+	if _, err := st.Enrichments.LatestByKind(ctx, a.ID, "embedding"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing kind should be ErrNotFound, got %v", err)
+	}
+
+	for _, p := range []string{`{"v":1}`, `{"v":2}`} {
+		if err := st.Enrichments.Create(ctx, &Enrichment{ArtifactID: a.ID, Kind: "embedding", Payload: p, Model: "m", PromptVersion: "v1"}); err != nil {
+			t.Fatalf("create enrichment: %v", err)
+		}
+	}
+	// A different kind must not be returned.
+	if err := st.Enrichments.Create(ctx, &Enrichment{ArtifactID: a.ID, Kind: "summary", Payload: `{"v":9}`, Model: "m", PromptVersion: "v1"}); err != nil {
+		t.Fatalf("create summary: %v", err)
+	}
+
+	got, err := st.Enrichments.LatestByKind(ctx, a.ID, "embedding")
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+	if got.Kind != "embedding" || got.Payload != `{"v":2}` {
+		t.Errorf("latest embedding = %+v, want the most recent embedding payload {\"v\":2}", got)
 	}
 }
 

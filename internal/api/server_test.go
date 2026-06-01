@@ -18,6 +18,8 @@ import (
 	"kb/internal/jobs"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
+	"kb/internal/relevance"
+	"kb/internal/relsignals"
 	"kb/internal/store"
 	"kb/internal/storetest"
 )
@@ -464,10 +466,12 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	bus := events.NewBus()
 	runner := jobs.NewRunner(st, jobs.WithLogger(discardLogger()))
 	model := staticLLM{resp: `{"summary":"S","tags":["go","kb"],"critical_analysis":"C"}`}
+	profile := relevance.NewProfile([]relevance.WeightedVector{{Vector: []float32{0.1, 0.2, 0.3}, Weight: 1}})
 	p := pipeline.New()
 	p.Register(enrich.NewFetch(fetch.NewWebFetcher(page.Client())))
 	p.Register(enrich.NewSummarize(model, "fake-model", true))
 	p.Register(enrich.NewEmbed(model, "fake-embed", true))
+	p.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	p.RegisterHandlers(st, runner, bus)
 	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p})
 	h := srv.Handler()
@@ -488,14 +492,18 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 
 	arts, _ := st.Artifacts.List(ctx)
 	if len(arts) != 1 || arts[0].Status != "ready" {
-		t.Fatalf("artifacts = %v, want one ready after fetch+summarize+embed", arts)
+		t.Fatalf("artifacts = %v, want one ready after the full pipeline", arts)
 	}
-	ens, _ := st.Enrichments.ListForArtifact(ctx, arts[0].ID)
+	a := arts[0]
+	if a.RelevanceScore == nil || *a.RelevanceScore <= 0 {
+		t.Errorf("relevance score = %v, want a positive score patched onto the artifact", a.RelevanceScore)
+	}
+	ens, _ := st.Enrichments.ListForArtifact(ctx, a.ID)
 	kinds := map[string]bool{}
 	for _, e := range ens {
 		kinds[e.Kind] = true
 	}
-	for _, want := range []string{"fetch", "summary", "tags", "critical_analysis", "embedding"} {
+	for _, want := range []string{"fetch", "summary", "tags", "critical_analysis", "embedding", "relevance"} {
 		if !kinds[want] {
 			t.Errorf("missing %q enrichment; got kinds %v", want, kinds)
 		}
