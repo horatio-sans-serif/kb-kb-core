@@ -14,8 +14,8 @@ func TestMigrate_FreshDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if applied != 1 {
-		t.Fatalf("applied = %d, want 1", applied)
+	if applied < 1 {
+		t.Fatalf("applied = %d, want >= 1", applied)
 	}
 
 	for _, tbl := range []string{"sources", "artifacts", "encounters", "enrichments", "schema_migrations"} {
@@ -24,19 +24,22 @@ func TestMigrate_FreshDB(t *testing.T) {
 		}
 	}
 
-	var v int
-	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&v); err != nil {
-		t.Fatalf("read version: %v", err)
+	// Every applied migration is recorded exactly once (count-robust as
+	// migrations accumulate across phases).
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
+		t.Fatalf("count migrations: %v", err)
 	}
-	if v != 1 {
-		t.Errorf("schema version = %d, want 1", v)
+	if n != applied {
+		t.Errorf("recorded %d migrations, want %d (one row per applied)", n, applied)
 	}
 }
 
 func TestMigrate_Idempotent(t *testing.T) {
 	db := openTemp(t)
 
-	if _, err := Migrate(db); err != nil {
+	first, err := Migrate(db)
+	if err != nil {
 		t.Fatalf("first Migrate: %v", err)
 	}
 	applied, err := Migrate(db)
@@ -51,8 +54,8 @@ func TestMigrate_Idempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("schema_migrations rows = %d, want 1", n)
+	if n != first {
+		t.Errorf("schema_migrations rows = %d, want %d (no duplicate on re-run)", n, first)
 	}
 }
 

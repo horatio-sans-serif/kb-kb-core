@@ -252,6 +252,65 @@ func TestAuth_EmptyConfiguredTokenRejects(t *testing.T) {
 	}
 }
 
+func TestIngest_CanonicalDedup(t *testing.T) {
+	st, _, h := testServer(t)
+	ctx := context.Background()
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	// Two URLs differing only by tracking params canonicalize to the same URL.
+	doIngest(h, `{"source_id":"`+src.ID+`","url":"https://example.com/p?utm_source=a"}`, "tok")
+	doIngest(h, `{"source_id":"`+src.ID+`","url":"https://example.com/p?utm_source=b&fbclid=z"}`, "tok")
+
+	arts, err := st.Artifacts.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(arts) != 1 {
+		t.Fatalf("artifacts = %d, want 1 (deduped by canonical URL)", len(arts))
+	}
+	if arts[0].CanonicalURL == nil || *arts[0].CanonicalURL != "https://example.com/p" {
+		t.Errorf("canonical_url = %v, want https://example.com/p", arts[0].CanonicalURL)
+	}
+	if n, _ := st.Encounters.CountForArtifact(ctx, arts[0].ID); n != 2 {
+		t.Errorf("encounters = %d, want 2", n)
+	}
+}
+
+func TestIngest_ContentDedup(t *testing.T) {
+	st, _, h := testServer(t)
+	ctx := context.Background()
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	// Same content, different whitespace -> same fingerprint -> one artifact.
+	doIngest(h, `{"source_id":"`+src.ID+`","body":"hello world"}`, "tok")
+	doIngest(h, `{"source_id":"`+src.ID+`","body":"hello   world"}`, "tok")
+
+	arts, err := st.Artifacts.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(arts) != 1 {
+		t.Errorf("artifacts = %d, want 1 (deduped by content hash)", len(arts))
+	}
+}
+
+func TestIngest_InvalidURL(t *testing.T) {
+	st, _, h := testServer(t)
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(context.Background(), src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if rec := doIngest(h, `{"source_id":"`+src.ID+`","url":"not a url"}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an invalid url", rec.Code)
+	}
+}
+
 func doIngest(h http.Handler, body, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
 	if token != "" {

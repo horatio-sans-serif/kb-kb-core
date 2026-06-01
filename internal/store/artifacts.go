@@ -49,6 +49,21 @@ const artifactSelect = `SELECT ` + artifactColNames + ` FROM artifacts`
 // on conflict only last_seen_at/updated_at change (a re-sighting must not
 // clobber an existing artifact's enriched fields).
 func (r *ArtifactRepo) UpsertByCanonical(ctx context.Context, a *Artifact) (*Artifact, error) {
+	return r.upsert(ctx, a, `ON CONFLICT(canonical_url) WHERE canonical_url IS NOT NULL AND deleted_at IS NULL`)
+}
+
+// UpsertByContentHash is the content-fingerprint dedup path (§8.2): the same
+// content provided as a body, or (Phase 2) fetched from different URLs, collapses
+// to one artifact. ContentHash must be set. URL artifacts carry a NULL
+// content_hash until fetched, so the two upsert paths never collide. Same
+// insert/conflict semantics as UpsertByCanonical.
+func (r *ArtifactRepo) UpsertByContentHash(ctx context.Context, a *Artifact) (*Artifact, error) {
+	return r.upsert(ctx, a, `ON CONFLICT(content_hash) WHERE content_hash IS NOT NULL AND deleted_at IS NULL`)
+}
+
+// upsert performs the shared insert-or-touch, differing only by the ON CONFLICT
+// target. conflict is a trusted constant (not user input).
+func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, conflict string) (*Artifact, error) {
 	if a.ID == "" {
 		a.ID = NewID()
 	}
@@ -74,7 +89,7 @@ func (r *ArtifactRepo) UpsertByCanonical(ctx context.Context, a *Artifact) (*Art
 			privacy_tier, lifecycle_tier, status, relevance_score,
 			first_seen_at, last_seen_at, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(canonical_url) WHERE canonical_url IS NOT NULL AND deleted_at IS NULL
+		 `+conflict+`
 		 DO UPDATE SET last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at
 		 RETURNING `+artifactColNames,
 		a.ID, a.Type, a.CanonicalURL, a.ContentHash, a.Title, a.BodyMarkdown,

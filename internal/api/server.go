@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"kb/internal/canon"
 	"kb/internal/events"
 	"kb/internal/store"
 )
@@ -110,6 +111,16 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var canonicalURL string
+	if req.URL != "" {
+		c, err := canon.URL(req.URL)
+		if err != nil {
+			http.Error(w, "invalid url", http.StatusBadRequest)
+			return
+		}
+		canonicalURL = c
+	}
+
 	ctx := r.Context()
 	if _, err := s.deps.Store.Sources.Get(ctx, req.SourceID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -123,14 +134,19 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	var artifactID string
 	err := s.deps.Store.Tx(ctx, func(tx *store.Store) error {
 		a := &store.Artifact{Title: req.Title, PrivacyTier: s.deps.DefaultPrivacy}
+		var art *store.Artifact
+		var err error
 		if req.URL != "" {
 			a.Type = "webpage"
-			a.CanonicalURL = &req.URL
+			a.CanonicalURL = &canonicalURL // dedup by canonical URL
+			art, err = tx.Artifacts.UpsertByCanonical(ctx, a)
 		} else {
 			a.Type = "note"
 			a.BodyMarkdown = req.Body
+			h := canon.Content(req.Body)
+			a.ContentHash = &h // dedup by content fingerprint
+			art, err = tx.Artifacts.UpsertByContentHash(ctx, a)
 		}
-		art, err := tx.Artifacts.UpsertByCanonical(ctx, a)
 		if err != nil {
 			return err
 		}
@@ -138,7 +154,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 		var rawURL *string
 		if req.URL != "" {
-			rawURL = &req.URL
+			rawURL = &req.URL // preserve the as-seen URL on the encounter
 		}
 		if err := tx.Encounters.Record(ctx, &store.Encounter{
 			ArtifactID: art.ID, SourceID: req.SourceID, RawURL: rawURL,

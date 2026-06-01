@@ -1,8 +1,38 @@
-# KB Core — Implementation Plan: Phase 0 (Spine)
+# KB Core — Implementation Plan
 
-Implements Phase 0 of `UNIFIED_SYSTEM_DESIGN_PLAN.md` §12: the core daemon
-skeleton everything else depends on. Subsequent phases get their own plans.
-Delete this file when all stages are Complete.
+The living build plan, tracking the phases of `UNIFIED_SYSTEM_DESIGN_PLAN.md`
+§12. Phase 0 (the spine) is broken into the five stages below; later phases are
+appended as they are designed and built.
+
+## Documentation & Walkthrough (ongoing, system-wide deliverable)
+
+**Requirement:** a long-form walkthrough of every part of this system is needed
+when it is done — what each subsystem does, how the pieces compose, and how a
+request flows end to end.
+
+**Approach — build it as we go, don't backfill at the end.** Each phase produces
+one walkthrough document under `docs/walkthrough/NN-<name>.md` while the work is
+fresh; together they accumulate into the long-form system walkthrough. Each entry
+covers: what was built, why (linking the design section), how it fits the spine,
+the request/data flow it participates in, and the key decisions/trade-offs.
+
+**Reuse the doc/learning projects already in `~/projects/kb/`** rather than
+building new surfaces:
+
+- **Output/Render layer** (design "Output / Render Layer"): the walkthrough is
+  Markdown-at-rest, so `pandoc` renders it to PDF/HTML and `patat` to a
+  terminal slide-walkthrough — the render layer's first real consumer.
+- **`agent-skills-tutorial`** (interactive HTML tutorial format): the shape for
+  an interactive, click-through version of the walkthrough.
+- **`glance`** (detects learning material; its "Copy Claude Instructions" button
+  emits a tailored prompt to build demos + interactive tutorials): use that
+  prompt pattern to generate the interactive walkthrough from each phase doc.
+- **`flashcarder`** (spaced-repetition flashcards from content): generate
+  concept-review cards from each walkthrough doc so the system's own design is
+  learnable/retained.
+
+Status: structure established (`docs/walkthrough/README.md`); per-phase entries
+written as each phase completes.
 
 ## Phase 0 Tech Decisions
 
@@ -343,3 +373,64 @@ Review fixes applied (54 tests total under `-race`):
   artifact through write → enqueue → event, observable on `/events`.
 - This is the spine for Phase 1 (ingestion/dedup), which extends Stage 2's
   upsert into the full canonicalization + fingerprint path (§8.2).
+
+---
+
+# Phase 1 — Ingestion: canonicalization + content-hash dedup (§8.2)
+
+**Goal:** make ingestion _correct_ — the same artifact arriving from different
+sources or at differently-decorated URLs collapses to one canonical artifact.
+
+## Stage 1.1: URL canonicalization
+
+**Goal**: a pure `canon.URL` that normalizes a raw URL so tracking-decorated and
+trivially-different URLs map to one canonical form.
+
+**Success Criteria**:
+
+- Strips tracking params (`utm_*`, `fbclid`, `gclid`, `mc_eid`, `igshid`,
+  `ref`/`ref_src`, ...); lowercases scheme + host; drops default ports; removes
+  `www.`; strips the fragment; removes a trailing slash (except root); sorts the
+  remaining query for stable output; conservative de-AMP.
+- Pure and offline. Redirect-following is deferred to fetch time (Phase 2), which
+  re-canonicalizes the resolved URL.
+- Wired into `POST /ingest`: the stored `canonical_url` is the canonicalized
+  form; the original is preserved as the encounter's `raw_url`.
+
+**Tests**: table-driven `canon.URL` cases (each normalization + idempotence:
+`URL(URL(x)) == URL(x)`); an API test that two URLs differing only by `utm_*`
+dedup to one artifact with two encounters.
+
+**Status**: Complete — `internal/canon.URL` (lowercase scheme/host, drop
+userinfo/default-port/`www.`/fragment, strip `utm_*` + tracking denylist, sort
+query, trailing-slash + conservative de-AMP); wired into `/ingest` (canonicalize
+→ 400 on bad URL → `CanonicalURL`, original preserved as the encounter `raw_url`).
+`TestURL`/`TestURL_Invalid`; `TestIngest_CanonicalDedup` (utm-only-difference →
+one artifact, two encounters) and `TestIngest_InvalidURL` (400).
+
+## Stage 1.2: Content fingerprint + content-hash dedup
+
+**Goal**: dedup the same content living at different URLs / provided as a body.
+
+**Success Criteria**:
+
+- `canon.Content` normalizes text (collapse whitespace, trim) and returns a
+  stable hash.
+- A partial unique index on `content_hash` (live rows) + `UpsertByContentHash`
+  (atomic `ON CONFLICT … RETURNING`), mirroring `UpsertByCanonical` (migration
+  `0002`).
+- `POST /ingest` of a `body` dedups by content hash; URL artifacts carry a NULL
+  content hash until fetched (Phase 2), so the two dedup paths don't collide.
+
+**Tests**: `canon.Content` normalization + stability; `UpsertByContentHash`
+dedups; an API test that two identical bodies collapse to one artifact.
+
+**Status**: Complete — `internal/canon.Content` (whitespace-collapsed SHA-256);
+migration `0002` swaps the non-unique content*hash index for a partial unique one
+(live rows) — the first multi-migration, exercising the runner; `store.upsert`
+refactored to share insert/conflict between `UpsertByCanonical` and the new
+`UpsertByContentHash`. `/ingest` of a `body` dedups by content hash (URL artifacts
+keep a NULL hash until fetched, so paths don't collide).
+`TestContent*\*`, `TestArtifact_UpsertByContentHash_Dedups`,
+`TestIngest_ContentDedup`. Migrate tests made count-robust for multi-migration.
+61 tests total green under `-race`; index swap verified at the SQL level.

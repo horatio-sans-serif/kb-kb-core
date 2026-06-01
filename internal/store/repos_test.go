@@ -218,6 +218,31 @@ func TestArtifact_ConcurrentUpsert_NoDuplicates(t *testing.T) {
 	}
 }
 
+func TestArtifact_UpsertByContentHash_Dedups(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	h := "0000000000000000000000000000000000000000000000000000000000000001"
+
+	a1, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", ContentHash: &h, BodyMarkdown: "hello"})
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	a2, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", ContentHash: &h, BodyMarkdown: "hello reflowed"})
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if a1.ID != a2.ID {
+		t.Errorf("content-hash upsert created a duplicate: %s != %s", a1.ID, a2.ID)
+	}
+	list, err := st.Artifacts.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Errorf("artifacts = %d, want 1 (deduped by content hash)", len(list))
+	}
+}
+
 func TestArtifact_GetNotFound(t *testing.T) {
 	st := newTestStore(t)
 	_, err := st.Artifacts.Get(context.Background(), "01NONEXISTENT")
