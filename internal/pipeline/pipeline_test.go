@@ -24,11 +24,13 @@ func (f *fakeEnricher) PrivacyOK(t kb.PrivacyTier) bool {
 	}
 	return true
 }
-func (f *fakeEnricher) Enrich(_ context.Context, a *kb.Artifact) ([]kb.Enrichment, error) {
+func (f *fakeEnricher) Enrich(_ context.Context, a *kb.Artifact) (kb.EnrichResult, error) {
 	if f.onEnrich != nil {
 		f.onEnrich(a)
 	}
-	return []kb.Enrichment{{ArtifactID: a.ID, Kind: f.name, Payload: "{}", Model: "test", PromptVersion: "v1"}}, nil
+	return kb.EnrichResult{
+		Enrichments: []kb.Enrichment{{ArtifactID: a.ID, Kind: f.name, Payload: "{}", Model: "test", PromptVersion: "v1"}},
+	}, nil
 }
 
 func TestPipeline_Validate(t *testing.T) {
@@ -85,6 +87,9 @@ func TestPipeline_EnqueueAndRun_RespectsOrder(t *testing.T) {
 	}
 	if len(ens) != 2 {
 		t.Errorf("persisted %d enrichments, want 2", len(ens))
+	}
+	if got, _ := st.Artifacts.Get(ctx, a.ID); got.Status != kb.StatusReady {
+		t.Errorf("artifact status = %q, want ready after the pipeline completes", got.Status)
 	}
 }
 

@@ -218,6 +218,32 @@ func TestArtifact_ConcurrentUpsert_NoDuplicates(t *testing.T) {
 	}
 }
 
+func TestArtifact_Patch(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	a, err := st.Artifacts.UpsertByCanonical(ctx, &Artifact{Type: "webpage", Title: "x"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	body := "# fetched"
+	status := ArtifactStatus("ready")
+	score := 0.75
+	if err := st.Artifacts.Patch(ctx, a.ID, ArtifactPatch{BodyMarkdown: &body, Status: &status, RelevanceScore: &score}); err != nil {
+		t.Fatalf("patch: %v", err)
+	}
+	got, _ := st.Artifacts.Get(ctx, a.ID)
+	if got.BodyMarkdown != body || got.Status != "ready" || got.RelevanceScore == nil || *got.RelevanceScore != score {
+		t.Errorf("after patch: body=%q status=%q score=%v", got.BodyMarkdown, got.Status, got.RelevanceScore)
+	}
+	if got.Title != "x" {
+		t.Errorf("narrow patch changed an unset field: title = %q", got.Title)
+	}
+	if err := st.Artifacts.Patch(ctx, a.ID, ArtifactPatch{}); err != nil {
+		t.Errorf("empty patch should be a no-op: %v", err)
+	}
+}
+
 func TestArtifact_UpsertByContentHash_Dedups(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

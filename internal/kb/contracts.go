@@ -29,6 +29,25 @@ type Fetcher interface {
 	Extract(ctx context.Context, ref ResourceRef) (Extracted, error)
 }
 
+// ArtifactPatch is a set of optional artifact-field updates produced by an
+// enrichment stage (fetch sets Body/Type; relevance sets RelevanceScore). nil
+// fields are left unchanged, so the pipeline applies a narrow UPDATE of only the
+// changed columns (keeping cr-sqlite per-column metadata churn minimal, §6.0).
+type ArtifactPatch struct {
+	Type           *ArtifactType
+	BodyMarkdown   *string
+	ContentHash    *string
+	Status         *ArtifactStatus
+	RelevanceScore *float64
+}
+
+// EnrichResult is one enricher's output: zero or more enrichment rows plus an
+// optional patch to the artifact itself.
+type EnrichResult struct {
+	Enrichments []Enrichment
+	Patch       *ArtifactPatch
+}
+
 // Enricher is one stage of the enrichment pipeline DAG (design §7 / §5).
 // DependsOn names the stages that must complete first; PrivacyOK lets a
 // cloud-backed enricher refuse sensitive/restricted artifacts — the privacy gate
@@ -37,7 +56,7 @@ type Enricher interface {
 	Name() string
 	DependsOn() []string
 	PrivacyOK(tier PrivacyTier) bool
-	Enrich(ctx context.Context, a *Artifact) ([]Enrichment, error)
+	Enrich(ctx context.Context, a *Artifact) (EnrichResult, error)
 }
 
 // RenderOpts configures a render.

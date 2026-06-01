@@ -7,12 +7,14 @@ import "kb/internal/kb"
 // usages compiling; they are the same types, not wrappers. Job stays defined in
 // this package — it is local-only queue infrastructure, not a domain entity.
 type (
-	Artifact      = kb.Artifact
-	Encounter     = kb.Encounter
-	Enrichment    = kb.Enrichment
-	Source        = kb.Source
-	PrivacyTier   = kb.PrivacyTier
-	SourceKind    = kb.SourceKind
-	ArtifactType  = kb.ArtifactType
-	LifecycleTier = kb.LifecycleTier
+	Artifact       = kb.Artifact
+	Encounter      = kb.Encounter
+	Enrichment     = kb.Enrichment
+	Source         = kb.Source
+	ArtifactPatch  = kb.ArtifactPatch
+	PrivacyTier    = kb.PrivacyTier
+	SourceKind     = kb.SourceKind
+	ArtifactType   = kb.ArtifactType
+	ArtifactStatus = kb.ArtifactStatus
+	LifecycleTier  = kb.LifecycleTier
 )

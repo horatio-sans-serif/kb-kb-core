@@ -29,6 +29,9 @@ func New() *Pipeline {
 // wiring bug and panics.
 func (p *Pipeline) Register(e kb.Enricher) {
 	name := e.Name()
+	if name == readyStage {
+		panic(fmt.Sprintf("pipeline: %q is a reserved stage name", name))
+	}
 	if _, dup := p.enrichers[name]; dup {
 		panic(fmt.Sprintf("pipeline: enricher %q already registered", name))
 	}
@@ -43,30 +46,49 @@ func (p *Pipeline) Validate() error {
 	return err
 }
 
-// Enqueue creates one job per stage for the artifact in a single transaction,
-// wiring each job's depends_on to the job ids of the stages it depends on.
+// readyStage is the built-in terminal stage: it depends on every enrichment
+// stage and marks the artifact ready once they all complete. It is reserved;
+// an enricher may not use this name.
+const readyStage = "@ready"
+
+// Enqueue runs EnqueueTx in its own transaction.
 func (p *Pipeline) Enqueue(ctx context.Context, st *store.Store, artifactID string) error {
+	return st.Tx(ctx, func(tx *store.Store) error {
+		return p.EnqueueTx(ctx, tx, artifactID)
+	})
+}
+
+// EnqueueTx expands the artifact into one job per stage (plus the terminal ready
+// stage) within an existing transaction, wiring each job's depends_on to the job
+// ids of the stages it depends on, and marks the artifact 'enriching'. Call it
+// from the ingest transaction so the artifact, its encounter, and its pipeline
+// are one atomic unit.
+func (p *Pipeline) EnqueueTx(ctx context.Context, tx *store.Store, artifactID string) error {
 	order, err := p.topoOrder()
 	if err != nil {
 		return err
 	}
-	return st.Tx(ctx, func(tx *store.Store) error {
-		jobIDs := make(map[string]string, len(order)) // stage name -> job id
-		for _, name := range order {
-			deps := make([]string, 0, len(p.enrichers[name].DependsOn()))
-			for _, dep := range p.enrichers[name].DependsOn() {
-				deps = append(deps, jobIDs[dep])
-			}
-			id, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{
-				Type: name, ArtifactID: &artifactID, DependsOn: deps,
-			})
-			if err != nil {
-				return err
-			}
-			jobIDs[name] = id
+	enriching := kb.StatusEnriching
+	if err := tx.Artifacts.Patch(ctx, artifactID, store.ArtifactPatch{Status: &enriching}); err != nil {
+		return err
+	}
+
+	jobIDs := make(map[string]string, len(order)) // stage name -> job id
+	all := make([]string, 0, len(order))
+	for _, name := range order {
+		deps := make([]string, 0, len(p.enrichers[name].DependsOn()))
+		for _, dep := range p.enrichers[name].DependsOn() {
+			deps = append(deps, jobIDs[dep])
 		}
-		return nil
-	})
+		id, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: name, ArtifactID: &artifactID, DependsOn: deps})
+		if err != nil {
+			return err
+		}
+		jobIDs[name] = id
+		all = append(all, id)
+	}
+	_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: readyStage, ArtifactID: &artifactID, DependsOn: all})
+	return err
 }
 
 // RegisterHandlers wires one job handler per stage into the runner. Each handler
@@ -78,6 +100,13 @@ func (p *Pipeline) RegisterHandlers(st *store.Store, runner *jobs.Runner) {
 	for _, name := range p.order {
 		runner.Handle(name, p.handler(st, p.enrichers[name]))
 	}
+	runner.Handle(readyStage, func(ctx context.Context, job store.Job) error {
+		if job.ArtifactID == nil {
+			return fmt.Errorf("pipeline: ready job %s has no artifact", job.ID)
+		}
+		ready := kb.StatusReady
+		return st.Artifacts.Patch(ctx, *job.ArtifactID, store.ArtifactPatch{Status: &ready})
+	})
 }
 
 func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
@@ -92,16 +121,18 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 		if !e.PrivacyOK(a.PrivacyTier) {
 			return nil // privacy gate: skip, never process this tier with this enricher
 		}
-		results, err := e.Enrich(ctx, a)
+		res, err := e.Enrich(ctx, a)
 		if err != nil {
 			return err
 		}
-		if len(results) == 0 {
-			return nil
-		}
 		return st.Tx(ctx, func(tx *store.Store) error {
-			for i := range results {
-				if err := tx.Enrichments.Create(ctx, &results[i]); err != nil {
+			for i := range res.Enrichments {
+				if err := tx.Enrichments.Create(ctx, &res.Enrichments[i]); err != nil {
+					return err
+				}
+			}
+			if res.Patch != nil {
+				if err := tx.Artifacts.Patch(ctx, a.ID, *res.Patch); err != nil {
 					return err
 				}
 			}
