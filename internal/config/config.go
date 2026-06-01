@@ -14,6 +14,8 @@ type Config struct {
 	APIToken        string // KB_API_TOKEN (required)
 	DefaultPrivacy  string // KB_DEFAULT_PRIVACY (default personal)
 	CloudLLMEnabled bool   // KB_CLOUD_LLM (default false)
+	OllamaURL       string // KB_OLLAMA_URL (default http://127.0.0.1:11434)
+	SummarizeModel  string // KB_SUMMARIZE_MODEL (default llama3.2)
 }
 
 // Load reads configuration via getenv (pass os.Getenv in production). It returns
@@ -26,6 +28,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		APIToken:        getenv("KB_API_TOKEN"),
 		DefaultPrivacy:  orDefault(getenv("KB_DEFAULT_PRIVACY"), "personal"),
 		CloudLLMEnabled: parseBool(getenv("KB_CLOUD_LLM")),
+		OllamaURL:       orDefault(getenv("KB_OLLAMA_URL"), "http://127.0.0.1:11434"),
+		SummarizeModel:  orDefault(getenv("KB_SUMMARIZE_MODEL"), "llama3.2"),
 	}
 
 	var missing []string

@@ -571,8 +571,34 @@ the design's enrichment core (§8.3), wired through the pipeline into ingest.
   broke the lexicographic = chronological invariant the FIFO `Claim` and
   `run_after`/`claimed_at` comparisons rely on. Fixed-width nanoseconds restore it.
 
-**Next (Stage 2 — enrichers):** `internal/llm` (Ollama client, injectable),
-`summarize`/`tags`/`critical-analysis` enrichers (`DependsOn: ["fetch"]`,
-local-LLM so `PrivacyOK` is always true), and `embed` (sqlite-vec — needs the
-runtime extension + a vector store) feeding relevance scoring against the static
-profile (§8.5/§8.9). Then retrieval (Phase 3).
+## Phase 2 — Stage 2: Structured LLM enrichment (summarize)
+
+**Goal:** every text artifact gains a summary, topical tags, and the mandatory
+critical analysis from one schema-validated local-LLM call (design §8.5, the
+`SUMMARIZE` stage at line 220; §6.4 makes critical analysis mandatory to prevent
+uncritical hoarding).
+
+**Status: Complete.** Verified end to end (HTTP ingest → fetch → summarize →
+`ready` with `summary`/`tags`/`critical_analysis` rows) against a fake LLM; the
+daemon wires a real local Ollama.
+
+- **`internal/llm`.** A `Client` interface (`Generate`) over a local Ollama
+  server (`/api/generate`, `stream:false`). The HTTP client is injectable so
+  enrichers and the client itself test against an httptest fake; no network in
+  tests. Supports Ollama structured output by passing a JSON schema in `format`.
+- **`summarize` enricher.** `DependsOn: ["fetch"]` (runs after the body exists,
+  for both fetched URLs and notes). One `Generate` call returns
+  `{summary, tags[], critical_analysis}`; the stage writes three enrichment rows
+  (`summary`, `tags`, `critical_analysis`). Tags are normalized (lowercase, trim,
+  dedup, capped). The body is truncated to a fixed character cap before the call.
+  `PrivacyOK` is always true: Ollama is on-device, so the privacy gate (which
+  exists to keep _cloud_ enrichers off sensitive/restricted tiers) does not apply.
+  An empty body is a graceful no-op.
+- **Config + wiring.** `KB_OLLAMA_URL` (default `http://127.0.0.1:11434`) and
+  `KB_SUMMARIZE_MODEL` (default model). `cmd/kbd` registers `summarize` after
+  `fetch`.
+
+**Next (Stage 3 — embeddings + relevance):** `embed` (sqlite-vec — needs the
+vec0 runtime extension + a vector store) producing artifact- and chunk-level
+vectors, feeding relevance scoring against the static profile (§8.5/§8.9). Then
+retrieval (Phase 3).

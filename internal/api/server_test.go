@@ -16,6 +16,7 @@ import (
 	"kb/internal/events"
 	"kb/internal/fetch"
 	"kb/internal/jobs"
+	"kb/internal/llm"
 	"kb/internal/pipeline"
 	"kb/internal/store"
 	"kb/internal/storetest"
@@ -438,6 +439,61 @@ func TestIngest_PipelineFetchesAndMarksReady(t *testing.T) {
 	}
 	if ens, _ := st.Enrichments.ListForArtifact(ctx, a.ID); len(ens) != 1 || ens[0].Kind != "fetch" {
 		t.Errorf("enrichments = %v, want one 'fetch' row", ens)
+	}
+}
+
+// staticLLM returns the same canned completion for every call.
+type staticLLM struct{ resp string }
+
+func (s staticLLM) Generate(_ context.Context, _ llm.GenerateRequest) (string, error) {
+	return s.resp, nil
+}
+
+func TestIngest_FetchThenSummarize_EndToEnd(t *testing.T) {
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, `<html><head><title>P</title></head><body><p>Fetched body.</p></body></html>`)
+	}))
+	defer page.Close()
+
+	st := storetest.New(t)
+	bus := events.NewBus()
+	runner := jobs.NewRunner(st, jobs.WithLogger(discardLogger()))
+	p := pipeline.New()
+	p.Register(enrich.NewFetch(fetch.NewWebFetcher(page.Client())))
+	p.Register(enrich.NewSummarize(
+		staticLLM{resp: `{"summary":"S","tags":["go","kb"],"critical_analysis":"C"}`}, "fake-model"))
+	p.RegisterHandlers(st, runner, bus)
+	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p})
+	h := srv.Handler()
+
+	ctx := context.Background()
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	body := `{"source_id":"` + src.ID + `","url":"` + page.URL + `/article"}`
+	if rec := doIngest(h, body, "tok"); rec.Code != http.StatusOK {
+		t.Fatalf("ingest status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := runner.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	arts, _ := st.Artifacts.List(ctx)
+	if len(arts) != 1 || arts[0].Status != "ready" {
+		t.Fatalf("artifacts = %v, want one ready after fetch+summarize", arts)
+	}
+	ens, _ := st.Enrichments.ListForArtifact(ctx, arts[0].ID)
+	kinds := map[string]bool{}
+	for _, e := range ens {
+		kinds[e.Kind] = true
+	}
+	for _, want := range []string{"fetch", "summary", "tags", "critical_analysis"} {
+		if !kinds[want] {
+			t.Errorf("missing %q enrichment; got kinds %v", want, kinds)
+		}
 	}
 }
 

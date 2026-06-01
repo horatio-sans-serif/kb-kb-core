@@ -22,6 +22,7 @@ import (
 	"kb/internal/events"
 	"kb/internal/fetch"
 	"kb/internal/jobs"
+	"kb/internal/llm"
 	"kb/internal/pipeline"
 	"kb/internal/store"
 )
@@ -99,8 +100,12 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	runner := jobs.NewRunner(st, jobs.WithLogger(logger))
 
 	// The enrichment pipeline: each ingested artifact is expanded into its stages.
+	// fetch retrieves the body; summarize runs a local Ollama model over it to
+	// produce summary/tags/critical-analysis enrichment rows (design §8.5).
+	llmClient := llm.NewOllama(cfg.OllamaURL)
 	enrichment := pipeline.New()
 	enrichment.Register(enrich.NewFetch(fetch.New()))
+	enrichment.Register(enrich.NewSummarize(llmClient, cfg.SummarizeModel))
 	enrichment.RegisterHandlers(st, runner, bus)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not

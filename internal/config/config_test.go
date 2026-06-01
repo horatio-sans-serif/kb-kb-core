@@ -29,6 +29,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.CloudLLMEnabled {
 		t.Error("CloudLLMEnabled = true, want false by default")
 	}
+	if cfg.OllamaURL != "http://127.0.0.1:11434" {
+		t.Errorf("OllamaURL = %q, want the localhost Ollama default", cfg.OllamaURL)
+	}
+	if cfg.SummarizeModel != "llama3.2" {
+		t.Errorf("SummarizeModel = %q, want the default model", cfg.SummarizeModel)
+	}
 }
 
 func TestConfig_MissingTokenFails(t *testing.T) {
