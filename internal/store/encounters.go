@@ -6,7 +6,7 @@ import (
 )
 
 // Encounter is defined in internal/kb (aliased in types.go).
-type EncounterRepo struct{ q Querier }
+type EncounterRepo struct{ q, rq Querier } // q: write pool; rq: read pool
 
 // Record always inserts a new encounter (never deduped — the artifact is the
 // deduped entity, the encounter is the per-sighting fact).
@@ -31,7 +31,7 @@ func (r *EncounterRepo) Record(ctx context.Context, e *Encounter) error {
 // CountForArtifact returns how many times the artifact has been encountered.
 func (r *EncounterRepo) CountForArtifact(ctx context.Context, artifactID string) (int, error) {
 	var n int
-	if err := r.q.QueryRowContext(ctx,
+	if err := r.rq.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM encounters WHERE artifact_id = ?`, artifactID).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count encounters for %q: %w", artifactID, err)
 	}

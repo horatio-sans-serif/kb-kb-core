@@ -8,7 +8,7 @@ import (
 )
 
 // Artifact is defined in internal/kb (aliased in types.go).
-type ArtifactRepo struct{ q Querier }
+type ArtifactRepo struct{ q, rq Querier } // q: write pool; rq: read pool
 
 const artifactColNames = `id, type, canonical_url, content_hash, title, body_markdown,
 	privacy_tier, lifecycle_tier, status, relevance_score,
@@ -83,7 +83,7 @@ func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, conflict string)
 }
 
 func (r *ArtifactRepo) Get(ctx context.Context, id string) (*Artifact, error) {
-	a, err := scanArtifact(r.q.QueryRowContext(ctx, artifactSelect+` WHERE id = ?`, id))
+	a, err := scanArtifact(r.rq.QueryRowContext(ctx, artifactSelect+` WHERE id = ?`, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("get artifact %q: %w", id, ErrNotFound)
@@ -105,7 +105,7 @@ func (r *ArtifactRepo) ListIncludingDeleted(ctx context.Context) ([]*Artifact, e
 }
 
 func (r *ArtifactRepo) list(ctx context.Context, clause string) ([]*Artifact, error) {
-	rows, err := r.q.QueryContext(ctx, artifactSelect+clause)
+	rows, err := r.rq.QueryContext(ctx, artifactSelect+clause)
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts: %w", err)
 	}

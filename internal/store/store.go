@@ -29,10 +29,12 @@ type Querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// Store groups the repositories over a single querier (a *sql.DB, or a *sql.Tx
-// when inside Tx).
+// Store groups the repositories. Each repo holds a write querier (q) and a read
+// querier (rq): mutations and Tx use q (the single-writer pool); Get/List/Count
+// use rq (a separate, multi-connection read pool over the same WAL file). Inside
+// Tx, both are the transaction.
 type Store struct {
-	db          *sql.DB // nil for a transaction-scoped Store
+	db          *sql.DB // write pool, for beginning transactions; nil in a tx-scoped Store
 	Sources     *SourceRepo
 	Artifacts   *ArtifactRepo
 	Encounters  *EncounterRepo
@@ -40,19 +42,28 @@ type Store struct {
 	Jobs        *JobRepo
 }
 
-// New wires the repositories to db. db is expected to be already migrated.
+// New wires the repositories to a single pool for both reads and writes (used in
+// tests and single-connection setups). db is expected to be already migrated.
 func New(db *sql.DB) *Store {
-	return newStore(db, db)
+	return newStore(db, db, db)
 }
 
-func newStore(db *sql.DB, q Querier) *Store {
+// NewWithReadPool routes reads to a separate read-only pool while mutations and
+// transactions use the single-writer pool. WAL lets the read pool run concurrent
+// readers against the writer, so long (LLM-bound) enricher writes don't serialize
+// reads behind them. write must be the single-writer pool (SetMaxOpenConns(1)).
+func NewWithReadPool(write, read *sql.DB) *Store {
+	return newStore(write, write, read)
+}
+
+func newStore(db *sql.DB, q, rq Querier) *Store {
 	return &Store{
 		db:          db,
-		Sources:     &SourceRepo{q: q},
-		Artifacts:   &ArtifactRepo{q: q},
-		Encounters:  &EncounterRepo{q: q},
-		Enrichments: &EnrichmentRepo{q: q},
-		Jobs:        &JobRepo{q: q},
+		Sources:     &SourceRepo{q: q, rq: rq},
+		Artifacts:   &ArtifactRepo{q: q, rq: rq},
+		Encounters:  &EncounterRepo{q: q, rq: rq},
+		Enrichments: &EnrichmentRepo{q: q, rq: rq},
+		Jobs:        &JobRepo{q: q, rq: rq},
 	}
 }
 
@@ -79,7 +90,7 @@ func (s *Store) Tx(ctx context.Context, fn func(*Store) error) (err error) {
 			panic(p)
 		}
 	}()
-	if err = fn(newStore(nil, tx)); err != nil {
+	if err = fn(newStore(nil, tx, tx)); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

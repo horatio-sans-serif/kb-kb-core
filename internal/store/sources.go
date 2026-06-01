@@ -8,7 +8,7 @@ import (
 )
 
 // Source is defined in internal/kb (aliased in types.go).
-type SourceRepo struct{ q Querier }
+type SourceRepo struct{ q, rq Querier } // q: write pool; rq: read pool
 
 // Create inserts a source, assigning a ULID if none is set and defaulting the
 // privacy tier to "personal". source_weight and enabled take their schema
@@ -36,7 +36,7 @@ func (r *SourceRepo) Create(ctx context.Context, s *Source) error {
 func (r *SourceRepo) Get(ctx context.Context, id string) (*Source, error) {
 	var s Source
 	var enabled int
-	err := r.q.QueryRowContext(ctx,
+	err := r.rq.QueryRowContext(ctx,
 		`SELECT id, kind, connector, config, default_privacy, source_weight, enabled, created_at
 		 FROM sources WHERE id = ?`, id).
 		Scan(&s.ID, &s.Kind, &s.Connector, &s.Config, &s.DefaultPrivacy, &s.SourceWeight, &enabled, &s.CreatedAt)

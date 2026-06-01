@@ -84,7 +84,13 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	st := store.New(db)
+	rdb, err := store.OpenReadOnly(cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("open read pool: %w", err)
+	}
+	defer rdb.Close()
+
+	st := store.NewWithReadPool(db, rdb)
 	bus := events.NewBus()
 
 	runner := jobs.NewRunner(st, jobs.WithLogger(logger))

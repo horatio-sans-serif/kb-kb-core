@@ -55,6 +55,24 @@ func dsn(path string) string {
 	return u.String()
 }
 
+// OpenReadOnly opens a read-only, multi-connection pool over the same database
+// file. WAL permits concurrent readers against the single writer, so reads do
+// not serialize behind long write transactions. The file must already exist and
+// be migrated (Open + Migrate run first on the write pool).
+func OpenReadOnly(path string) (*sql.DB, error) {
+	q := url.Values{"mode": {"ro"}, "_foreign_keys": {"on"}, "_busy_timeout": {"5000"}}
+	u := url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}
+	db, err := sql.Open("sqlite3", u.String())
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite (ro) %q: %w", path, err)
+	}
+	db.SetMaxOpenConns(4)
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("ping sqlite (ro) %q: %w", path, err)
+	}
+	return db, nil
+}
+
 // Migrate applies the embedded migrations. See migrateFS.
 func Migrate(db *sql.DB) (int, error) {
 	return migrateFS(db, migrations.FS)

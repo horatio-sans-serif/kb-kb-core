@@ -32,7 +32,7 @@ type EnqueueSpec struct {
 	RunAfter   *string
 }
 
-type JobRepo struct{ q Querier }
+type JobRepo struct{ q, rq Querier } // q: write pool; rq: read pool
 
 // jobCols is the column list for SELECT/RETURNING; scanJob depends on this exact
 // order. claimed_at is intentionally omitted — it is internal lease state.
@@ -166,7 +166,7 @@ func (r *JobRepo) ReclaimStuck(ctx context.Context, olderThan string) (int, erro
 // the failed-dependency case to failed, so in practice this surfaces the
 // missing-dependency (mis-enqueue) case for monitoring.
 func (r *JobRepo) Blocked(ctx context.Context) ([]*Job, error) {
-	rows, err := r.q.QueryContext(ctx,
+	rows, err := r.rq.QueryContext(ctx,
 		`SELECT `+jobCols+` FROM jobs j WHERE j.status = 'pending' AND EXISTS (
 		   SELECT 1 FROM json_each(j.depends_on) dep
 		   LEFT JOIN jobs d ON d.id = dep.value
@@ -204,7 +204,7 @@ func (r *JobRepo) Purge(ctx context.Context, olderThan string) (int, error) {
 }
 
 func (r *JobRepo) Get(ctx context.Context, id string) (*Job, error) {
-	job, err := scanJob(r.q.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
+	job, err := scanJob(r.rq.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("get job %q: %w", id, ErrNotFound)
