@@ -214,6 +214,32 @@ func TestRunner_UnknownTypeFails(t *testing.T) {
 	}
 }
 
+func TestRunner_Run_ProcessesEnqueued(t *testing.T) {
+	st := newStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r := NewRunner(st)
+	done := make(chan string, 1)
+	r.Handle("x", func(_ context.Context, j store.Job) error { done <- j.ID; return nil })
+
+	id, err := st.Jobs.Enqueue(context.Background(), store.EnqueueSpec{Type: "x"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	go func() { _ = r.Run(ctx, 5*time.Millisecond) }()
+
+	select {
+	case got := <-done:
+		if got != id {
+			t.Errorf("processed job %s, want %s", got, id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run loop did not process the enqueued job")
+	}
+}
+
 func TestRunner_ResumeAfterCrash(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()

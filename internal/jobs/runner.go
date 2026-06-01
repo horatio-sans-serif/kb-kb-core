@@ -118,6 +118,26 @@ func (r *Runner) ReclaimStuck(ctx context.Context) (int, error) {
 	return r.store.Jobs.ReclaimStuck(ctx, nowTS())
 }
 
+// Run reclaims jobs orphaned by a prior crash once, then drains the queue on
+// each interval tick until ctx is cancelled. A transient infra error from a
+// drain is swallowed so the loop keeps running; only context cancellation (or a
+// failed initial reclaim) returns.
+func (r *Runner) Run(ctx context.Context, interval time.Duration) error {
+	if _, err := r.ReclaimStuck(ctx); err != nil {
+		return err
+	}
+	for {
+		if _, err := r.Drain(ctx); err != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
 func (r *Runner) process(ctx context.Context, job store.Job) error {
 	h, ok := r.handlers[job.Type]
 	if !ok {

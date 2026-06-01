@@ -291,14 +291,36 @@ wiring is Phase 4; here it is an internal ticker).
 - `TestAuth_RejectsMissingToken`: `/ingest` without token → 401; `/healthz`
   without token → 200.
 
-**Status**: Not Started
+**Status**: Complete — `internal/config` (env-driven, fails fast naming missing
+vars, validates privacy tier), `internal/api` (`NewServer`/`Handler`: public
+`GET /healthz`, auth-wrapped `GET /events` SSE and `POST /ingest`; constant-time
+bearer-token check, token never logged), `jobs.Runner.Run` (reclaim-once then
+tick-drain), and `cmd/kbd` (config → open/migrate → runner loop → HTTP serve,
+graceful shutdown on SIGINT/SIGTERM). 14 new tests green under `go test -race`.
+
+- `POST /ingest` is the walking skeleton: writes artifact + encounter + enqueues
+  an `ingest` job atomically via `Store.Tx`, then publishes `artifact.ingested`
+  only after commit (`TestIngest_EndToEnd`). Unknown `source_id` → 400
+  (`TestIngest_UnknownSource`).
+- Config fails fast (`TestConfig_MissingTokenFails`/`_MissingDBFails`/
+  `_InvalidPrivacyFails`); auth rejects missing/wrong token while `/healthz`
+  stays open (`TestAuth_RejectsMissingToken`).
+- Real-binary smoke verified over a socket: `/healthz` 200, `/ingest` 401/400 as
+  expected, graceful shutdown on signal.
+
+Deferred (with consumers, not Phase 0): the read-only connection pool moves to
+the retrieval phase (no concurrent DB reader exists yet — `/healthz` is
+DB-free, the runner and `/ingest` are the only writers, both serialized on the
+one writer; SSE holds no DB connection). The `ingest` job handler is a
+placeholder until Phase 2 wires the enrichment pipeline.
 
 ---
 
-## Definition of Done (Phase 0)
+## Definition of Done (Phase 0) — MET
 
-- All five stages Complete; `go test ./...` green; `go vet` clean.
-- A single command starts `kbd`, and `POST /ingest` round-trips an artifact
-  through write → enqueue → event, observable on `/events`.
+- All five stages Complete; `go test -race ./...` green (48 tests); `go vet` and
+  `gofmt` clean.
+- A single command (`kbd`) starts the daemon, and `POST /ingest` round-trips an
+  artifact through write → enqueue → event, observable on `/events`.
 - This is the spine for Phase 1 (ingestion/dedup), which extends Stage 2's
   upsert into the full canonicalization + fingerprint path (§8.2).
