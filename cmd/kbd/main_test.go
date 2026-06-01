@@ -13,6 +13,33 @@ import (
 	"kb/internal/config"
 )
 
+func TestLogLevel(t *testing.T) {
+	cases := map[string]slog.Level{
+		"debug": slog.LevelDebug, "warn": slog.LevelWarn, "error": slog.LevelError,
+		"": slog.LevelInfo, "bogus": slog.LevelInfo, " DEBUG ": slog.LevelDebug,
+	}
+	for in, want := range cases {
+		if got := logLevel(in); got != want {
+			t.Errorf("logLevel(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestServe_BadDBPath(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	cfg := &config.Config{
+		DBPath: "/nonexistent-dir-xyz/kb.db", ListenAddr: ln.Addr().String(),
+		APIToken: "t", DefaultPrivacy: "personal",
+	}
+	if err := serve(context.Background(), ln, cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
+		t.Error("expected an error opening a DB in a nonexistent directory")
+	}
+}
+
 func TestServe_HealthzThenGracefulShutdown(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

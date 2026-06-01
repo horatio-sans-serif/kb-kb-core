@@ -18,6 +18,8 @@ func TestURL(t *testing.T) {
 		{"sort query", "https://example.com/x?b=2&a=1", "https://example.com/x?a=1&b=2"},
 		{"de-amp path", "https://example.com/x/amp", "https://example.com/x"},
 		{"de-amp query", "https://example.com/x?amp=1", "https://example.com/x"},
+		{"de-amp root", "https://example.com/amp", "https://example.com/"},
+		{"strip userinfo", "https://user:pass@example.com/x", "https://example.com/x"},
 		{"all at once", "HTTPS://WWW.Example.com:443/p/?fbclid=z&b=2&utm_source=x&a=1#frag", "https://example.com/p?a=1&b=2"},
 	}
 	for _, c := range cases {
@@ -42,6 +44,28 @@ func TestURL_Invalid(t *testing.T) {
 			t.Errorf("URL(%q): expected an error", in)
 		}
 	}
+}
+
+func FuzzURL(f *testing.F) {
+	for _, s := range []string{
+		"https://example.com/x", "http://a.b/c?d=1&utm_source=x", "https://x",
+		"HTTPS://WWW.A.com:443/p/amp?b=2&a=1#f", "ftp://x/y", "not a url",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		out, err := URL(raw)
+		if err != nil {
+			return // rejected inputs are fine; we only assert no panic + idempotence
+		}
+		out2, err := URL(out)
+		if err != nil {
+			t.Fatalf("URL(%q)=%q, then re-canonicalizing errored: %v", raw, out, err)
+		}
+		if out2 != out {
+			t.Fatalf("not idempotent: URL(%q)=%q but URL(%q)=%q", raw, out, out, out2)
+		}
+	})
 }
 
 func TestContent_StableAndWhitespaceInsensitive(t *testing.T) {

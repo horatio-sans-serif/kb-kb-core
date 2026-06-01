@@ -60,6 +60,14 @@ func TestMigrate_Idempotent(t *testing.T) {
 	}
 }
 
+func TestVersionFromName_Invalid(t *testing.T) {
+	for _, name := range []string{"", "noseparator.sql", "abc_desc.sql", "0_zero.sql", "_x.sql"} {
+		if _, err := versionFromName(name); err == nil {
+			t.Errorf("versionFromName(%q): expected an error", name)
+		}
+	}
+}
+
 func TestMigrate_PragmasSet(t *testing.T) {
 	db := openTemp(t)
 	if _, err := Migrate(db); err != nil {

@@ -33,6 +33,52 @@ func TestBackoff_Increasing(t *testing.T) {
 	}
 }
 
+func TestBackoff_OverflowAndDegenerate(t *testing.T) {
+	b := ExpBackoff(time.Second, time.Hour)
+	for _, a := range []int{63, 64, 1000} {
+		if got := b(a); got != time.Hour {
+			t.Errorf("backoff(%d) = %v, want cap %v", a, got, time.Hour)
+		}
+	}
+	if got := ExpBackoff(0, time.Hour)(1); got <= 0 {
+		t.Errorf("ExpBackoff(0, 1h)(1) = %v, want a positive fallback", got)
+	}
+	if got := ExpBackoff(time.Minute, time.Second)(1); got != time.Minute {
+		t.Errorf("ExpBackoff(min, sec)(1) = %v, want base (max raised to base)", got)
+	}
+}
+
+func TestRunner_BackoffSetsFutureRunAfter(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	r := NewRunner(st, WithBackoff(func(int) time.Duration { return time.Hour }), WithMaxAttempts(5))
+	r.Handle("flaky", func(context.Context, store.Job) error { return errors.New("transient") })
+
+	id, err := st.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "flaky"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := r.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	job, err := st.Jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if job.Status != "pending" || job.RunAfter == nil {
+		t.Fatalf("job = %+v, want pending with a future run_after", job)
+	}
+	// Not claimable now: its run_after is an hour out.
+	claimed, err := st.Jobs.Claim(ctx, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed != nil {
+		t.Errorf("claimed a job whose backoff run_after is in the future: %+v", claimed)
+	}
+}
+
 func TestRunner_DAGOrder(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()

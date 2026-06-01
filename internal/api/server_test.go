@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -13,6 +15,8 @@ import (
 	"kb/internal/events"
 	"kb/internal/store"
 )
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
@@ -31,7 +35,7 @@ func testServer(t *testing.T) (*store.Store, *events.Bus, http.Handler) {
 	t.Helper()
 	st := newStore(t)
 	bus := events.NewBus()
-	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Build: BuildInfo{Version: "test"}})
+	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Build: BuildInfo{Version: "test"}, Logger: discardLogger()})
 	return st, bus, srv.Handler()
 }
 
@@ -308,6 +312,79 @@ func TestIngest_InvalidURL(t *testing.T) {
 	}
 	if rec := doIngest(h, `{"source_id":"`+src.ID+`","url":"not a url"}`, "tok"); rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for an invalid url", rec.Code)
+	}
+}
+
+func TestIngest_PrivacyFromSource(t *testing.T) {
+	st, _, h := testServer(t)
+	ctx := context.Background()
+	src := &store.Source{Kind: "PUSH", Connector: "imessage", DefaultPrivacy: "sensitive"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	doIngest(h, `{"source_id":"`+src.ID+`","body":"secret"}`, "tok")
+	arts, _ := st.Artifacts.List(ctx)
+	if len(arts) != 1 || arts[0].PrivacyTier != "sensitive" {
+		t.Errorf("privacy = %v, want sensitive (from the source default)", arts)
+	}
+}
+
+func TestIngest_PrivacyOverrideAndValidation(t *testing.T) {
+	st, _, h := testServer(t)
+	ctx := context.Background()
+	src := &store.Source{Kind: "PUSH", Connector: "x"} // default personal
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	doIngest(h, `{"source_id":"`+src.ID+`","body":"x","privacy":"restricted"}`, "tok")
+	arts, _ := st.Artifacts.List(ctx)
+	if len(arts) != 1 || arts[0].PrivacyTier != "restricted" {
+		t.Errorf("privacy = %v, want restricted (request override)", arts)
+	}
+	if rec := doIngest(h, `{"source_id":"`+src.ID+`","body":"y","privacy":"bogus"}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("invalid privacy: status = %d, want 400", rec.Code)
+	}
+}
+
+func TestIngest_BothURLAndBody(t *testing.T) {
+	st, _, h := testServer(t)
+	ctx := context.Background()
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	doIngest(h, `{"source_id":"`+src.ID+`","url":"https://e.com/x","body":"ignored"}`, "tok")
+	arts, _ := st.Artifacts.List(ctx)
+	if len(arts) != 1 || arts[0].Type != "webpage" || arts[0].BodyMarkdown != "" {
+		t.Errorf("both url+body: got %+v, want a webpage with no body (url wins)", arts)
+	}
+}
+
+func TestIngest_StoreFailureReturns500(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "kb.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := store.Migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	srv := NewServer(Deps{Store: store.New(db), Bus: events.NewBus(), Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger()})
+	h := srv.Handler()
+	db.Close() // subsequent store ops fail
+
+	rec := doIngest(h, `{"source_id":"01ABC","url":"https://e.com/x"}`, "tok")
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 when the store fails", rec.Code)
+	}
+}
+
+func TestSSEHandler_NonFlusherReturns500(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := struct{ http.ResponseWriter }{rec} // embeds the interface, hiding Flush
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	SSEHandler(events.NewBus())(w, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 for a non-flushing writer", rec.Code)
 	}
 }
 

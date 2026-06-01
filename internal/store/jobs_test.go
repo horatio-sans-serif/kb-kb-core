@@ -216,6 +216,103 @@ func TestJobs_ReclaimByLease(t *testing.T) {
 	}
 }
 
+func TestJobs_Reschedule(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	id, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "x"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := st.Jobs.Claim(ctx, now()); err != nil { // -> running
+		t.Fatalf("claim: %v", err)
+	}
+
+	future := "2999-01-01T00:00:00Z"
+	if err := st.Jobs.Reschedule(ctx, id, &future, "boom"); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+	job, err := st.Jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if job.Status != "pending" || job.RunAfter == nil || *job.RunAfter != future ||
+		job.LastError == nil || *job.LastError != "boom" {
+		t.Errorf("job = %+v, want pending/run_after=future/last_error=boom", job)
+	}
+	if c, _ := st.Jobs.Claim(ctx, now()); c != nil {
+		t.Errorf("claimed a future-scheduled job: %+v", c)
+	}
+}
+
+func TestJobs_GetCorruptRow(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO jobs(id, type, depends_on, status, created_at)
+		 VALUES ('01BAD', 'x', 'not json', 'pending', '2026-01-01')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := st.Jobs.Get(ctx, "01BAD"); err == nil {
+		t.Error("expected an error parsing a malformed depends_on blob")
+	}
+}
+
+func TestJobs_Purge(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	rows := []struct{ id, status, created string }{
+		{"01OLDDONE", "done", "2020-01-01T00:00:00Z"},
+		{"01OLDFAIL", "failed", "2020-01-01T00:00:00Z"},
+		{"01NEWDONE", "done", "2999-01-01T00:00:00Z"},
+		{"01PENDING", "pending", "2020-01-01T00:00:00Z"},
+	}
+	for _, r := range rows {
+		if _, err := st.db.ExecContext(ctx,
+			`INSERT INTO jobs(id, type, depends_on, status, created_at) VALUES (?, 'x', '[]', ?, ?)`,
+			r.id, r.status, r.created); err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+	}
+	n, err := st.Jobs.Purge(ctx, "2021-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("purged %d, want 2 (old done + old failed only)", n)
+	}
+	for _, id := range []string{"01NEWDONE", "01PENDING"} {
+		if _, err := st.Jobs.Get(ctx, id); err != nil {
+			t.Errorf("%s should survive purge: %v", id, err)
+		}
+	}
+}
+
+func TestJobs_ClaimFIFOOrder(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	const n = 10
+	ids := make([]string, n)
+	for i := range ids {
+		id, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "x"})
+		if err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+		ids[i] = id
+	}
+	for i := range ids {
+		job, err := st.Jobs.Claim(ctx, now())
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if job == nil || job.ID != ids[i] {
+			t.Fatalf("claim %d = %v, want %s (FIFO by created_at,id)", i, job, ids[i])
+		}
+		if err := st.Jobs.MarkDone(ctx, job.ID); err != nil {
+			t.Fatalf("mark done: %v", err)
+		}
+	}
+}
+
 func TestJobs_ConcurrentClaim_NoDoubleDispatch(t *testing.T) {
 	st := newTestStore(t)
 	st.db.SetMaxOpenConns(8) // override the single-writer pool to force real concurrency

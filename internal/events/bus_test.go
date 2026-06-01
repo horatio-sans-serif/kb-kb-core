@@ -67,6 +67,18 @@ func TestBus_SlowSubscriberDropped(t *testing.T) {
 	_ = slow
 }
 
+func TestBus_DoubleCancelIsIdempotent(t *testing.T) {
+	bus := NewBus()
+	_, cancel := bus.Subscribe()
+	cancel()
+	cancel() // must not panic (sync.Once)
+}
+
+func TestBus_PublishWithNoSubscribers(t *testing.T) {
+	bus := NewBus()
+	bus.Publish(New("x", nil)) // must not panic or block
+}
+
 func TestBus_UnsubscribeStopsDelivery(t *testing.T) {
 	bus := NewBus()
 	ch, cancel := bus.Subscribe()

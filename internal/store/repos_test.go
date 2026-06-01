@@ -328,6 +328,55 @@ func TestStore_NestedTxDisallowed(t *testing.T) {
 	}
 }
 
+func TestSource_GetNotFound(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.Sources.Get(context.Background(), "01NONE"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEnrichment_GetNotFound(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.Enrichments.Get(context.Background(), "01NONE"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEncounter_ForeignKeyEnforced(t *testing.T) {
+	st := newTestStore(t)
+	err := st.Encounters.Record(context.Background(),
+		&Encounter{ArtifactID: "01NOSUCH", SourceID: "01NOSUCH"})
+	if err == nil {
+		t.Error("expected a foreign-key violation for an encounter referencing a missing artifact/source")
+	}
+}
+
+func TestStore_TxPanicRollsBack(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("expected the panic to propagate out of Tx")
+			}
+		}()
+		_ = st.Tx(ctx, func(tx *Store) error {
+			if err := tx.Sources.Create(ctx, &Source{Kind: "PULL", Connector: "x"}); err != nil {
+				return err
+			}
+			panic("boom")
+		})
+	}()
+
+	var n int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sources`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("sources = %d after a panicking Tx, want 0 (rolled back)", n)
+	}
+}
+
 func TestEnrichment_CreateGet(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
