@@ -124,13 +124,14 @@ func TestIngest_EndToEnd(t *testing.T) {
 		t.Errorf("encounter count = %d, want 1", n)
 	}
 
-	// Enrichment job enqueued for the artifact.
-	job, err := st.Jobs.Claim(ctx, time.Now().UTC().Format(time.RFC3339Nano))
+	// With no Enqueuer wired, ingest records the artifact and its encounter but
+	// starts no pipeline — there is nothing claimable.
+	job, err := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
 	if err != nil {
 		t.Fatalf("claim job: %v", err)
 	}
-	if job == nil || job.Type != "ingest" || job.ArtifactID == nil || *job.ArtifactID != resp.ArtifactID {
-		t.Errorf("expected an 'ingest' job for %s, got %+v", resp.ArtifactID, job)
+	if job != nil {
+		t.Errorf("expected no job with a nil Enqueuer, got %+v", job)
 	}
 
 	// artifact.ingested published (after the transaction committed).
@@ -406,7 +407,7 @@ func TestIngest_PipelineFetchesAndMarksReady(t *testing.T) {
 	runner := jobs.NewRunner(st, jobs.WithLogger(discardLogger()))
 	p := pipeline.New()
 	p.Register(enrich.NewFetch(fetch.NewWebFetcher(page.Client()))) // injected client reaches loopback
-	p.RegisterHandlers(st, runner)
+	p.RegisterHandlers(st, runner, bus)
 	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p})
 	h := srv.Handler()
 
@@ -437,6 +438,47 @@ func TestIngest_PipelineFetchesAndMarksReady(t *testing.T) {
 	}
 	if ens, _ := st.Enrichments.ListForArtifact(ctx, a.ID); len(ens) != 1 || ens[0].Kind != "fetch" {
 		t.Errorf("enrichments = %v, want one 'fetch' row", ens)
+	}
+}
+
+// countingEnqueuer records how many times the pipeline expansion is invoked.
+type countingEnqueuer struct{ n int }
+
+func (c *countingEnqueuer) EnqueueTx(_ context.Context, _ *store.Store, _ string) error {
+	c.n++
+	return nil
+}
+
+func TestIngest_ReingestDoesNotRerunPipeline(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	enq := &countingEnqueuer{}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: enq})
+	h := srv.Handler()
+
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	body := `{"source_id":"` + src.ID + `","url":"https://example.com/same"}`
+	for i := 0; i < 2; i++ {
+		if rec := doIngest(h, body, "tok"); rec.Code != http.StatusOK {
+			t.Fatalf("ingest %d: status %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	// One artifact, two encounters, but the pipeline expanded only once (insert).
+	arts, _ := st.Artifacts.List(ctx)
+	if len(arts) != 1 {
+		t.Fatalf("artifacts = %d, want 1 (same URL dedups)", len(arts))
+	}
+	n, _ := st.Encounters.CountForArtifact(ctx, arts[0].ID)
+	if n != 2 {
+		t.Errorf("encounters = %d, want 2 (each ingest is a sighting)", n)
+	}
+	if enq.n != 1 {
+		t.Errorf("pipeline enqueued %d times, want 1 (re-ingest of unchanged content must not re-run)", enq.n)
 	}
 }
 

@@ -100,12 +100,28 @@ func (s *Store) Tx(ctx context.Context, fn func(*Store) error) (err error) {
 	return nil
 }
 
+// TimeFormat is the canonical wire format for every timestamp string the system
+// mints. Unlike time.RFC3339Nano it never trims trailing zeros, so the fraction
+// is always nine digits and every timestamp is the same width. That makes byte
+// (lexicographic) order identical to chronological order — the property the job
+// queue's FIFO claim (ORDER BY created_at, id) and the run_after/claimed_at
+// comparisons depend on. RFC3339Nano breaks it: it drops the fraction entirely
+// on a whole second, and '.' (0x2E) sorts before digits while 'Z' (0x5A) sorts
+// after, so "…05Z" wrongly sorts after "…05.000001Z".
+const TimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
+
+// FormatTime renders t in TimeFormat at UTC.
+func FormatTime(t time.Time) string { return t.UTC().Format(TimeFormat) }
+
+// Now is the current time as a TimeFormat string (UTC).
+func Now() string { return FormatTime(time.Now()) }
+
 // now is the ISO-8601 UTC timestamp written to created_at/updated_at columns.
 // All repositories write it explicitly so a column never mixes this format with
 // SQLite's space-separated datetime('now') default. These are audit timestamps,
 // not logical merge clocks (cr-sqlite owns causal ordering; see 6.0).
 func now() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+	return Now()
 }
 
 // nullIfEmpty maps "" to a SQL NULL so optional JSON/text columns stay NULL

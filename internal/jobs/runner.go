@@ -31,6 +31,24 @@ type Runner struct {
 	maxAttempts int
 	backoff     func(attempts int) time.Duration
 	logger      *slog.Logger
+	onComplete  func(ctx context.Context, job store.Job, failed bool) error
+}
+
+// SetOnComplete registers a callback invoked after a job reaches a terminal
+// state (done or failed). The pipeline uses it to finalize an artifact once all
+// its stages are terminal. A callback error is logged, not propagated (the job
+// is already terminal).
+func (r *Runner) SetOnComplete(fn func(ctx context.Context, job store.Job, failed bool) error) {
+	r.onComplete = fn
+}
+
+func (r *Runner) fireComplete(ctx context.Context, job store.Job, failed bool) {
+	if r.onComplete == nil {
+		return
+	}
+	if err := r.onComplete(ctx, job, failed); err != nil {
+		r.logger.Error("jobs: on-complete hook failed", "job", job.ID, "err", err)
+	}
 }
 
 // Option configures a Runner.
@@ -171,7 +189,11 @@ func (r *Runner) Run(ctx context.Context, wake <-chan struct{}, interval time.Du
 func (r *Runner) process(ctx context.Context, job store.Job) error {
 	h, ok := r.handlers[job.Type]
 	if !ok {
-		return r.store.Jobs.MarkFailed(ctx, job.ID, fmt.Sprintf("no handler for job type %q", job.Type))
+		if err := r.store.Jobs.MarkFailed(ctx, job.ID, fmt.Sprintf("no handler for job type %q", job.Type)); err != nil {
+			return err
+		}
+		r.fireComplete(ctx, job, true)
+		return nil
 	}
 
 	if herr := h(ctx, job); herr != nil {
@@ -180,6 +202,7 @@ func (r *Runner) process(ctx context.Context, job store.Job) error {
 			if err := r.store.Jobs.MarkFailed(ctx, job.ID, herr.Error()); err != nil {
 				return fmt.Errorf("mark job %s failed after handler error %q: %w", job.ID, herr, err)
 			}
+			r.fireComplete(ctx, job, true)
 			return nil
 		}
 		var runAfter *string
@@ -190,19 +213,22 @@ func (r *Runner) process(ctx context.Context, job store.Job) error {
 		if err := r.store.Jobs.Reschedule(ctx, job.ID, runAfter, herr.Error()); err != nil {
 			return fmt.Errorf("reschedule job %s after handler error %q: %w", job.ID, herr, err)
 		}
-		return nil
+		return nil // retry pending — not terminal
 	}
 	if err := r.store.Jobs.MarkDone(ctx, job.ID); err != nil {
 		return fmt.Errorf("mark job %s done: %w", job.ID, err)
 	}
+	r.fireComplete(ctx, job, false)
 	return nil
 }
 
-// tsFormat is the single timestamp formatter for all run_after/claim writes, so
-// the string comparison in Claim/ReclaimStuck can never break on a format drift.
-func tsFormat(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+// tsFormat is the single timestamp formatter for all run_after/claim writes. It
+// delegates to store.FormatTime so run_after/claimed_at share the artifacts'
+// created_at format exactly — one fixed-width, lexicographically-sortable wire
+// format across the whole system, so a string comparison never drifts.
+func tsFormat(t time.Time) string { return store.FormatTime(t) }
 
-func nowTS() string { return tsFormat(time.Now()) }
+func nowTS() string { return store.Now() }
 
 // ExpBackoff returns an exponential backoff (base * 2^(attempts-1)) capped at
 // max. base<=0 falls back to 1s and max<base is raised to base, so the result is

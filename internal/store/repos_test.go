@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -15,6 +16,64 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatalf("migrate: %v", err)
 	}
 	return New(db)
+}
+
+// TestReadPool_SnapshotIsolation pins the read/write split the daemon relies on:
+// an uncommitted write is invisible to the read pool, and a committed one is
+// visible. The pipeline's finalize hook reads job state through the read pool
+// right after the writer commits a terminal status, so read-after-commit
+// visibility is a correctness requirement, not just an optimization.
+func TestReadPool_SnapshotIsolation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "kb.db")
+	wdb, err := Open(path)
+	if err != nil {
+		t.Fatalf("open write: %v", err)
+	}
+	t.Cleanup(func() { _ = wdb.Close() })
+	if _, err := Migrate(wdb); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	rdb, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("open read: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	st := NewWithReadPool(wdb, rdb)
+
+	// An uncommitted write must not be visible through the read pool.
+	rollback := errors.New("rollback")
+	h1 := "h1"
+	err = st.Tx(ctx, func(tx *Store) error {
+		if _, err := tx.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "x", ContentHash: &h1}); err != nil {
+			return err
+		}
+		arts, err := st.Artifacts.List(ctx) // read pool, mid-transaction
+		if err != nil {
+			t.Fatalf("read during tx: %v", err)
+		}
+		if len(arts) != 0 {
+			t.Errorf("read pool saw %d artifacts during an open write tx, want 0", len(arts))
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("tx returned %v, want the rollback sentinel", err)
+	}
+
+	// After a committed write, the read pool sees it.
+	h2 := "h2"
+	committed, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "y", ContentHash: &h2})
+	if err != nil {
+		t.Fatalf("commit write: %v", err)
+	}
+	got, err := st.Artifacts.Get(ctx, committed.ID) // read pool
+	if err != nil {
+		t.Fatalf("read after commit: %v", err)
+	}
+	if got.ID != committed.ID {
+		t.Errorf("read pool got %q, want the committed artifact %q", got.ID, committed.ID)
+	}
 }
 
 func TestULID_Sortable(t *testing.T) {

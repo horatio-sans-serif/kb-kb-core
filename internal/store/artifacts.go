@@ -140,7 +140,9 @@ func (r *ArtifactRepo) SoftDelete(ctx context.Context, id string) error {
 // Patch applies a narrow UPDATE of only the set fields of p (plus updated_at);
 // a no-op when nothing is set. Enrichment stages use it to write their artifact
 // effects (fetch sets the body, relevance sets the score) one column-narrow
-// statement at a time (§6.0).
+// statement at a time (§6.0). Scoped to live rows: a patch must never resurrect
+// a tombstoned artifact's columns (which would diverge from the merged delete
+// under cr-sqlite).
 func (r *ArtifactRepo) Patch(ctx context.Context, id string, p ArtifactPatch) error {
 	sets := make([]string, 0, 5)
 	args := make([]any, 0, 7)
@@ -165,7 +167,7 @@ func (r *ArtifactRepo) Patch(ctx context.Context, id string, p ArtifactPatch) er
 	sets = append(sets, "updated_at = ?")
 	args = append(args, now(), id)
 	if _, err := r.q.ExecContext(ctx,
-		`UPDATE artifacts SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+		`UPDATE artifacts SET `+strings.Join(sets, ", ")+` WHERE id = ? AND deleted_at IS NULL`, args...); err != nil {
 		return fmt.Errorf("patch artifact %q: %w", id, err)
 	}
 	return nil

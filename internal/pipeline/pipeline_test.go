@@ -2,18 +2,23 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"kb/internal/events"
 	"kb/internal/jobs"
 	"kb/internal/kb"
+	"kb/internal/store"
 	"kb/internal/storetest"
 )
 
 type fakeEnricher struct {
-	name     string
-	deps     []string
-	okFn     func(kb.PrivacyTier) bool
-	onEnrich func(*kb.Artifact)
+	name      string
+	deps      []string
+	okFn      func(kb.PrivacyTier) bool
+	onEnrich  func(*kb.Artifact)
+	enrichErr error
 }
 
 func (f *fakeEnricher) Name() string        { return f.name }
@@ -28,9 +33,31 @@ func (f *fakeEnricher) Enrich(_ context.Context, a *kb.Artifact) (kb.EnrichResul
 	if f.onEnrich != nil {
 		f.onEnrich(a)
 	}
+	if f.enrichErr != nil {
+		return kb.EnrichResult{}, f.enrichErr
+	}
 	return kb.EnrichResult{
 		Enrichments: []kb.Enrichment{{ArtifactID: a.ID, Kind: f.name, Payload: "{}", Model: "test", PromptVersion: "v1"}},
 	}, nil
+}
+
+// failFastRunner builds a runner that fails a job on its first error (no retry
+// backoff) so failure-path tests do not wait on exponential backoff.
+func failFastRunner(st *store.Store) *jobs.Runner {
+	return jobs.NewRunner(st, jobs.WithMaxAttempts(1), jobs.WithBackoff(func(int) time.Duration { return 0 }))
+}
+
+// drainEvents collects the events buffered on sub without blocking.
+func drainEvents(sub <-chan events.Event) []events.Event {
+	var out []events.Event
+	for {
+		select {
+		case e := <-sub:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
 }
 
 func TestPipeline_Validate(t *testing.T) {
@@ -55,9 +82,31 @@ func TestPipeline_Validate(t *testing.T) {
 	}
 }
 
+func TestPipeline_Register_RejectsReservedAndEmpty(t *testing.T) {
+	mustPanic := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: expected panic", name)
+			}
+		}()
+		fn()
+	}
+	mustPanic("empty name", func() { New().Register(&fakeEnricher{name: ""}) })
+	mustPanic("reserved @ prefix", func() { New().Register(&fakeEnricher{name: "@ready"}) })
+	mustPanic("duplicate", func() {
+		p := New()
+		p.Register(&fakeEnricher{name: "a"})
+		p.Register(&fakeEnricher{name: "a"})
+	})
+}
+
 func TestPipeline_EnqueueAndRun_RespectsOrder(t *testing.T) {
 	st := storetest.New(t)
 	ctx := context.Background()
+	bus := events.NewBus()
+	sub, unsub := bus.Subscribe()
+	defer unsub()
 
 	var order []string
 	p := New()
@@ -73,7 +122,7 @@ func TestPipeline_EnqueueAndRun_RespectsOrder(t *testing.T) {
 	}
 
 	r := jobs.NewRunner(st)
-	p.RegisterHandlers(st, r)
+	p.RegisterHandlers(st, r, bus)
 	if _, err := r.Drain(ctx); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
@@ -91,11 +140,72 @@ func TestPipeline_EnqueueAndRun_RespectsOrder(t *testing.T) {
 	if got, _ := st.Artifacts.Get(ctx, a.ID); got.Status != kb.StatusReady {
 		t.Errorf("artifact status = %q, want ready after the pipeline completes", got.Status)
 	}
+	// Exactly one terminal artifact.ready event, and no artifact.failed.
+	var ready, failed int
+	for _, e := range drainEvents(sub) {
+		switch e.Type {
+		case events.ArtifactReady:
+			ready++
+		case events.ArtifactFailed:
+			failed++
+		}
+	}
+	if ready != 1 || failed != 0 {
+		t.Errorf("events: ready=%d failed=%d, want ready=1 failed=0", ready, failed)
+	}
+}
+
+func TestPipeline_StageFailure_FinalizesArtifactFailed(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+	bus := events.NewBus()
+	sub, unsub := bus.Subscribe()
+	defer unsub()
+
+	// a -> b(fails) -> c. b's failure cascade-fails c; the artifact must still
+	// reach a terminal 'failed' status (the keystone: a failed stage formerly
+	// stranded the artifact in 'enriching' forever via the @ready sentinel).
+	p := New()
+	p.Register(&fakeEnricher{name: "a"})
+	p.Register(&fakeEnricher{name: "b", deps: []string{"a"}, enrichErr: errors.New("boom")})
+	p.Register(&fakeEnricher{name: "c", deps: []string{"b"}})
+
+	a, err := st.Artifacts.UpsertByCanonical(ctx, &kb.Artifact{Type: kb.Note, Title: "x"})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if err := p.Enqueue(ctx, st, a.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	r := failFastRunner(st)
+	p.RegisterHandlers(st, r, bus)
+	if _, err := r.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	got, _ := st.Artifacts.Get(ctx, a.ID)
+	if got.Status != kb.StatusFailed {
+		t.Errorf("artifact status = %q, want failed after a stage fails (not stranded in enriching)", got.Status)
+	}
+	var ready, failed int
+	for _, e := range drainEvents(sub) {
+		switch e.Type {
+		case events.ArtifactReady:
+			ready++
+		case events.ArtifactFailed:
+			failed++
+		}
+	}
+	if failed != 1 || ready != 0 {
+		t.Errorf("events: ready=%d failed=%d, want ready=0 failed=1", ready, failed)
+	}
 }
 
 func TestPipeline_PrivacyGate(t *testing.T) {
 	st := storetest.New(t)
 	ctx := context.Background()
+	bus := events.NewBus()
 
 	calls := 0
 	cloud := &fakeEnricher{
@@ -106,9 +216,11 @@ func TestPipeline_PrivacyGate(t *testing.T) {
 	p := New()
 	p.Register(cloud)
 	r := jobs.NewRunner(st)
-	p.RegisterHandlers(st, r)
+	p.RegisterHandlers(st, r, bus)
 
-	// Sensitive artifact: the gate must skip the cloud enricher entirely.
+	// Sensitive artifact: the gate must skip the cloud enricher entirely, but
+	// record an auditable "skipped" enrichment and still finalize the artifact
+	// (a privacy skip is a deliberate no-op, not a failure).
 	sens, _ := st.Artifacts.UpsertByCanonical(ctx, &kb.Artifact{Type: kb.Note, Title: "secret", PrivacyTier: kb.Sensitive})
 	if err := p.Enqueue(ctx, st, sens.ID); err != nil {
 		t.Fatal(err)
@@ -119,8 +231,12 @@ func TestPipeline_PrivacyGate(t *testing.T) {
 	if calls != 0 {
 		t.Errorf("cloud enricher ran on a sensitive artifact (%d calls) — privacy gate failed", calls)
 	}
-	if ens, _ := st.Enrichments.ListForArtifact(ctx, sens.ID); len(ens) != 0 {
-		t.Errorf("sensitive artifact got %d enrichments, want 0", len(ens))
+	ens, _ := st.Enrichments.ListForArtifact(ctx, sens.ID)
+	if len(ens) != 1 || ens[0].Kind != "skipped" {
+		t.Errorf("sensitive artifact enrichments = %+v, want exactly one 'skipped' row", ens)
+	}
+	if got, _ := st.Artifacts.Get(ctx, sens.ID); got.Status != kb.StatusReady {
+		t.Errorf("skipped artifact status = %q, want ready (a privacy skip is not a failure)", got.Status)
 	}
 
 	// Personal artifact: the gate allows it.

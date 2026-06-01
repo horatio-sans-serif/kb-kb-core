@@ -23,7 +23,7 @@ type BuildInfo struct {
 
 // Enqueuer expands an ingested artifact into its enrichment-pipeline jobs within
 // the caller's transaction (satisfied by *pipeline.Pipeline). When nil, ingest
-// enqueues a single placeholder "ingest" job instead.
+// records the artifact and its encounter but starts no pipeline.
 type Enqueuer interface {
 	EnqueueTx(ctx context.Context, tx *store.Store, artifactID string) error
 }
@@ -227,14 +227,15 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return err
 		}
-		// TODO(Phase 2.x): re-ingesting a known URL re-runs the pipeline even
-		// though the artifact is unchanged. Make this idempotent once
-		// UpsertByCanonical reports inserted-vs-updated.
-		if s.deps.Enqueue != nil {
+		// Only a fresh INSERT starts a pipeline. Re-ingesting a known artifact
+		// records another encounter (a relevance signal, §8.9) but must not
+		// re-run enrichment on unchanged content. The upsert leaves
+		// created_at==updated_at only on insert; a re-sighting bumps updated_at.
+		inserted := art.CreatedAt == art.UpdatedAt
+		if inserted && s.deps.Enqueue != nil {
 			return s.deps.Enqueue.EnqueueTx(ctx, tx, art.ID)
 		}
-		_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "ingest", ArtifactID: &art.ID})
-		return err
+		return nil
 	})
 	if err != nil {
 		s.serverError(w, "ingest", err)

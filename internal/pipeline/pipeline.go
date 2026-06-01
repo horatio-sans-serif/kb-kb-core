@@ -7,8 +7,10 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
+	"kb/internal/events"
 	"kb/internal/jobs"
 	"kb/internal/kb"
 	"kb/internal/store"
@@ -25,12 +27,16 @@ func New() *Pipeline {
 	return &Pipeline{enrichers: make(map[string]kb.Enricher)}
 }
 
-// Register adds an enricher (one pipeline stage). A duplicate stage name is a
+// Register adds an enricher (one pipeline stage). An empty name, the reserved
+// '@' prefix (held for built-in pseudo-stages), or a duplicate stage name is a
 // wiring bug and panics.
 func (p *Pipeline) Register(e kb.Enricher) {
 	name := e.Name()
-	if name == readyStage {
-		panic(fmt.Sprintf("pipeline: %q is a reserved stage name", name))
+	if name == "" {
+		panic("pipeline: enricher has an empty name")
+	}
+	if name[0] == '@' {
+		panic(fmt.Sprintf("pipeline: stage name %q uses the reserved '@' prefix", name))
 	}
 	if _, dup := p.enrichers[name]; dup {
 		panic(fmt.Sprintf("pipeline: enricher %q already registered", name))
@@ -46,11 +52,6 @@ func (p *Pipeline) Validate() error {
 	return err
 }
 
-// readyStage is the built-in terminal stage: it depends on every enrichment
-// stage and marks the artifact ready once they all complete. It is reserved;
-// an enricher may not use this name.
-const readyStage = "@ready"
-
 // Enqueue runs EnqueueTx in its own transaction.
 func (p *Pipeline) Enqueue(ctx context.Context, st *store.Store, artifactID string) error {
 	return st.Tx(ctx, func(tx *store.Store) error {
@@ -58,15 +59,21 @@ func (p *Pipeline) Enqueue(ctx context.Context, st *store.Store, artifactID stri
 	})
 }
 
-// EnqueueTx expands the artifact into one job per stage (plus the terminal ready
-// stage) within an existing transaction, wiring each job's depends_on to the job
-// ids of the stages it depends on, and marks the artifact 'enriching'. Call it
-// from the ingest transaction so the artifact, its encounter, and its pipeline
-// are one atomic unit.
+// EnqueueTx expands the artifact into one job per stage within an existing
+// transaction, wiring each job's depends_on to the job ids of the stages it
+// depends on, and marks the artifact 'enriching'. Call it from the ingest
+// transaction so the artifact, its encounter, and its pipeline are one atomic
+// unit. With no registered stages the artifact has no work to do and is marked
+// 'ready' immediately. Terminal status (ready/failed) for a non-empty pipeline
+// is set later by the runner's on-complete hook (see finalize), not here.
 func (p *Pipeline) EnqueueTx(ctx context.Context, tx *store.Store, artifactID string) error {
 	order, err := p.topoOrder()
 	if err != nil {
 		return err
+	}
+	if len(order) == 0 {
+		ready := kb.StatusReady
+		return tx.Artifacts.Patch(ctx, artifactID, store.ArtifactPatch{Status: &ready})
 	}
 	enriching := kb.StatusEnriching
 	if err := tx.Artifacts.Patch(ctx, artifactID, store.ArtifactPatch{Status: &enriching}); err != nil {
@@ -74,7 +81,6 @@ func (p *Pipeline) EnqueueTx(ctx context.Context, tx *store.Store, artifactID st
 	}
 
 	jobIDs := make(map[string]string, len(order)) // stage name -> job id
-	all := make([]string, 0, len(order))
 	for _, name := range order {
 		deps := make([]string, 0, len(p.enrichers[name].DependsOn()))
 		for _, dep := range p.enrichers[name].DependsOn() {
@@ -85,28 +91,59 @@ func (p *Pipeline) EnqueueTx(ctx context.Context, tx *store.Store, artifactID st
 			return err
 		}
 		jobIDs[name] = id
-		all = append(all, id)
 	}
-	_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: readyStage, ArtifactID: &artifactID, DependsOn: all})
-	return err
+	return nil
 }
 
-// RegisterHandlers wires one job handler per stage into the runner. Each handler
-// loads the artifact, enforces the privacy gate (an enricher whose PrivacyOK
-// rejects the tier is skipped without ever processing the artifact — this is the
-// §8.17 floor: sensitive/restricted content never reaches a cloud enricher),
-// runs Enrich, and persists the resulting enrichments.
-func (p *Pipeline) RegisterHandlers(st *store.Store, runner *jobs.Runner) {
+// RegisterHandlers wires one job handler per stage into the runner and installs
+// the finalize on-complete hook. Each handler loads the artifact, enforces the
+// privacy gate (an enricher whose PrivacyOK rejects the tier is skipped without
+// ever processing the artifact — the §8.17 floor: sensitive/restricted content
+// never reaches a cloud enricher), runs Enrich, and persists the resulting
+// enrichments.
+func (p *Pipeline) RegisterHandlers(st *store.Store, runner *jobs.Runner, bus *events.Bus) {
 	for _, name := range p.order {
 		runner.Handle(name, p.handler(st, p.enrichers[name]))
 	}
-	runner.Handle(readyStage, func(ctx context.Context, job store.Job) error {
+	runner.SetOnComplete(p.finalize(st, bus))
+}
+
+// finalize transitions an artifact to its terminal status once every one of its
+// pipeline jobs is terminal. It runs after each job completes (the runner's
+// on-complete hook): while any stage is still pending or running it is a no-op;
+// when the last one finishes it sets status 'ready' (all stages done) or
+// 'failed' (at least one stage failed) and publishes the matching lifecycle
+// event.
+//
+// This replaces a former built-in "@ready" sentinel job that depended on every
+// stage: because cascade-fail fails the *dependents* of a failed job, any
+// upstream failure also failed "@ready", whose handler then never ran — leaving
+// the artifact stuck in 'enriching'. Deriving the terminal state from the job
+// table after each completion has no such gap: a failed stage's own completion
+// is what triggers the finalize.
+func (p *Pipeline) finalize(st *store.Store, bus *events.Bus) func(context.Context, store.Job, bool) error {
+	return func(ctx context.Context, job store.Job, _ bool) error {
 		if job.ArtifactID == nil {
-			return fmt.Errorf("pipeline: ready job %s has no artifact", job.ID)
+			return nil // non-artifact job: nothing to finalize
 		}
-		ready := kb.StatusReady
-		return st.Artifacts.Patch(ctx, *job.ArtifactID, store.ArtifactPatch{Status: &ready})
-	})
+		artifactID := *job.ArtifactID
+		pending, anyFailed, err := st.Jobs.ArtifactPipelineState(ctx, artifactID)
+		if err != nil {
+			return err
+		}
+		if pending > 0 {
+			return nil // stages remain; the artifact is not terminal yet
+		}
+		status, evt := kb.StatusReady, events.ArtifactReady
+		if anyFailed {
+			status, evt = kb.StatusFailed, events.ArtifactFailed
+		}
+		if err := st.Artifacts.Patch(ctx, artifactID, store.ArtifactPatch{Status: &status}); err != nil {
+			return err
+		}
+		bus.Publish(events.New(evt, map[string]string{"artifact_id": artifactID}))
+		return nil
+	}
 }
 
 func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
@@ -119,7 +156,16 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 			return fmt.Errorf("pipeline: load artifact for %s: %w", e.Name(), err)
 		}
 		if !e.PrivacyOK(a.PrivacyTier) {
-			return nil // privacy gate: skip, never process this tier with this enricher
+			// Privacy gate: this enricher may not process this tier. Record the
+			// skip as an enrichment row so the gap is auditable, then complete
+			// the job — a privacy skip is a deliberate no-op, not a failure, so
+			// it must not fail the artifact.
+			return st.Enrichments.Create(ctx, &store.Enrichment{
+				ArtifactID:    a.ID,
+				Kind:          "skipped",
+				Payload:       skippedPayload(e.Name(), a.PrivacyTier),
+				PromptVersion: "1",
+			})
 		}
 		res, err := e.Enrich(ctx, a)
 		if err != nil {
@@ -139,6 +185,17 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 			return nil
 		})
 	}
+}
+
+// skippedPayload is the JSON body recorded for a privacy-gated stage skip.
+func skippedPayload(stage string, tier kb.PrivacyTier) string {
+	b, err := json.Marshal(map[string]string{
+		"stage": stage, "reason": "privacy_gate", "tier": string(tier),
+	})
+	if err != nil { // a string map cannot fail to marshal; defensive fallback
+		return `{"reason":"privacy_gate"}`
+	}
+	return string(b)
 }
 
 // topoOrder returns the enrichers in a dependency-respecting order (Kahn's

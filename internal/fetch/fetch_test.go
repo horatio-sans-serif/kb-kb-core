@@ -35,6 +35,48 @@ func TestWebFetcher_Extract(t *testing.T) {
 	}
 }
 
+func TestWebFetcher_StripsNoscript(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, `<html><body><noscript>noscript_token</noscript><p>Visible.</p></body></html>`)
+	}))
+	defer srv.Close()
+
+	got, err := NewWebFetcher(srv.Client()).Extract(context.Background(), kb.ResourceRef{URL: srv.URL})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if strings.Contains(got.BodyMarkdown, "noscript_token") {
+		t.Errorf("body should not contain <noscript> contents: %q", got.BodyMarkdown)
+	}
+	if !strings.Contains(got.BodyMarkdown, "Visible.") {
+		t.Errorf("body = %q, want the visible paragraph", got.BodyMarkdown)
+	}
+}
+
+func TestWebFetcher_RejectsNonHTMLContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = io.WriteString(w, "%PDF-1.7 not really html")
+	}))
+	defer srv.Close()
+	if _, err := NewWebFetcher(srv.Client()).Extract(context.Background(), kb.ResourceRef{URL: srv.URL}); err == nil {
+		t.Error("a non-HTML content type should be rejected (the HTML extractor must not run on binary)")
+	}
+}
+
+func TestWebFetcher_RejectsOversizedBody(t *testing.T) {
+	big := strings.Repeat("a", maxBodyBytes+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, big)
+	}))
+	defer srv.Close()
+	if _, err := NewWebFetcher(srv.Client()).Extract(context.Background(), kb.ResourceRef{URL: srv.URL}); err == nil {
+		t.Errorf("a body over the %d-byte cap should error, not silently truncate", maxBodyBytes)
+	}
+}
+
 func TestWebFetcher_Non200IsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

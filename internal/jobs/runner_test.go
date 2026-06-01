@@ -59,7 +59,7 @@ func TestRunner_BackoffSetsFutureRunAfter(t *testing.T) {
 		t.Fatalf("job = %+v, want pending with a future run_after", job)
 	}
 	// Not claimable now: its run_after is an hour out.
-	claimed, err := st.Jobs.Claim(ctx, time.Now().UTC().Format(time.RFC3339Nano))
+	claimed, err := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestRunner_ResumeAfterCrash(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 	// Claim leaves the job 'running' and is never completed — a crash.
-	if _, err := st.Jobs.Claim(ctx, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := st.Jobs.Claim(ctx, store.FormatTime(time.Now())); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 

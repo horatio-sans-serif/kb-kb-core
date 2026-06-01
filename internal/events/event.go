@@ -17,6 +17,7 @@ type EventType string
 const (
 	ArtifactIngested   EventType = "artifact.ingested"
 	ArtifactReady      EventType = "artifact.ready"
+	ArtifactFailed     EventType = "artifact.failed"
 	EngagementRecorded EventType = "engagement.recorded"
 	ProfileUpdated     EventType = "profile.updated"
 	SourceFailed       EventType = "source.failed"

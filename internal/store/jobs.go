@@ -203,6 +203,24 @@ func (r *JobRepo) Purge(ctx context.Context, olderThan string) (int, error) {
 	return int(n), nil
 }
 
+// ArtifactPipelineState summarizes the jobs of one artifact for the pipeline's
+// finalize hook: pending is the count of jobs not yet terminal (still pending or
+// running), and anyFailed reports whether at least one reached 'failed'. The
+// finalize hook reads it after each job completes to decide when every stage is
+// terminal — pending==0 — and whether the artifact is ready or failed. Read pool.
+func (r *JobRepo) ArtifactPipelineState(ctx context.Context, artifactID string) (pending int, anyFailed bool, err error) {
+	row := r.rq.QueryRowContext(ctx,
+		`SELECT
+		   COALESCE(SUM(CASE WHEN status NOT IN ('done', 'failed') THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+		 FROM jobs WHERE artifact_id = ?`, artifactID)
+	var failed int
+	if err := row.Scan(&pending, &failed); err != nil {
+		return 0, false, fmt.Errorf("artifact %q pipeline state: %w", artifactID, err)
+	}
+	return pending, failed > 0, nil
+}
+
 func (r *JobRepo) Get(ctx context.Context, id string) (*Job, error) {
 	job, err := scanJob(r.rq.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
 	if err != nil {

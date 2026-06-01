@@ -101,14 +101,14 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// The enrichment pipeline: each ingested artifact is expanded into its stages.
 	enrichment := pipeline.New()
 	enrichment.Register(enrich.NewFetch(fetch.New()))
-	enrichment.RegisterHandlers(st, runner)
+	enrichment.RegisterHandlers(st, runner, bus)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not
 	// serve with a dead loop), then purge old terminal jobs (best-effort).
 	if _, err := runner.ReclaimStuck(ctx); err != nil {
 		return fmt.Errorf("reclaim stuck jobs: %w", err)
 	}
-	cutoff := time.Now().Add(-jobRetention).UTC().Format(time.RFC3339Nano)
+	cutoff := store.FormatTime(time.Now().Add(-jobRetention))
 	if n, err := st.Jobs.Purge(ctx, cutoff); err != nil {
 		logger.Warn("purge old jobs", "err", err)
 	} else if n > 0 {

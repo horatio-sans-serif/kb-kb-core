@@ -532,22 +532,44 @@ packages.
 **Goal:** raw URL artifacts become artifacts with real content — the first end of
 the design's enrichment core (§8.3), wired through the pipeline into ingest.
 
-**Status: Complete.**
+**Status: Complete (reviewed; all findings fixed).**
 
 - **Contract evolution.** `kb.Enricher.Enrich` now returns
-  `EnrichResult{Enrichments, Patch}` — a stage can emit enrichment rows *and*
+  `EnrichResult{Enrichments, Patch}` — a stage can emit enrichment rows _and_
   patch the artifact (fetch sets the body). `store.ArtifactRepo.Patch` applies a
   narrow per-column UPDATE.
-- **Status lifecycle.** `pipeline.EnqueueTx` marks the artifact `enriching` and a
-  built-in terminal `@ready` stage (depending on all enrichment jobs) marks it
-  `ready`.
+- **Status lifecycle.** `pipeline.EnqueueTx` marks the artifact `enriching`; the
+  runner's on-complete hook (`pipeline.finalize`) sets the terminal status by
+  reading the job table after each completion — `ready` when every stage is done,
+  `failed` when any stage failed — and publishes `artifact.ready`/`.failed`.
 - **Fetch.** `internal/fetch.WebFetcher` — SSRF-guarded http.Client (dialer
-  Control rejects internal IPs, defeating rebinding; redirect/size/timeout caps),
-  basic HTML→Markdown. `internal/enrich.Fetch` is the "fetch" stage.
+  Control rejects internal IPs, defeating rebinding; redirect/size/timeout caps)
+  plus a pre-flight `CheckURL` host check; rejects non-HTML content types and
+  oversized bodies; strips `script`/`style`/`noscript`; basic HTML→Markdown.
+  `internal/enrich.Fetch` is the "fetch" stage.
 - **Wiring.** `api.Deps.Enqueue` (an `Enqueuer` seam) lets `/ingest` expand the
-  artifact into its pipeline jobs in the ingest transaction; `cmd/kbd` registers
-  the fetch stage. The placeholder `ingest` handler is gone. Verified end to end:
-  HTTP ingest → fetch → body in the artifact → `ready`.
+  artifact into its pipeline jobs in the ingest transaction — only on a fresh
+  insert, so re-ingesting a known URL records the encounter but does not re-run
+  enrichment; `cmd/kbd` registers the fetch stage. Verified end to end: HTTP
+  ingest → fetch → body in the artifact → `ready`.
+
+**Review fixes applied (Phase 2 Stage 1):**
+
+- **Failed stage no longer strands the artifact.** The former terminal `@ready`
+  job depended on every stage, so an upstream failure cascade-failed it and the
+  artifact sat in `enriching` forever. Replaced with `jobs.Runner.SetOnComplete`
+  - `pipeline.finalize`, which derives terminal status from
+    `store.JobRepo.ArtifactPipelineState` (pending count + any-failed). A failing
+    stage now finalizes the artifact `failed`.
+- **Privacy-gate skips are auditable.** A gated stage writes a `skipped`
+  enrichment row instead of silently returning, and still finalizes (a skip is
+  not a failure).
+- **`Patch` cannot resurrect a tombstone.** Scoped to `deleted_at IS NULL`.
+- **One sortable timestamp format.** `store.TimeFormat`/`FormatTime`/`Now` replace
+  `time.RFC3339Nano` everywhere a timestamp is minted (store, jobs, daemon).
+  RFC3339Nano trims trailing zeros and drops the fraction on a whole second, which
+  broke the lexicographic = chronological invariant the FIFO `Claim` and
+  `run_after`/`claimed_at` comparisons rely on. Fixed-width nanoseconds restore it.
 
 **Next (Stage 2 — enrichers):** `internal/llm` (Ollama client, injectable),
 `summarize`/`tags`/`critical-analysis` enrichers (`DependsOn: ["fetch"]`,
