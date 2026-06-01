@@ -524,3 +524,33 @@ SSE write-error + heartbeat; bus RWMutex; canon allocation/typed-event cleanups;
 DB-file and HTTP hardening; tooling (Makefile, golangci-lint, CI); the
 notification-vs-durable-work bus rule (design §9). Coverage backfilled across all
 packages.
+
+---
+
+# Phase 2 — Stage 1: Fetch layer (the enrichment pipeline goes live)
+
+**Goal:** raw URL artifacts become artifacts with real content — the first end of
+the design's enrichment core (§8.3), wired through the pipeline into ingest.
+
+**Status: Complete.**
+
+- **Contract evolution.** `kb.Enricher.Enrich` now returns
+  `EnrichResult{Enrichments, Patch}` — a stage can emit enrichment rows *and*
+  patch the artifact (fetch sets the body). `store.ArtifactRepo.Patch` applies a
+  narrow per-column UPDATE.
+- **Status lifecycle.** `pipeline.EnqueueTx` marks the artifact `enriching` and a
+  built-in terminal `@ready` stage (depending on all enrichment jobs) marks it
+  `ready`.
+- **Fetch.** `internal/fetch.WebFetcher` — SSRF-guarded http.Client (dialer
+  Control rejects internal IPs, defeating rebinding; redirect/size/timeout caps),
+  basic HTML→Markdown. `internal/enrich.Fetch` is the "fetch" stage.
+- **Wiring.** `api.Deps.Enqueue` (an `Enqueuer` seam) lets `/ingest` expand the
+  artifact into its pipeline jobs in the ingest transaction; `cmd/kbd` registers
+  the fetch stage. The placeholder `ingest` handler is gone. Verified end to end:
+  HTTP ingest → fetch → body in the artifact → `ready`.
+
+**Next (Stage 2 — enrichers):** `internal/llm` (Ollama client, injectable),
+`summarize`/`tags`/`critical-analysis` enrichers (`DependsOn: ["fetch"]`,
+local-LLM so `PrivacyOK` is always true), and `embed` (sqlite-vec — needs the
+runtime extension + a vector store) feeding relevance scoring against the static
+profile (§8.5/§8.9). Then retrieval (Phase 3).
