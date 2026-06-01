@@ -12,12 +12,12 @@ func envFunc(m map[string]string) func(string) string {
 func TestLoad_Defaults(t *testing.T) {
 	cfg, err := Load(envFunc(map[string]string{
 		"KB_DB":        "/tmp/kb.db",
-		"KB_API_TOKEN": "secret",
+		"KB_API_TOKEN": "0123456789abcdef0123456789abcdef",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.DBPath != "/tmp/kb.db" || cfg.APIToken != "secret" {
+	if cfg.DBPath != "/tmp/kb.db" || cfg.APIToken != "0123456789abcdef0123456789abcdef" {
 		t.Errorf("got %+v, want DBPath/APIToken from env", cfg)
 	}
 	if cfg.ListenAddr != "127.0.0.1:8087" {
@@ -41,8 +41,15 @@ func TestConfig_MissingTokenFails(t *testing.T) {
 	}
 }
 
+func TestConfig_ShortTokenFails(t *testing.T) {
+	_, err := Load(envFunc(map[string]string{"KB_DB": "/tmp/kb.db", "KB_API_TOKEN": "short"}))
+	if err == nil || !strings.Contains(err.Error(), "KB_API_TOKEN") {
+		t.Errorf("expected a min-length error for a short token, got %v", err)
+	}
+}
+
 func TestConfig_MissingDBFails(t *testing.T) {
-	_, err := Load(envFunc(map[string]string{"KB_API_TOKEN": "secret"}))
+	_, err := Load(envFunc(map[string]string{"KB_API_TOKEN": "0123456789abcdef0123456789abcdef"}))
 	if err == nil || !strings.Contains(err.Error(), "KB_DB") {
 		t.Errorf("expected an error naming KB_DB, got %v", err)
 	}
@@ -51,7 +58,7 @@ func TestConfig_MissingDBFails(t *testing.T) {
 func TestConfig_InvalidPrivacyFails(t *testing.T) {
 	_, err := Load(envFunc(map[string]string{
 		"KB_DB":              "/tmp/kb.db",
-		"KB_API_TOKEN":       "secret",
+		"KB_API_TOKEN":       "0123456789abcdef0123456789abcdef",
 		"KB_DEFAULT_PRIVACY": "bogus",
 	}))
 	if err == nil || !strings.Contains(err.Error(), "KB_DEFAULT_PRIVACY") {
@@ -62,7 +69,7 @@ func TestConfig_InvalidPrivacyFails(t *testing.T) {
 func TestConfig_CloudLLMParsed(t *testing.T) {
 	cfg, err := Load(envFunc(map[string]string{
 		"KB_DB":        "/tmp/kb.db",
-		"KB_API_TOKEN": "secret",
+		"KB_API_TOKEN": "0123456789abcdef0123456789abcdef",
 		"KB_CLOUD_LLM": "true",
 	}))
 	if err != nil {

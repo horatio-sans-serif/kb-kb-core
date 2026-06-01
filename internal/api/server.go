@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"kb/internal/canon"
 	"kb/internal/events"
@@ -104,6 +105,24 @@ func validPrivacy(t string) bool {
 	return false
 }
 
+// validText rejects invalid UTF-8 and control characters (a stored-injection
+// guard for the future renderers). Tab is always allowed; newlines/CR only when
+// allowNewlines (the Markdown body, not the title).
+func validText(s string, allowNewlines bool) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r == '\t', allowNewlines && (r == '\n' || r == '\r'):
+			continue
+		case r < 0x20 || r == 0x7f:
+			return false
+		}
+	}
+	return true
+}
+
 // handleIngest is the walking skeleton: it writes the artifact, its encounter,
 // and an enrichment job atomically, then publishes artifact.ingested (only after
 // the transaction commits, so a rolled-back ingest emits no event). The artifact
@@ -133,6 +152,9 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	case req.Privacy != "" && !validPrivacy(req.Privacy):
 		http.Error(w, "invalid privacy tier", http.StatusBadRequest)
+		return
+	case !validText(req.Title, false) || !validText(req.Body, true):
+		http.Error(w, "title/body contains invalid UTF-8 or control characters", http.StatusBadRequest)
 		return
 	}
 

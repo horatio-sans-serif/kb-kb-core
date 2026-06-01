@@ -25,6 +25,27 @@ func (r *EnrichmentRepo) Create(ctx context.Context, e *Enrichment) error {
 	return nil
 }
 
+// ListForArtifact returns all enrichments for an artifact, oldest first.
+func (r *EnrichmentRepo) ListForArtifact(ctx context.Context, artifactID string) ([]*Enrichment, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT id, artifact_id, kind, payload, model, prompt_version, created_at
+		 FROM enrichments WHERE artifact_id = ? ORDER BY created_at, id`, artifactID)
+	if err != nil {
+		return nil, fmt.Errorf("list enrichments for %q: %w", artifactID, err)
+	}
+	defer rows.Close()
+
+	var out []*Enrichment
+	for rows.Next() {
+		var e Enrichment
+		if err := rows.Scan(&e.ID, &e.ArtifactID, &e.Kind, &e.Payload, &e.Model, &e.PromptVersion, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan enrichment: %w", err)
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
+}
+
 // Get returns the enrichment by id, or ErrNotFound.
 func (r *EnrichmentRepo) Get(ctx context.Context, id string) (*Enrichment, error) {
 	var e Enrichment

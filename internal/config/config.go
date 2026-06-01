@@ -39,6 +39,11 @@ func Load(getenv func(string) string) (*Config, error) {
 		return nil, fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
 	}
 
+	const minTokenLen = 16
+	if len(cfg.APIToken) < minTokenLen {
+		return nil, fmt.Errorf("KB_API_TOKEN must be at least %d characters (use e.g. `openssl rand -hex 32`)", minTokenLen)
+	}
+
 	switch cfg.DefaultPrivacy {
 	case "public", "personal", "sensitive", "restricted":
 	default:

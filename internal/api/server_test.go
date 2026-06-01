@@ -350,6 +350,18 @@ func TestIngest_BothURLAndBody(t *testing.T) {
 	}
 }
 
+func TestIngest_RejectsControlChars(t *testing.T) {
+	st, _, h := testServer(t)
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(context.Background(), src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	body := `{"source_id":"` + src.ID + `","body":"ok","title":"bad\u0007title"}`
+	if rec := doIngest(h, body, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a control char in the title", rec.Code)
+	}
+}
+
 func TestIngest_StoreFailureReturns500(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "kb.db"))
 	if err != nil {
