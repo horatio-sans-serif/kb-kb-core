@@ -444,6 +444,15 @@ built the mechanisms (queue, store, bus) but not the contracts that the
 enrichment pipeline plugs into. Do these **before** the first real enricher, in
 roughly this order — each is small now and a refactor later.
 
+**Status: Complete.** 0.1 `internal/kb` domain package (type aliases in `store`,
+typed enums). 0.2 `internal/pipeline` (DAG expansion + privacy-gated handlers).
+0.3 `internal/ssrf` guard. 0.4 read pool (`OpenReadOnly`/`NewWithReadPool`). 0.5
+`SourceRepo` List/Update/SetEnabled + `internal/sources` connector registry. 0.6
+token-length floor + ingest UTF-8/control-char validation. Deferred to Phase 4
+(needs real connectors): wiring connector-registry validation at source create
+and startup. Deferred to the read API: audit-log writes + per-device tokens (no
+read/export path to audit yet). All green under `-race`.
+
 ## 0.1 Domain types package (`internal/kb`)
 
 Extract `Artifact`, `Enrichment`, `Encounter`, `Source` (and value types
@@ -471,10 +480,10 @@ interfaces in `internal/kb` now (even unimplemented) so the seam and its types
 
 - **Privacy gate:** make `PrivacyOK` a hard precondition in the enricher dispatch
   path — a `sensitive`/`restricted` artifact is never dispatched to a cloud
-  enricher regardless of `KB_CLOUD_LLM`; the flag only *enables* cloud for
+  enricher regardless of `KB_CLOUD_LLM`; the flag only _enables_ cloud for
   `public`/`personal`. Test that a sensitive artifact never reaches a cloud
   handler. (Per-source tagging is already done; this enforces it.)
-- **SSRF guard:** a dedicated, unit-tested package the fetcher *must* call —
+- **SSRF guard:** a dedicated, unit-tested package the fetcher _must_ call —
   scheme allowlist (`http`/`https` only), resolve-then-pin the IP and reject
   loopback / private / link-local / ULA / multicast / Tailscale CGNAT
   (`100.64.0.0/10`) on every redirect hop, cap redirects and response size, set

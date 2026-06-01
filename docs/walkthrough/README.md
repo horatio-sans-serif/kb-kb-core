@@ -12,20 +12,21 @@ fits the spine, the **flow** it participates in, and the **decisions/trade-offs*
 Tracks every phase of `../UNIFIED_SYSTEM_DESIGN_PLAN.md` §12, so the table doubles
 as a progress tracker.
 
-| #   | Phase                                            | Doc                                                | Status      |
-| --- | ------------------------------------------------ | -------------------------------------------------- | ----------- |
-| 00  | Spine (schema, storage, jobs, events, HTTP API)  | [00-phase-0-spine.md](00-phase-0-spine.md)         | written     |
-| 01  | Ingestion: canonicalization + content-hash dedup | [01-phase-1-ingestion.md](01-phase-1-ingestion.md) | written     |
-| 02  | Enrichment core (fetch, summarize, embed)        | —                                                  | not started |
-| 03  | Retrieval (search + RAG)                         | —                                                  | not started |
-| 04  | Sources at scale + scheduling + health           | —                                                  | not started |
-| 05  | Knowledge graph + entities                       | —                                                  | not started |
-| 06  | The feedback loop (engagement, re-score, decay)  | —                                                  | not started |
-| 07  | Surfacing (digest, spaced repetition, context)   | —                                                  | not started |
-| 08  | Transcription + ambient capture                  | —                                                  | not started |
-| 09  | Output / render layer                            | —                                                  | not started |
-| 10  | Multi-device, API, sync                          | —                                                  | not started |
-| 11  | Conflict detection + source credibility          | —                                                  | not started |
+| #   | Phase                                                      | Doc                                                                    | Status      |
+| --- | ---------------------------------------------------------- | ---------------------------------------------------------------------- | ----------- |
+| 00  | Spine (schema, storage, jobs, events, HTTP API)            | [00-phase-0-spine.md](00-phase-0-spine.md)                             | written     |
+| 01  | Ingestion: canonicalization + content-hash dedup           | [01-phase-1-ingestion.md](01-phase-1-ingestion.md)                     | written     |
+| 02  | Enrichment foundations (domain, pipeline, SSRF, read pool) | [02-phase-2-stage-0-foundations.md](02-phase-2-stage-0-foundations.md) | written     |
+| 02+ | Enrichment core (fetch, summarize, embed)                  | —                                                                      | not started |
+| 03  | Retrieval (search + RAG)                                   | —                                                                      | not started |
+| 04  | Sources at scale + scheduling + health                     | —                                                                      | not started |
+| 05  | Knowledge graph + entities                                 | —                                                                      | not started |
+| 06  | The feedback loop (engagement, re-score, decay)            | —                                                                      | not started |
+| 07  | Surfacing (digest, spaced repetition, context)             | —                                                                      | not started |
+| 08  | Transcription + ambient capture                            | —                                                                      | not started |
+| 09  | Output / render layer                                      | —                                                                      | not started |
+| 10  | Multi-device, API, sync                                    | —                                                                      | not started |
+| 11  | Conflict detection + source credibility                    | —                                                                      | not started |
 
 ## Rendering
 
