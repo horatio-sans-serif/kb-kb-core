@@ -76,17 +76,29 @@ func BuildProfile(ctx context.Context, embed func(ctx context.Context, text stri
 // Size reports the number of interest vectors (0 = neutral profile).
 func (p *Profile) Size() int { return len(p.interests) }
 
+// Dim is the dimension of the profile's interest vectors (0 for an empty
+// profile). A caller can compare it to an artifact embedding's dimension to
+// catch a model mismatch, which Cosine would otherwise silently score as 0.
+func (p *Profile) Dim() int {
+	if len(p.interests) == 0 {
+		return 0
+	}
+	return len(p.interests[0].Vector)
+}
+
 // Match scores vec against the profile: the maximum weight-scaled cosine over all
-// interests, clamped to [0,1]. An empty profile returns 1 (neutral — no interest
-// bias), so relevance still ranks by the other factors when no interests are set.
+// interests, clamped to [0,1]. With the default equal weights this is simply the
+// best cosine match; a non-unit weight scales an interest's contribution (a weight
+// above 1 is capped by the clamp). An empty profile returns 1 (neutral — no
+// interest bias), so relevance still ranks by the other factors when no interests
+// are set.
 func (p *Profile) Match(vec []float32) float64 {
 	if len(p.interests) == 0 {
 		return 1
 	}
 	best := 0.0
 	for _, iv := range p.interests {
-		s := Cosine(vec, iv.Vector) * iv.Weight
-		if s > best {
+		if s := Cosine(vec, iv.Vector) * iv.Weight; s > best {
 			best = s
 		}
 	}
@@ -105,6 +117,10 @@ func RecencyFactor(ageHours float64) float64 {
 // EncounterFactor rewards artifacts seen from multiple sources (the multi-source
 // relevance signal, §8.9): 1 at a single sighting, growing logarithmically so a
 // few extra sightings help and a flood does not dominate. Never below 1.
+//
+// Note: with scoring currently computed once at first ingest (see Score), the
+// live encounter count is 1, so this factor is dormant until a re-scoring trigger
+// (deferred to the §9 living-profile stage) runs relevance again on a re-encounter.
 func EncounterFactor(count int) float64 {
 	if count <= 1 {
 		return 1
@@ -156,17 +172,27 @@ type Breakdown struct {
 // recency are in [0,1]; the encounter, engagement, and source-weight factors are
 // multipliers >= 1 (or the source's own weight), so the result is a relative
 // ranking score, not a probability.
+//
+// Caveat: it is currently computed once, at first ingest, when the encounter
+// count is 1 and only the first source is known — so EncounterFactor and
+// SourceWeight do not yet differentiate artifacts. Re-scoring on re-encounter and
+// engagement is deferred to the §9 living-profile stage.
+//
+// SourceWeight is floored at 0: source_weight is an externally-mutable column (a
+// future yield feedback loop adjusts it), and a negative value would invert the
+// relevance_score DESC ranking.
 func Score(in Inputs) Breakdown {
 	recency := RecencyFactor(in.AgeHours)
 	encounter := EncounterFactor(in.Encounters)
 	engagement := EngagementFactor(in.Engaged)
+	sourceWeight := math.Max(0, in.SourceWeight)
 	return Breakdown{
 		ProfileMatch: in.Match,
 		Recency:      recency,
 		Encounter:    encounter,
 		Engagement:   engagement,
-		SourceWeight: in.SourceWeight,
-		Score:        in.Match * recency * encounter * engagement * in.SourceWeight,
+		SourceWeight: sourceWeight,
+		Score:        in.Match * recency * encounter * engagement * sourceWeight,
 	}
 }
 

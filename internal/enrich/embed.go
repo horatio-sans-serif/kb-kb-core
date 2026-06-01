@@ -2,7 +2,9 @@ package enrich
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"kb/internal/kb"
@@ -60,12 +62,25 @@ func (e *Embed) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult, er
 	if len(vec) == 0 {
 		return kb.EnrichResult{}, fmt.Errorf("embed: model returned an empty vector")
 	}
+	// A non-finite component would make json.Marshal fail. Reject it as a stage
+	// error (so the runner retries/fails it visibly) rather than letting it become
+	// a corrupt row that silently reads back as "no embedding" forever.
+	for i, v := range vec {
+		if f := float64(v); math.IsNaN(f) || math.IsInf(f, 0) {
+			return kb.EnrichResult{}, fmt.Errorf("embed: vector[%d] is non-finite (%v)", i, v)
+		}
+	}
 
-	payload := jsonString(kb.EmbeddingPayload{Model: e.model, Dim: len(vec), Vector: vec})
+	// Marshal explicitly and propagate any error — never persist a lossy
+	// fallback payload for an embedding.
+	payload, err := json.Marshal(kb.EmbeddingPayload{Model: e.model, Dim: len(vec), Vector: vec})
+	if err != nil {
+		return kb.EnrichResult{}, fmt.Errorf("embed: marshal payload: %w", err)
+	}
 	return kb.EnrichResult{Enrichments: []kb.Enrichment{{
 		ArtifactID:    a.ID,
 		Kind:          "embedding",
-		Payload:       payload,
+		Payload:       string(payload),
 		Model:         e.model,
 		PromptVersion: embedPromptVersion,
 	}}}, nil

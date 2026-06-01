@@ -669,6 +669,30 @@ engagement * source_weight`.
 
 The enrichment DAG is now `fetch → {summarize, embed}; embed → relevance`.
 
+**Review fixes applied (Phase 2 Stage 3):**
+
+- **Non-finite embeddings fail loudly.** A NaN/±Inf vector component would make
+  `json.Marshal` fail; the embed stage now rejects it as a stage error (visible,
+  retryable) and marshals the payload explicitly, instead of the old lossy helper
+  that wrote `{}` — which read back as "no embedding" and permanently unscored the
+  artifact with no error.
+- **Dimension mismatch surfaces.** If the profile and an artifact embedding differ
+  in dimension (e.g. the embed model changed), the relevance stage errors rather
+  than silently scoring 0 for everything.
+- **`SourceWeight` floored at 0** in `Score` so a future yield feedback loop
+  driving the column negative can't invert the `relevance_score DESC` ranking.
+- **Honest factor docs.** `EncounterFactor`/`Score` now state plainly that, with
+  scoring computed once at first ingest (count 1, single source), the multi-source
+  encounter and source-weight factors are dormant until the re-scoring trigger
+  (deferred to §9) runs relevance again on a re-encounter.
+
+**Known limitation — scoring is computed once at ingest.** The relevance stage
+runs in the first-ingest pipeline only, when the encounter count is 1 and one
+source is known, and nothing recomputes it afterward — so the recency decay and
+the multi-source factors don't yet differentiate artifacts over time. The §9
+living-profile stage adds the re-scoring trigger (on re-encounter, engagement, and
+profile change).
+
 **Next (Phase 3 — retrieval):** the `vec0`/FTS5 local indexes (rebuilt from synced
 enrichment data, §6.0), hybrid search, and RAG. Plus the deferred items: chunk-
 level embeddings (Decision 3 chunking), the living profile and re-scoring on

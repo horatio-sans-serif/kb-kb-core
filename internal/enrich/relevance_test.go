@@ -67,6 +67,16 @@ func TestRelevance_NoEmbeddingIsNoop(t *testing.T) {
 	}
 }
 
+func TestRelevance_DimMismatchIsError(t *testing.T) {
+	// Profile vectors are 2-dim; the artifact embedding is 3-dim (e.g. the embed
+	// model changed). This must error rather than silently score 0.
+	prof := relevance.NewProfile([]relevance.WeightedVector{{Vector: []float32{1, 0}, Weight: 1}})
+	r := NewRelevance(fakeSignals{sig: relevance.Signals{Embedding: []float32{1, 0, 0}, Encounters: 1, SourceWeight: 1}}, prof)
+	if _, err := r.Enrich(context.Background(), &kb.Artifact{ID: "01ART"}); err == nil {
+		t.Error("a profile/embedding dimension mismatch must be a stage error")
+	}
+}
+
 func TestRelevance_ProviderErrorPropagates(t *testing.T) {
 	r := NewRelevance(fakeSignals{err: errors.New("db down")}, relevance.NewProfile(nil))
 	if _, err := r.Enrich(context.Background(), &kb.Artifact{ID: "01ART"}); err == nil {

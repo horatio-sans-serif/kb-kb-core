@@ -130,3 +130,26 @@ func TestScore_CombinesFactors(t *testing.T) {
 		t.Errorf("score with zero match = %v, want 0", z.Score)
 	}
 }
+
+func TestScore_NegativeSourceWeightFloored(t *testing.T) {
+	// A negative source weight (from a future yield feedback loop) must not invert
+	// the ranking: it floors to 0, zeroing the score rather than going negative.
+	bd := Score(Inputs{Match: 1, AgeHours: 0, Encounters: 1, SourceWeight: -2})
+	if bd.Score != 0 || bd.SourceWeight != 0 {
+		t.Errorf("score with negative weight = %+v, want score and weight floored to 0", bd)
+	}
+}
+
+func TestProfile_DimAndWeightClamp(t *testing.T) {
+	if d := NewProfile(nil).Dim(); d != 0 {
+		t.Errorf("empty profile Dim = %d, want 0", d)
+	}
+	p := NewProfile([]WeightedVector{{Vector: []float32{1, 0, 0}, Weight: 4}})
+	if d := p.Dim(); d != 3 {
+		t.Errorf("Dim = %d, want 3", d)
+	}
+	// A weight above 1 on a perfectly-aligned interest is capped by the clamp.
+	if m := p.Match([]float32{1, 0, 0}); !almost(m, 1) {
+		t.Errorf("match with weight 4 = %v, want 1 (clamped)", m)
+	}
+}

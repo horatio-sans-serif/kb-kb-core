@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 
 	"kb/internal/kb"
@@ -83,6 +84,17 @@ func TestEmbed_EmptyVectorIsError(t *testing.T) {
 	e := NewEmbed(f, "m", true)
 	if _, err := e.Enrich(context.Background(), &kb.Artifact{ID: "01ART", BodyMarkdown: "text"}); err == nil {
 		t.Error("an empty vector must be an error")
+	}
+}
+
+func TestEmbed_NonFiniteVectorIsError(t *testing.T) {
+	for _, bad := range []float32{float32(math.NaN()), float32(math.Inf(1)), float32(math.Inf(-1))} {
+		f := &fakeEmbedder{vec: []float32{0.1, bad, 0.3}}
+		e := NewEmbed(f, "m", true)
+		_, err := e.Enrich(context.Background(), &kb.Artifact{ID: "01ART", BodyMarkdown: "text"})
+		if err == nil {
+			t.Errorf("a non-finite component (%v) must be a stage error, not a silently corrupt row", bad)
+		}
 	}
 }
 

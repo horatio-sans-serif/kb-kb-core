@@ -2,6 +2,7 @@ package enrich
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"kb/internal/kb"
@@ -47,6 +48,12 @@ func (r *Relevance) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 	}
 	if len(sig.Embedding) == 0 {
 		return kb.EnrichResult{}, nil // no embedding (e.g. empty body) — nothing to score
+	}
+	// A profile/embedding dimension mismatch (e.g. the embed model changed) makes
+	// every cosine 0 and silently zeroes the score. Surface it as a stage error so
+	// the misconfiguration is visible rather than producing meaningless scores.
+	if d := r.profile.Dim(); d != 0 && d != len(sig.Embedding) {
+		return kb.EnrichResult{}, fmt.Errorf("relevance: embedding dim %d != profile dim %d (embed model mismatch?)", len(sig.Embedding), d)
 	}
 
 	bd := relevance.Score(relevance.Inputs{
