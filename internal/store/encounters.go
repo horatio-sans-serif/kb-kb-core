@@ -5,18 +5,7 @@ import (
 	"fmt"
 )
 
-// Encounter records one sighting of an artifact from one source (design 6.3).
-// Encounters accumulate; their count is itself a relevance signal (§8.9).
-type Encounter struct {
-	ID         string
-	ArtifactID string
-	SourceID   string
-	RawURL     *string
-	Context    string // JSON; stored NULL when empty
-	SeenAt     string
-	CreatedAt  string
-}
-
+// Encounter is defined in internal/kb (aliased in types.go).
 type EncounterRepo struct{ q Querier }
 
 // Record always inserts a new encounter (never deduped — the artifact is the

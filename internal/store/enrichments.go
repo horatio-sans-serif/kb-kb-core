@@ -7,19 +7,7 @@ import (
 	"fmt"
 )
 
-// Enrichment is a versioned, schema-validated output of one pipeline stage for
-// one artifact (design 6.4). Embedding vectors also travel here as payload data
-// so every replica can rebuild its local ANN index (6.0).
-type Enrichment struct {
-	ID            string
-	ArtifactID    string
-	Kind          string // summary | tags | critical_analysis | relevance | embedding | ...
-	Payload       string // JSON
-	Model         string
-	PromptVersion string
-	CreatedAt     string
-}
-
+// Enrichment is defined in internal/kb (aliased in types.go).
 type EnrichmentRepo struct{ q Querier }
 
 // Create inserts an enrichment row, assigning a ULID if none is set.

@@ -7,28 +7,7 @@ import (
 	"fmt"
 )
 
-// Artifact is a canonical knowledge item (design 6.2). Nullable columns are
-// pointers so SQL NULL round-trips correctly; Title/BodyMarkdown are plain
-// strings that read NULL as "" (see scanArtifact).
-type Artifact struct {
-	ID             string
-	Type           string
-	CanonicalURL   *string
-	ContentHash    *string
-	Title          string
-	BodyMarkdown   string
-	PrivacyTier    string
-	LifecycleTier  string
-	Status         string
-	RelevanceScore *float64
-	FirstSeenAt    string
-	LastSeenAt     string
-	LastEngagedAt  *string
-	DeletedAt      *string
-	CreatedAt      string
-	UpdatedAt      string
-}
-
+// Artifact is defined in internal/kb (aliased in types.go).
 type ArtifactRepo struct{ q Querier }
 
 const artifactColNames = `id, type, canonical_url, content_hash, title, body_markdown,

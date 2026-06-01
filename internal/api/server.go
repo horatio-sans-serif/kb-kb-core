@@ -10,6 +10,7 @@ import (
 
 	"kb/internal/canon"
 	"kb/internal/events"
+	"kb/internal/kb"
 	"kb/internal/store"
 )
 
@@ -157,12 +158,12 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Privacy tier: explicit request override > source default > daemon default.
-	tier := s.deps.DefaultPrivacy
+	tier := kb.PrivacyTier(s.deps.DefaultPrivacy)
 	if src.DefaultPrivacy != "" {
 		tier = src.DefaultPrivacy
 	}
 	if req.Privacy != "" {
-		tier = req.Privacy
+		tier = kb.PrivacyTier(req.Privacy)
 	}
 
 	var artifactID string

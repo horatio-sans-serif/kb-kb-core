@@ -7,21 +7,7 @@ import (
 	"fmt"
 )
 
-// Source is a registered origin of artifacts (design 6.1). The schema's
-// schedule, auth_state, and storage_budget columns are intentionally not mapped
-// until the connector contract lands (Phase 4 / Phase 2 Stage 0); this struct is
-// not the complete row.
-type Source struct {
-	ID             string
-	Kind           string // PULL | PUSH | AMBIENT
-	Connector      string
-	Config         string // JSON
-	DefaultPrivacy string
-	SourceWeight   float64
-	Enabled        bool
-	CreatedAt      string
-}
-
+// Source is defined in internal/kb (aliased in types.go).
 type SourceRepo struct{ q Querier }
 
 // Create inserts a source, assigning a ULID if none is set and defaulting the
