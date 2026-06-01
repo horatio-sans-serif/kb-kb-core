@@ -7,11 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,10 +26,21 @@ import (
 // Version is the build version reported by /healthz (override with -ldflags).
 var Version = "0.0.0-dev"
 
+// jobRetention is how long terminal (done/failed) jobs are kept before purge.
+const jobRetention = 7 * 24 * time.Hour
+
 func main() {
+	syscall.Umask(0o077) // daemon-created files (DB, WAL, SHM) are owner-only
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLevel(os.Getenv("KB_LOG_LEVEL")),
+	}))
+	slog.SetDefault(logger)
+
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
-		log.Fatalf("kbd: config: %v", err)
+		logger.Error("config", "err", err)
+		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -36,18 +48,33 @@ func main() {
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		log.Fatalf("kbd: listen on %s: %v", cfg.ListenAddr, err)
+		logger.Error("listen", "addr", cfg.ListenAddr, "err", err)
+		os.Exit(1)
 	}
 
-	if err := serve(ctx, ln, cfg); err != nil {
-		log.Fatalf("kbd: %v", err)
+	if err := serve(ctx, ln, cfg, logger); err != nil {
+		logger.Error("kbd exited with error", "err", err)
+		os.Exit(1)
+	}
+}
+
+func logLevel(s string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }
 
 // serve assembles the daemon over an already-bound listener (injected so it is
 // testable) and runs until ctx is cancelled, then shuts the HTTP server down
 // gracefully.
-func serve(ctx context.Context, ln net.Listener, cfg *config.Config) error {
+func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slog.Logger) error {
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return err
@@ -60,18 +87,48 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config) error {
 	st := store.New(db)
 	bus := events.NewBus()
 
-	runner := jobs.NewRunner(st)
+	runner := jobs.NewRunner(st, jobs.WithLogger(logger))
 	// Placeholder until Phase 2 wires the real enrichment pipeline; for now an
 	// ingest job simply completes so the walking skeleton runs end to end.
 	runner.Handle("ingest", func(context.Context, store.Job) error { return nil })
 
-	// Recover crash-orphaned jobs synchronously so a startup failure is fatal
-	// rather than leaving the daemon serving with a dead job loop.
+	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not
+	// serve with a dead loop), then purge old terminal jobs (best-effort).
 	if _, err := runner.ReclaimStuck(ctx); err != nil {
 		return fmt.Errorf("reclaim stuck jobs: %w", err)
 	}
+	cutoff := time.Now().Add(-jobRetention).UTC().Format(time.RFC3339Nano)
+	if n, err := st.Jobs.Purge(ctx, cutoff); err != nil {
+		logger.Warn("purge old jobs", "err", err)
+	} else if n > 0 {
+		logger.Info("purged old jobs", "count", n)
+	}
+
+	// Wake the runner on each event (a fresh job was enqueued) so it drains
+	// promptly instead of polling the single writer; a coarse fallback tick
+	// covers backoff-rescheduled jobs.
+	wake := make(chan struct{}, 1)
+	sub, unsub := bus.Subscribe()
+	defer unsub()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-sub:
+				if !ok {
+					return
+				}
+				select {
+				case wake <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
 	runErr := make(chan error, 1)
-	go func() { runErr <- runner.Run(ctx, time.Second) }()
+	go func() { runErr <- runner.Run(ctx, wake, 30*time.Second) }()
 
 	srv := api.NewServer(api.Deps{
 		Store:          st,
@@ -79,6 +136,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config) error {
 		Token:          cfg.APIToken,
 		DefaultPrivacy: cfg.DefaultPrivacy,
 		Build:          api.BuildInfo{Version: Version},
+		Logger:         logger,
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),
@@ -97,14 +155,14 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config) error {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("kbd: serving on %s", ln.Addr())
+	logger.Info("serving", "addr", ln.Addr().String())
 	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 
 	// Wait for the runner to observe ctx cancellation and exit cleanly.
 	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("kbd: runner exited: %v", err)
+		logger.Error("runner exited", "err", err)
 	}
 	return nil
 }

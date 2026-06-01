@@ -4,7 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -25,6 +25,7 @@ type Deps struct {
 	Token          string
 	DefaultPrivacy string
 	Build          BuildInfo
+	Logger         *slog.Logger
 }
 
 // Server wires the HTTP handlers.
@@ -32,7 +33,12 @@ type Server struct {
 	deps Deps
 }
 
-func NewServer(d Deps) *Server { return &Server{deps: d} }
+func NewServer(d Deps) *Server {
+	if d.Logger == nil {
+		d.Logger = slog.Default()
+	}
+	return &Server{deps: d}
+}
 
 // Handler builds the routed, auth-wrapped HTTP handler. /healthz is public;
 // /events and /ingest require a bearer token.
@@ -49,17 +55,17 @@ func (s *Server) Handler() http.Handler {
 }
 
 // requireAuth enforces a constant-time bearer-token check. The token is never
-// logged or echoed.
+// logged or echoed; an empty configured token never authenticates.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	const prefix = "Bearer "
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
-		token := strings.TrimPrefix(h, prefix)
-		// An empty configured token must never authenticate (config forbids it;
-		// this is defense-in-depth, since "" == "" would otherwise pass).
-		if s.deps.Token == "" ||
-			!strings.HasPrefix(h, prefix) ||
-			subtle.ConstantTimeCompare([]byte(token), []byte(s.deps.Token)) != 1 {
+		if !strings.HasPrefix(h, prefix) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		token := h[len(prefix):]
+		if s.deps.Token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.deps.Token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -68,7 +74,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": s.deps.Build.Version})
+	s.writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": s.deps.Build.Version})
 }
 
 type ingestRequest struct {
@@ -76,20 +82,32 @@ type ingestRequest struct {
 	URL      string `json:"url,omitempty"`
 	Body     string `json:"body,omitempty"`
 	Title    string `json:"title,omitempty"`
+	Privacy  string `json:"privacy,omitempty"` // optional per-artifact tier override
 }
 
 type ingestResponse struct {
 	ArtifactID string `json:"artifact_id"`
 }
 
-// handleIngest is the walking skeleton: it writes the artifact, its encounter,
-// and an enrichment job atomically, then publishes artifact.ingested. The
-// publish happens only after the transaction commits, so a rolled-back ingest
-// emits no event.
-// maxIngestBytes caps the ingest request body; raise it when real capture
-// payloads are sized (Phase 1+).
-const maxIngestBytes = 8 << 20 // 8 MiB
+const (
+	maxIngestBytes   = 8 << 20 // 8 MiB body cap
+	maxTitleBytes    = 4096
+	maxSourceIDBytes = 64
+)
 
+func validPrivacy(t string) bool {
+	switch t {
+	case "public", "personal", "sensitive", "restricted":
+		return true
+	}
+	return false
+}
+
+// handleIngest is the walking skeleton: it writes the artifact, its encounter,
+// and an enrichment job atomically, then publishes artifact.ingested (only after
+// the transaction commits, so a rolled-back ingest emits no event). The artifact
+// privacy tier comes from an explicit request override, else the source's
+// default, else the daemon default (design §8.17).
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxIngestBytes)
 	var req ingestRequest
@@ -102,12 +120,18 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	if req.SourceID == "" {
+	switch {
+	case req.SourceID == "" || len(req.SourceID) > maxSourceIDBytes:
 		http.Error(w, "source_id is required", http.StatusBadRequest)
 		return
-	}
-	if req.URL == "" && req.Body == "" {
+	case req.URL == "" && req.Body == "":
 		http.Error(w, "url or body is required", http.StatusBadRequest)
+		return
+	case len(req.Title) > maxTitleBytes:
+		http.Error(w, "title too long", http.StatusBadRequest)
+		return
+	case req.Privacy != "" && !validPrivacy(req.Privacy):
+		http.Error(w, "invalid privacy tier", http.StatusBadRequest)
 		return
 	}
 
@@ -122,7 +146,8 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	if _, err := s.deps.Store.Sources.Get(ctx, req.SourceID); err != nil {
+	src, err := s.deps.Store.Sources.Get(ctx, req.SourceID)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "unknown source_id", http.StatusBadRequest)
 			return
@@ -131,9 +156,18 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Privacy tier: explicit request override > source default > daemon default.
+	tier := s.deps.DefaultPrivacy
+	if src.DefaultPrivacy != "" {
+		tier = src.DefaultPrivacy
+	}
+	if req.Privacy != "" {
+		tier = req.Privacy
+	}
+
 	var artifactID string
-	err := s.deps.Store.Tx(ctx, func(tx *store.Store) error {
-		a := &store.Artifact{Title: req.Title, PrivacyTier: s.deps.DefaultPrivacy}
+	err = s.deps.Store.Tx(ctx, func(tx *store.Store) error {
+		a := &store.Artifact{Title: req.Title, PrivacyTier: tier}
 		var art *store.Artifact
 		var err error
 		if req.URL != "" {
@@ -162,9 +196,9 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		// TODO(Phase 2): re-ingesting a known URL re-enqueues enrichment even
-		// though the artifact is unchanged. Make this idempotent (skip when
-		// enrichments already exist) once UpsertByCanonical reports
-		// inserted-vs-updated, so the cloud pipeline doesn't re-run for free.
+		// though the artifact is unchanged. Make this idempotent once
+		// UpsertByCanonical reports inserted-vs-updated, so the (cloud-billable)
+		// pipeline doesn't re-run for free.
 		_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "ingest", ArtifactID: &art.ID})
 		return err
 	})
@@ -176,18 +210,19 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	s.deps.Bus.Publish(events.New(events.ArtifactIngested,
 		map[string]string{"artifact_id": artifactID, "source_id": req.SourceID}))
 
-	writeJSON(w, http.StatusOK, ingestResponse{ArtifactID: artifactID})
+	s.writeJSON(w, http.StatusOK, ingestResponse{ArtifactID: artifactID})
 }
 
 func (s *Server) serverError(w http.ResponseWriter, what string, err error) {
-	log.Printf("api: %s: %v", what, err)
+	s.deps.Logger.Error("api request failed", "op", what, "err", err)
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func (s *Server) writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("api: encode response: %v", err)
+		s.deps.Logger.Error("api: encode response", "err", err)
 	}
 }

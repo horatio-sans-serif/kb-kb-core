@@ -4,6 +4,7 @@
 package canon
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,13 +12,13 @@ import (
 	"strings"
 )
 
-// trackingParams are query keys stripped during canonicalization (in addition to
-// any key with the "utm_" prefix). "amp" is included to de-AMP query-style AMP.
-var trackingParams = map[string]bool{
-	"fbclid": true, "gclid": true, "dclid": true, "gclsrc": true, "msclkid": true,
-	"mc_eid": true, "mc_cid": true, "igshid": true, "ref": true, "ref_src": true,
-	"ref_url": true, "_hsenc": true, "_hsmi": true, "vero_id": true,
-	"oly_enc_id": true, "oly_anon_id": true, "amp": true,
+// trackingParams is the set of query keys stripped during canonicalization (in
+// addition to any key with the "utm_" prefix). "amp" de-AMPs query-style AMP.
+var trackingParams = map[string]struct{}{
+	"fbclid": {}, "gclid": {}, "dclid": {}, "gclsrc": {}, "msclkid": {},
+	"mc_eid": {}, "mc_cid": {}, "igshid": {}, "ref": {}, "ref_src": {},
+	"ref_url": {}, "_hsenc": {}, "_hsmi": {}, "vero_id": {},
+	"oly_enc_id": {}, "oly_anon_id": {}, "amp": {},
 }
 
 // URL returns a canonical form of raw: lowercased scheme/host, no userinfo, no
@@ -61,7 +62,8 @@ func URL(raw string) (string, error) {
 
 	q := u.Query()
 	for k := range q {
-		if strings.HasPrefix(strings.ToLower(k), "utm_") || trackingParams[strings.ToLower(k)] {
+		lk := strings.ToLower(k)
+		if _, tracked := trackingParams[lk]; tracked || strings.HasPrefix(lk, "utm_") {
 			q.Del(k)
 		}
 	}
@@ -83,11 +85,20 @@ func stripAMPPath(p string) string {
 }
 
 // Content returns a stable, whitespace-insensitive fingerprint of body
-// (SHA-256 over whitespace-collapsed text). This catches verbatim and
-// reformatted copies; near-duplicate detection (SimHash/MinHash) is a later
-// refinement (§8.2).
+// (SHA-256 over whitespace-collapsed text). It streams words straight into the
+// hasher, never materializing the normalized copy, so an 8 MiB body costs O(1)
+// extra memory. This catches verbatim and reformatted copies; near-duplicate
+// detection (SimHash/MinHash) is a later refinement (§8.2).
 func Content(body string) string {
-	norm := strings.Join(strings.Fields(body), " ")
-	sum := sha256.Sum256([]byte(norm))
-	return hex.EncodeToString(sum[:])
+	h := sha256.New()
+	sc := bufio.NewScanner(strings.NewReader(body))
+	sc.Buffer(make([]byte, 0, 64*1024), 16<<20) // allow a single long token up to 16 MiB
+	sc.Split(bufio.ScanWords)
+	for first := true; sc.Scan(); first = false {
+		if !first {
+			h.Write([]byte{' '})
+		}
+		h.Write(sc.Bytes())
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

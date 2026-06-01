@@ -125,30 +125,21 @@ func (r *JobRepo) MarkFailed(ctx context.Context, id, errMsg string) error {
 		 WHERE id = ? AND status = 'running'`, errMsg, id); err != nil {
 		return fmt.Errorf("mark job %q failed: %w", id, err)
 	}
-	return r.cascadeFailDependents(ctx)
-}
-
-// cascadeFailDependents repeatedly fails pending jobs that have a failed
-// dependency until a fixpoint (the pending set strictly shrinks each pass).
-func (r *JobRepo) cascadeFailDependents(ctx context.Context) error {
-	for {
-		res, err := r.q.ExecContext(ctx,
-			`UPDATE jobs SET status = 'failed', last_error = 'dependency failed', claimed_at = NULL
-			 WHERE status = 'pending' AND EXISTS (
-			   SELECT 1 FROM json_each(jobs.depends_on) dep
-			   JOIN jobs d ON d.id = dep.value
-			   WHERE d.status = 'failed')`)
-		if err != nil {
-			return fmt.Errorf("cascade-fail dependents: %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("cascade-fail dependents (rows affected): %w", err)
-		}
-		if n == 0 {
-			return nil
-		}
+	// Cascade-fail the transitive closure of pending dependents in one recursive
+	// statement (rather than a fixpoint loop that re-scans the whole table per
+	// level), so a broken stage does not strand its downstream subtree forever.
+	if _, err := r.q.ExecContext(ctx,
+		`WITH RECURSIVE failed_closure(id) AS (
+		   SELECT ?
+		   UNION
+		   SELECT j.id FROM jobs j, json_each(j.depends_on) dep, failed_closure fc
+		   WHERE dep.value = fc.id AND j.status = 'pending'
+		 )
+		 UPDATE jobs SET status = 'failed', last_error = 'dependency failed', claimed_at = NULL
+		 WHERE status = 'pending' AND id IN (SELECT id FROM failed_closure)`, id); err != nil {
+		return fmt.Errorf("cascade-fail dependents of %q: %w", id, err)
 	}
+	return nil
 }
 
 // ReclaimStuck returns 'running' jobs claimed at or before olderThan to
@@ -194,6 +185,22 @@ func (r *JobRepo) Blocked(ctx context.Context) ([]*Job, error) {
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+// Purge deletes terminal (done/failed) jobs created before olderThan, bounding
+// the local-only jobs table's growth (it is not synced, so terminal rows have no
+// archival value beyond short-term debugging). Returns the number deleted.
+func (r *JobRepo) Purge(ctx context.Context, olderThan string) (int, error) {
+	res, err := r.q.ExecContext(ctx,
+		`DELETE FROM jobs WHERE status IN ('done', 'failed') AND created_at < ?`, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("purge jobs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("purge jobs (rows affected): %w", err)
+	}
+	return int(n), nil
 }
 
 func (r *JobRepo) Get(ctx context.Context, id string) (*Job, error) {

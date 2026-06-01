@@ -8,11 +8,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"kb/internal/store"
 )
+
+// drainBudget caps how many jobs a single Drain processes before returning, so
+// the Run loop can re-evaluate scheduling and shutdown under a steady enqueue
+// stream rather than looping unboundedly.
+const drainBudget = 256
 
 // Handler processes one job. Returning an error reschedules the job (with
 // backoff) until the attempt budget is exhausted, after which it is marked
@@ -25,6 +30,7 @@ type Runner struct {
 	handlers    map[string]Handler
 	maxAttempts int
 	backoff     func(attempts int) time.Duration
+	logger      *slog.Logger
 }
 
 // Option configures a Runner.
@@ -38,6 +44,9 @@ func WithBackoff(f func(attempts int) time.Duration) Option {
 	return func(r *Runner) { r.backoff = f }
 }
 
+// WithLogger sets the structured logger (default slog.Default()).
+func WithLogger(l *slog.Logger) Option { return func(r *Runner) { r.logger = l } }
+
 // NewRunner builds a Runner with sensible defaults (5 attempts, exponential
 // backoff from 1s capped at 1h).
 func NewRunner(s *store.Store, opts ...Option) *Runner {
@@ -46,6 +55,7 @@ func NewRunner(s *store.Store, opts ...Option) *Runner {
 		handlers:    make(map[string]Handler),
 		maxAttempts: 5,
 		backoff:     ExpBackoff(time.Second, time.Hour),
+		logger:      slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -89,7 +99,7 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 func (r *Runner) Drain(ctx context.Context) (int, error) {
 	n := 0
 	var errs error
-	for {
+	for n < drainBudget {
 		if err := ctx.Err(); err != nil {
 			return n, errors.Join(errs, err)
 		}
@@ -107,34 +117,53 @@ func (r *Runner) Drain(ctx context.Context) (int, error) {
 		}
 		n++
 	}
+	return n, errs // hit the budget; the caller drains again
 }
 
 // ReclaimStuck returns jobs left 'running' by a crash to 'pending'. Call once on
-// startup before draining: with no live worker, every running row is orphaned.
-//
-// TODO(Stage 5): a continuous runner must not reclaim jobs a live worker still
-// holds — switch to a lease cutoff (now - lease) using the claimed_at column,
-// rather than reclaiming everything.
+// startup before draining: this single-process runner is the only writer of
+// 'running', so on startup every such row is crash-orphaned and reclaim-all is
+// correct. The store's lease cutoff (claimed_at) is reserved for a future
+// concurrent/continuous reclaimer that must not reclaim a live worker's job.
 func (r *Runner) ReclaimStuck(ctx context.Context) (int, error) {
 	return r.store.Jobs.ReclaimStuck(ctx, nowTS())
 }
 
-// Run drains the queue on each interval tick until ctx is cancelled. A transient
-// (non-context) drain error is logged and the loop continues, so a wedged queue
-// is visible rather than silent; only context cancellation returns. Call
+// Run drains the queue whenever woken (a fresh job was enqueued — pass a channel
+// fed from the event bus) and on a periodic fallback tick (to pick up
+// backoff-rescheduled jobs), until ctx is cancelled. wake may be nil for
+// tick-only operation. A transient (non-context) drain error is logged and the
+// loop continues, so a wedged queue is visible rather than silent. Call
 // ReclaimStuck once before Run to recover jobs orphaned by a prior crash.
-func (r *Runner) Run(ctx context.Context, interval time.Duration) error {
+func (r *Runner) Run(ctx context.Context, wake <-chan struct{}, interval time.Duration) error {
+	t := time.NewTimer(interval)
+	defer t.Stop()
 	for {
-		if _, err := r.Drain(ctx); err != nil {
+		n, err := r.Drain(ctx)
+		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			log.Printf("jobs: drain error (continuing): %v", err)
+			r.logger.Error("jobs: drain error, continuing", "err", err)
 		}
+		if n >= drainBudget { // more work likely; drain again without waiting
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			continue
+		}
+		if !t.Stop() {
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+		t.Reset(interval)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(interval):
+		case <-wake:
+		case <-t.C:
 		}
 	}
 }

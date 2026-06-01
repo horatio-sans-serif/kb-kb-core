@@ -22,6 +22,7 @@ type Enrichment struct {
 
 type EnrichmentRepo struct{ q Querier }
 
+// Create inserts an enrichment row, assigning a ULID if none is set.
 func (r *EnrichmentRepo) Create(ctx context.Context, e *Enrichment) error {
 	if e.ID == "" {
 		e.ID = NewID()
@@ -36,6 +37,7 @@ func (r *EnrichmentRepo) Create(ctx context.Context, e *Enrichment) error {
 	return nil
 }
 
+// Get returns the enrichment by id, or ErrNotFound.
 func (r *EnrichmentRepo) Get(ctx context.Context, id string) (*Enrichment, error) {
 	var e Enrichment
 	err := r.q.QueryRowContext(ctx,

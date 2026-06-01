@@ -1,31 +1,39 @@
 // Package events is the in-process publish/subscribe bus that is the system's
 // nervous system (design Section 9 / Principle 5): lifecycle events fan out to
-// subscribers such as the enrichment runner, surfacing, and the SSE endpoint.
+// best-effort subscribers such as the SSE endpoint, surfacing, and UI observers.
+//
+// Durability rule: the bus is for NOTIFICATIONS only. Anything that must durably
+// happen (e.g. enqueueing enrichment, re-scoring on profile change) is a
+// transactionally-enqueued job, never a bus subscriber — a lossy, in-process,
+// non-durable bus cannot drive durable work. See design §9 and the walkthrough.
 package events
 
 import "time"
 
+// EventType identifies a lifecycle notification (design Section 9).
+type EventType string
+
 // Event type constants (design Section 9).
 const (
-	ArtifactIngested   = "artifact.ingested"
-	ArtifactReady      = "artifact.ready"
-	EngagementRecorded = "engagement.recorded"
-	ProfileUpdated     = "profile.updated"
-	SourceFailed       = "source.failed"
-	ConflictDetected   = "conflict.detected"
-	ReviewDue          = "review.due"
-	DigestReady        = "digest.ready"
-	ActivityObserved   = "activity.observed"
+	ArtifactIngested   EventType = "artifact.ingested"
+	ArtifactReady      EventType = "artifact.ready"
+	EngagementRecorded EventType = "engagement.recorded"
+	ProfileUpdated     EventType = "profile.updated"
+	SourceFailed       EventType = "source.failed"
+	ConflictDetected   EventType = "conflict.detected"
+	ReviewDue          EventType = "review.due"
+	DigestReady        EventType = "digest.ready"
+	ActivityObserved   EventType = "activity.observed"
 )
 
 // Event is one lifecycle notification. Data is any JSON-serializable payload.
 type Event struct {
-	Type string `json:"type"`
-	Data any    `json:"data,omitempty"`
-	Time string `json:"time"`
+	Type EventType `json:"type"`
+	Data any       `json:"data,omitempty"`
+	Time time.Time `json:"time"`
 }
 
 // New builds an Event stamped with the current UTC time.
-func New(eventType string, data any) Event {
-	return Event{Type: eventType, Data: data, Time: time.Now().UTC().Format(time.RFC3339Nano)}
+func New(eventType EventType, data any) Event {
+	return Event{Type: eventType, Data: data, Time: time.Now().UTC()}
 }

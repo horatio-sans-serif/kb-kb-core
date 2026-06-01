@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"testing/fstest"
@@ -152,7 +153,7 @@ func tableExists(t *testing.T, db *sql.DB, name string) bool {
 	err := db.QueryRow(
 		`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, name,
 	).Scan(&got)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false
 	}
 	if err != nil {

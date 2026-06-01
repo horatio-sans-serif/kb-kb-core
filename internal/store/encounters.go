@@ -25,13 +25,14 @@ func (r *EncounterRepo) Record(ctx context.Context, e *Encounter) error {
 	if e.ID == "" {
 		e.ID = NewID()
 	}
+	ts := now()
 	if e.SeenAt == "" {
-		e.SeenAt = now()
+		e.SeenAt = ts
 	}
 	_, err := r.q.ExecContext(ctx,
 		`INSERT INTO encounters(id, artifact_id, source_id, raw_url, context, seen_at, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, e.ArtifactID, e.SourceID, e.RawURL, nullIfEmpty(e.Context), e.SeenAt, now())
+		e.ID, e.ArtifactID, e.SourceID, e.RawURL, nullIfEmpty(e.Context), e.SeenAt, ts)
 	if err != nil {
 		return fmt.Errorf("record encounter: %w", err)
 	}

@@ -47,7 +47,7 @@ func TestSSE_DeliversAfterConnect(t *testing.T) {
 
 	select {
 	case line := <-got:
-		if !strings.Contains(line, events.ArtifactReady) || !strings.Contains(line, "01ABC") {
+		if !strings.Contains(line, string(events.ArtifactReady)) || !strings.Contains(line, "01ABC") {
 			t.Errorf("SSE data line = %q, want it to contain %q and the payload id", line, events.ArtifactReady)
 		}
 	case <-time.After(2 * time.Second):

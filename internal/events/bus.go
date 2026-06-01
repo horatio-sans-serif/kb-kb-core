@@ -9,7 +9,7 @@ const defaultBuffer = 64
 // Bus is an in-process fan-out bus. Publish never blocks: a subscriber whose
 // buffer is full drops the event. Safe for concurrent use.
 type Bus struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	subs   map[int]chan Event
 	nextID int
 	buffer int
@@ -46,10 +46,12 @@ func (b *Bus) Subscribe() (<-chan Event, func()) {
 }
 
 // Publish delivers e to every current subscriber without blocking. A subscriber
-// whose buffer is full silently drops this event.
+// whose buffer is full silently drops this event. Held under a read lock so
+// concurrent publishes do not serialize; the write lock taken by Subscribe and
+// unsubscribe still excludes any publish, so a channel is never closed mid-send.
 func (b *Bus) Publish(e Event) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	for _, ch := range b.subs {
 		select {
 		case ch <- e:

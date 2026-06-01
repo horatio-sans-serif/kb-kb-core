@@ -228,7 +228,7 @@ func TestRunner_Run_ProcessesEnqueued(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 
-	go func() { _ = r.Run(ctx, 5*time.Millisecond) }()
+	go func() { _ = r.Run(ctx, nil, 5*time.Millisecond) }()
 
 	select {
 	case got := <-done:

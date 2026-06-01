@@ -1,11 +1,13 @@
 package store
 
 import (
+	"cmp"
 	"database/sql"
 	"fmt"
 	"io/fs"
 	"net/url"
-	"sort"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -23,11 +25,19 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
 	// SQLite is a single-writer store; cap the pool to one connection to
-	// serialize writers and avoid SQLITE_BUSY. A separate read-only pool can be
-	// added at Stage 3 when the HTTP API introduces concurrent reads.
+	// serialize writers and avoid SQLITE_BUSY. A separate read-only pool over the
+	// same WAL file is planned for Phase 2 Stage 0, when long LLM-bound write
+	// transactions make concurrent reads worthwhile.
 	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
+	}
+	// The database holds personal/sensitive-tier content; keep it owner-only so
+	// other local accounts cannot read it directly, bypassing the token/tier
+	// model. (The daemon also sets a 0077 umask so the WAL/SHM sidecars are
+	// created owner-only.)
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, fmt.Errorf("secure db file %q: %w", path, err)
 	}
 	return db, nil
 }
@@ -141,7 +151,7 @@ func loadMigrations(src fs.FS) ([]migration, error) {
 		}
 		all = append(all, migration{version: v, name: e.Name()})
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].version < all[j].version })
+	slices.SortFunc(all, func(a, b migration) int { return cmp.Compare(a.version, b.version) })
 	return all, nil
 }
 

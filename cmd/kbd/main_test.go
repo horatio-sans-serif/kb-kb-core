@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -25,9 +27,10 @@ func TestServe_HealthzThenGracefulShutdown(t *testing.T) {
 		DefaultPrivacy: "personal",
 	}
 
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
-	go func() { errc <- serve(ctx, ln, cfg) }()
+	go func() { errc <- serve(ctx, ln, cfg, logger) }()
 
 	// Poll /healthz until the daemon is serving.
 	ready := false
