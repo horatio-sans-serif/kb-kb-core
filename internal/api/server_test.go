@@ -528,6 +528,23 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	if len(sr.Results) != 1 || sr.Results[0].ArtifactID != a.ID {
 		t.Errorf("search results = %+v, want the ingested artifact %s", sr.Results, a.ID)
 	}
+
+	// Keyword search over the fetched body ("Fetched body.") also finds it.
+	krec := doGet(h, "/search?q=fetched&mode=keyword", "tok")
+	if krec.Code != http.StatusOK {
+		t.Fatalf("keyword search status = %d: %s", krec.Code, krec.Body.String())
+	}
+	var kr struct {
+		Results []struct {
+			ArtifactID string `json:"artifact_id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(krec.Body.Bytes(), &kr); err != nil {
+		t.Fatalf("decode keyword search: %v", err)
+	}
+	if len(kr.Results) != 1 || kr.Results[0].ArtifactID != a.ID {
+		t.Errorf("keyword results = %+v, want the ingested artifact %s (body was indexed)", kr.Results, a.ID)
+	}
 }
 
 // countingEnqueuer records how many times the pipeline expansion is invoked.
@@ -596,10 +613,16 @@ type fakeSearcher struct {
 	err     error
 	gotQ    string
 	gotK    int
+	gotMode string
 }
 
 func (f *fakeSearcher) Semantic(_ context.Context, query string, k int) ([]search.Result, error) {
-	f.gotQ, f.gotK = query, k
+	f.gotQ, f.gotK, f.gotMode = query, k, "semantic"
+	return f.results, f.err
+}
+
+func (f *fakeSearcher) Keyword(_ context.Context, query string, k int) ([]search.Result, error) {
+	f.gotQ, f.gotK, f.gotMode = query, k, "keyword"
 	return f.results, f.err
 }
 
@@ -638,6 +661,22 @@ func TestSearch_ReturnsRankedResultsWithMetadata(t *testing.T) {
 	}
 	if resp.Results[0].Title != "First" || resp.Results[0].URL != u1 || resp.Results[0].Score != 0.9 {
 		t.Errorf("result 0 = %+v, want First/%s/0.9 (metadata attached, order preserved)", resp.Results[0], u1)
+	}
+}
+
+func TestSearch_ModeRouting(t *testing.T) {
+	st := newStore(t)
+	fs := &fakeSearcher{}
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Search: fs}).Handler()
+
+	if rec := doGet(h, "/search?q=x&mode=keyword", "tok"); rec.Code != http.StatusOK || fs.gotMode != "keyword" {
+		t.Errorf("mode=keyword: status %d mode %q, want 200/keyword", rec.Code, fs.gotMode)
+	}
+	if rec := doGet(h, "/search?q=x", "tok"); rec.Code != http.StatusOK || fs.gotMode != "semantic" {
+		t.Errorf("default mode: status %d mode %q, want 200/semantic", rec.Code, fs.gotMode)
+	}
+	if rec := doGet(h, "/search?q=x&mode=bogus", "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("mode=bogus: status %d, want 400", rec.Code)
 	}
 }
 

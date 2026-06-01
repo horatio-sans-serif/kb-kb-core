@@ -1,6 +1,8 @@
 # golangci-lint configuration for KB Core.
 run:
   timeout: 5m
+  build-tags:
+    - sqlite_fts5 # FTS5 search code compiles only with this tag
 
 linters:
   enable:

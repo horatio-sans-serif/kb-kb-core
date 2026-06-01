@@ -2,11 +2,12 @@
 #
 # SQLite uses the cgo driver, so CGO_ENABLED=1 is required (a plain `go build` on
 # a machine without a C toolchain produces linker errors). FTS5 search (Phase 3)
-# will require GO_TAGS=sqlite_fts5 — set it then so a plain build does not ship a
-# binary that panics when a `CREATE VIRTUAL TABLE ... USING fts5` migration runs.
+# requires the sqlite_fts5 build tag, defaulted below: the migration that creates
+# the FTS index runs `CREATE VIRTUAL TABLE ... USING fts5`, which fails ("no such
+# module: fts5") without it. Override with `make GO_TAGS=...` if needed.
 
 export CGO_ENABLED := 1
-GO_TAGS ?=
+GO_TAGS ?= sqlite_fts5
 TAGFLAG := $(if $(GO_TAGS),-tags '$(GO_TAGS)',)
 
 .PHONY: build test race vet fmt fmtcheck lint tidy run all

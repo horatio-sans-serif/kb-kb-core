@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 
 	"kb/internal/kb"
@@ -110,6 +111,57 @@ func (s *Searcher) Semantic(ctx context.Context, query string, k int) ([]Result,
 		out[i] = heap.Pop(h).(Result)
 	}
 	return out, nil
+}
+
+// ftsTerm matches a run of letters/digits (Unicode-aware); everything else is a
+// separator. Used to turn arbitrary user input into safe FTS5 query terms.
+var ftsTerm = regexp.MustCompile(`[\p{L}\p{N}]+`)
+
+// Keyword runs a full-text (FTS5) search over artifact title/body. It needs no
+// embedder and no locality check — the query never leaves SQLite — so it works
+// even when semantic search is disallowed. User input is reduced to quoted word
+// terms (implicit AND), which both defends against FTS5 syntax errors/injection
+// and makes the match a plain bag-of-words. A query with no word terms returns no
+// results (not an error); an empty query is an error.
+func (s *Searcher) Keyword(ctx context.Context, query string, k int) ([]Result, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("search: empty query")
+	}
+	switch {
+	case k <= 0:
+		k = defaultK
+	case k > maxK:
+		k = maxK
+	}
+
+	match := ftsMatch(query)
+	if match == "" {
+		return []Result{}, nil // no searchable terms
+	}
+	hits, err := s.st.Artifacts.SearchKeyword(ctx, match, k)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Result, len(hits))
+	for i, h := range hits {
+		out[i] = Result{ArtifactID: h.ArtifactID, Score: h.Score}
+	}
+	return out, nil
+}
+
+// ftsMatch builds a safe FTS5 MATCH expression from raw user input: each word
+// term is double-quoted (so FTS5 treats it literally, neutralizing operators like
+// OR/NEAR/"/( ) and column filters), joined by spaces for an implicit AND.
+func ftsMatch(raw string) string {
+	terms := ftsTerm.FindAllString(raw, -1)
+	if len(terms) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(terms))
+	for i, t := range terms {
+		quoted[i] = `"` + t + `"`
+	}
+	return strings.Join(quoted, " ")
 }
 
 // resultHeap is a bounded min-heap of results: the smallest (by score, then

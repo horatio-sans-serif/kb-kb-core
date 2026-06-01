@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest # has a C toolchain for the cgo SQLite driver
     env:
       CGO_ENABLED: "1"
+      GOFLAGS: "-tags=sqlite_fts5" # FTS5 search: build/test/vet all need the module
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -28,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "1"
+      GOFLAGS: "-tags=sqlite_fts5"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

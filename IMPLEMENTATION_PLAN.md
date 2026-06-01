@@ -736,7 +736,38 @@ the artifact) plus unit coverage of ranking, dim-skip, and the endpoint.
   by privacy tier (it serves the single owner behind the bearer token); a future
   lower-trust read path must add a tier ceiling in `ForEachLatestEmbedding`.
 
-**Next (Phase 3):** FTS5 keyword search (build tag + local index), hybrid ranking
-blend, then RAG (retrieve → rerank → synthesize with citations). Plus the deferred
-items: chunk-level embeddings (Decision 3 chunking), the living profile and
-re-scoring (§9), and exactly-once enrichment writes.
+## Phase 3 — Stage 2: FTS5 keyword search
+
+**Goal:** full-text keyword search over artifact title/body (design §8.8), the
+keyword half of the eventual hybrid blend.
+
+**Status: Complete.** Verified end to end (ingest → fetch → `GET /search?mode=keyword`
+finds the artifact by its fetched body) plus unit coverage.
+
+- **Build tag.** FTS5 needs `-tags sqlite_fts5` (mattn compiles the module only
+  then). Defaulted in the Makefile (`GO_TAGS ?= sqlite_fts5`), set via `GOFLAGS`
+  in CI, and added to `.golangci.yml` `build-tags`. All `go` commands now require
+  it — the migration that creates the index fails without it.
+- **Local index (migration 0004).** `artifacts_fts` FTS5 virtual table
+  (`unicode61`, diacritic-folding). Per §6.0 it is a local index rebuilt from the
+  synced `artifacts` table, excluded from the future CRR set. Standalone (not
+  external-content) so it doesn't depend on rowid; backfills existing rows.
+- **Trigger-free maintenance.** `ArtifactRepo.reindexFTS` rebuilds an artifact's
+  FTS row from its current live state inside the same write transaction (called
+  from `upsert` and from `Patch` when the body changes), so no DB triggers sit on
+  the soon-to-be-CRR `artifacts` table (§6.0). Soft-deletes need no FTS write —
+  the search join filters `deleted_at IS NULL`.
+- **Search.** `ArtifactRepo.SearchKeyword` runs the FTS5 `MATCH` + `bm25` (negated
+  so higher = better), joined to live artifacts. `search.Searcher.Keyword`
+  reduces user input to quoted word terms (implicit AND) — defending against FTS5
+  syntax errors/injection — and needs no embedder or locality check (the query
+  never leaves SQLite).
+- **API.** `GET /search?...&mode=semantic|keyword` (default semantic).
+- **Fetch bug fixed in passing.** `htmlToMarkdown` left the `<head>` in the body,
+  so the page title leaked into — and corrupted the tokens of — the body text. It
+  now strips `<head>` after extracting the title.
+
+**Next (Phase 3):** hybrid ranking (blend semantic + keyword), then RAG (retrieve
+→ rerank → synthesize with citations). Plus the deferred items: chunk-level
+embeddings (Decision 3 chunking), the living profile and re-scoring (§9), and
+exactly-once enrichment writes.

@@ -9,6 +9,7 @@ import (
 
 	"kb/internal/kb"
 	"kb/internal/llm"
+	"kb/internal/store"
 	"kb/internal/storetest"
 )
 
@@ -125,5 +126,60 @@ func TestSemantic_EmbedErrorPropagates(t *testing.T) {
 	s := NewSearcher(st, queryEmbedder{err: errors.New("ollama down")}, "m", true)
 	if _, err := s.Semantic(context.Background(), "q", 5); err == nil {
 		t.Error("an embed error must propagate")
+	}
+}
+
+func seedNote(t *testing.T, st *store.Store, hash, title, body string) string {
+	t.Helper()
+	a, err := st.Artifacts.UpsertByContentHash(context.Background(), &kb.Artifact{Type: kb.Note, Title: title, BodyMarkdown: body, ContentHash: &hash})
+	if err != nil {
+		t.Fatalf("seed note: %v", err)
+	}
+	return a.ID
+}
+
+func TestKeyword_FindsAndRanks(t *testing.T) {
+	st := storetest.New(t)
+	rust := seedNote(t, st, "h1", "Rust async", "tokio runtime and tasks")
+	seedNote(t, st, "h2", "Go channels", "goroutines and selects")
+
+	// Keyword search needs no embedder and no locality (it never leaves SQLite).
+	s := NewSearcher(st, queryEmbedder{err: errors.New("must not be called")}, "m", false)
+	results, err := s.Keyword(context.Background(), "rust async", 10)
+	if err != nil {
+		t.Fatalf("keyword: %v", err)
+	}
+	if len(results) != 1 || results[0].ArtifactID != rust {
+		t.Errorf("results = %+v, want only the rust artifact %s", results, rust)
+	}
+}
+
+func TestKeyword_SanitizesSpecialChars(t *testing.T) {
+	st := storetest.New(t)
+	seedNote(t, st, "h1", "Rust async", "tokio")
+	s := NewSearcher(st, queryEmbedder{}, "m", true)
+	// FTS5 syntax metacharacters in raw input must not produce a query error.
+	if _, err := s.Keyword(context.Background(), `rust" OR (NEAR foo`, 10); err != nil {
+		t.Errorf("special characters must be sanitized, not error: %v", err)
+	}
+}
+
+func TestKeyword_NoSearchableTerms(t *testing.T) {
+	st := storetest.New(t)
+	s := NewSearcher(st, queryEmbedder{}, "m", true)
+	results, err := s.Keyword(context.Background(), "!!! ??? ...", 10)
+	if err != nil {
+		t.Fatalf("keyword: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("a query with no word tokens should return no results, got %+v", results)
+	}
+}
+
+func TestKeyword_EmptyQueryIsError(t *testing.T) {
+	st := storetest.New(t)
+	s := NewSearcher(st, queryEmbedder{}, "m", true)
+	if _, err := s.Keyword(context.Background(), "  ", 10); err == nil {
+		t.Error("an empty query should be an error")
 	}
 }

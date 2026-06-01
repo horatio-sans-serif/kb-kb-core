@@ -586,6 +586,51 @@ func TestStore_TxPanicRollsBack(t *testing.T) {
 	}
 }
 
+func TestArtifact_KeywordSearch(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	h1, h2 := "h1", "h2"
+	rust, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", Title: "Rust async", BodyMarkdown: "tokio runtime", ContentHash: &h1})
+	if err != nil {
+		t.Fatalf("create rust: %v", err)
+	}
+	if _, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", Title: "Go channels", BodyMarkdown: "goroutines", ContentHash: &h2}); err != nil {
+		t.Fatalf("create go: %v", err)
+	}
+
+	hits, err := st.Artifacts.SearchKeyword(ctx, `"rust"`, 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ArtifactID != rust.ID {
+		t.Fatalf("hits = %+v, want only the rust artifact", hits)
+	}
+	if hits[0].Score <= 0 {
+		t.Errorf("score = %v, want positive (negated bm25)", hits[0].Score)
+	}
+
+	// A body patch is reindexed: the new term is searchable, the old one is gone.
+	body := "now mentions kubernetes"
+	if err := st.Artifacts.Patch(ctx, rust.ID, ArtifactPatch{BodyMarkdown: &body}); err != nil {
+		t.Fatalf("patch: %v", err)
+	}
+	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"kubernetes"`, 10); len(hits) != 1 || hits[0].ArtifactID != rust.ID {
+		t.Errorf("patched body term should be searchable, got %+v", hits)
+	}
+	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"tokio"`, 10); len(hits) != 0 {
+		t.Errorf("old body term should not match after reindex, got %+v", hits)
+	}
+
+	// Tombstoned artifacts are excluded from results.
+	if err := st.Artifacts.SoftDelete(ctx, rust.ID); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"kubernetes"`, 10); len(hits) != 0 {
+		t.Errorf("tombstoned artifact must not appear in search, got %+v", hits)
+	}
+}
+
 func TestEnrichment_CreateGet(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

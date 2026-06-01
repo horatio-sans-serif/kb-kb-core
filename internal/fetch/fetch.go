@@ -139,6 +139,7 @@ func checkHTMLContentType(ct string) error {
 
 var (
 	reScriptStyle = regexp.MustCompile(`(?is)<(script|style|noscript)[^>]*>.*?</(?:script|style|noscript)>`)
+	reHead        = regexp.MustCompile(`(?is)<head[^>]*>.*?</head>`)
 	reTitle       = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 	reBlockClose  = regexp.MustCompile(`(?i)</(p|div|h[1-6]|li|tr|article|section)>|<br\s*/?>`)
 	reTag         = regexp.MustCompile(`(?s)<[^>]+>`)
@@ -147,11 +148,14 @@ var (
 )
 
 // htmlToMarkdown is a basic HTML-to-text extraction: title from <title>, body
-// text with script/style removed and block tags turned into line breaks.
+// text with the head section and script/style removed and block tags turned into
+// line breaks. The head is dropped after the title is captured so head content
+// (title, meta) does not leak into — and pollute the tokens of — the body.
 func htmlToMarkdown(s string) (title, body string) {
 	if m := reTitle.FindStringSubmatch(s); m != nil {
 		title = strings.TrimSpace(html.UnescapeString(reTag.ReplaceAllString(m[1], "")))
 	}
+	s = reHead.ReplaceAllString(s, " ")
 	s = reScriptStyle.ReplaceAllString(s, " ")
 	s = reBlockClose.ReplaceAllString(s, "\n")
 	s = reTag.ReplaceAllString(s, "")

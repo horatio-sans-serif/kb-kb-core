@@ -35,6 +35,30 @@ func TestWebFetcher_Extract(t *testing.T) {
 	}
 }
 
+func TestWebFetcher_HeadDoesNotLeakIntoBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// The title abuts the first body word with no separating block tag; if the
+		// head leaked, the body would tokenize "TitleWordFetched" as one token.
+		_, _ = io.WriteString(w, `<html><head><title>TitleWord</title></head><body><p>Fetched body.</p></body></html>`)
+	}))
+	defer srv.Close()
+
+	got, err := NewWebFetcher(srv.Client()).Extract(context.Background(), kb.ResourceRef{URL: srv.URL})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "TitleWord" {
+		t.Errorf("title = %q, want TitleWord", got.Title)
+	}
+	if strings.Contains(got.BodyMarkdown, "TitleWord") {
+		t.Errorf("body must not contain the head/title text, got %q", got.BodyMarkdown)
+	}
+	if !strings.HasPrefix(got.BodyMarkdown, "Fetched body.") {
+		t.Errorf("body = %q, want it to start with the real body text", got.BodyMarkdown)
+	}
+}
+
 func TestWebFetcher_StripsNoscript(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

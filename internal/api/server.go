@@ -31,9 +31,11 @@ type Enqueuer interface {
 }
 
 // Searcher ranks artifacts for a query (satisfied by *search.Searcher). When nil,
-// the /search route reports 503.
+// the /search route reports 503. Semantic is meaning-based (embeds the query);
+// Keyword is full-text (FTS5).
 type Searcher interface {
 	Semantic(ctx context.Context, query string, k int) ([]search.Result, error)
+	Keyword(ctx context.Context, query string, k int) ([]search.Result, error)
 }
 
 // Deps are the server's collaborators and settings.
@@ -293,7 +295,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	hits, err := s.deps.Search.Semantic(ctx, q, k)
+	var hits []search.Result
+	var err error
+	switch mode := r.URL.Query().Get("mode"); mode {
+	case "", "semantic":
+		hits, err = s.deps.Search.Semantic(ctx, q, k)
+	case "keyword":
+		hits, err = s.deps.Search.Keyword(ctx, q, k)
+	default:
+		http.Error(w, "mode must be 'semantic' or 'keyword'", http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		if errors.Is(err, search.ErrRemoteDisallowed) {
 			http.Error(w, "semantic search requires an on-device embed endpoint", http.StatusServiceUnavailable)

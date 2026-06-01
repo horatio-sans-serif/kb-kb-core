@@ -80,7 +80,75 @@ func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, conflict string)
 	if err != nil {
 		return nil, fmt.Errorf("upsert artifact: %w", err)
 	}
+	if err := r.reindexFTS(ctx, got.ID); err != nil {
+		return nil, err
+	}
 	return got, nil
+}
+
+// reindexFTS rebuilds the artifact's full-text row from its current live state.
+// It reads via the write querier so it observes an update made earlier in the
+// same transaction; a tombstoned or missing artifact is simply removed from the
+// index (no row re-added). Called from every artifact write that can change the
+// indexed title/body, so the FTS index stays consistent without DB triggers.
+func (r *ArtifactRepo) reindexFTS(ctx context.Context, id string) error {
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM artifacts_fts WHERE artifact_id = ?`, id); err != nil {
+		return fmt.Errorf("fts delete %q: %w", id, err)
+	}
+	var title, body sql.NullString
+	err := r.q.QueryRowContext(ctx,
+		`SELECT title, body_markdown FROM artifacts WHERE id = ? AND deleted_at IS NULL`, id).
+		Scan(&title, &body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // tombstoned or gone — leave it out of the index
+	}
+	if err != nil {
+		return fmt.Errorf("fts read %q: %w", id, err)
+	}
+	if _, err := r.q.ExecContext(ctx,
+		`INSERT INTO artifacts_fts(artifact_id, title, body_markdown) VALUES (?, ?, ?)`,
+		id, title.String, body.String); err != nil {
+		return fmt.Errorf("fts insert %q: %w", id, err)
+	}
+	return nil
+}
+
+// KeywordHit is one full-text match: an artifact and its relevance score (higher
+// is better — the FTS5 bm25 rank is negated, since bm25 returns more-negative for
+// better matches).
+type KeywordHit struct {
+	ArtifactID string
+	Score      float64
+}
+
+// SearchKeyword runs an FTS5 MATCH (match must be a valid FTS5 query — the search
+// layer builds a safe one from user input) and returns live artifacts ranked by
+// bm25, best first. The join to artifacts drops tombstoned rows whose stale FTS
+// entries may linger.
+func (r *ArtifactRepo) SearchKeyword(ctx context.Context, match string, limit int) ([]KeywordHit, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT f.artifact_id, bm25(artifacts_fts) AS rank
+		 FROM artifacts_fts f
+		 JOIN artifacts a ON a.id = f.artifact_id AND a.deleted_at IS NULL
+		 WHERE artifacts_fts MATCH ?
+		 ORDER BY rank
+		 LIMIT ?`, match, limit)
+	if err != nil {
+		return nil, fmt.Errorf("fts search: %w", err)
+	}
+	defer rows.Close()
+
+	var out []KeywordHit
+	for rows.Next() {
+		var h KeywordHit
+		var rank float64
+		if err := rows.Scan(&h.ArtifactID, &rank); err != nil {
+			return nil, fmt.Errorf("scan fts hit: %w", err)
+		}
+		h.Score = -rank // bm25: more negative = better; flip so higher = better
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 func (r *ArtifactRepo) Get(ctx context.Context, id string) (*Artifact, error) {
@@ -169,6 +237,13 @@ func (r *ArtifactRepo) Patch(ctx context.Context, id string, p ArtifactPatch) er
 	if _, err := r.q.ExecContext(ctx,
 		`UPDATE artifacts SET `+strings.Join(sets, ", ")+` WHERE id = ? AND deleted_at IS NULL`, args...); err != nil {
 		return fmt.Errorf("patch artifact %q: %w", id, err)
+	}
+	// The fetch stage patches body_markdown; re-index so the fetched content is
+	// searchable (title is not patchable, so only a body change matters).
+	if p.BodyMarkdown != nil {
+		if err := r.reindexFTS(ctx, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
