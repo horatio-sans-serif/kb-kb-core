@@ -2,6 +2,7 @@ package enrich
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -64,13 +65,20 @@ func (r *Relevance) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 		SourceWeight: sig.SourceWeight,
 	})
 
+	// Marshal explicitly and propagate (consistent with the embed stage): Score
+	// sanitizes its inputs so the breakdown is always finite, but never persist a
+	// lossy fallback for a score row.
+	payload, err := json.Marshal(bd)
+	if err != nil {
+		return kb.EnrichResult{}, fmt.Errorf("relevance: marshal breakdown: %w", err)
+	}
 	score := bd.Score
 	return kb.EnrichResult{
 		Patch: &kb.ArtifactPatch{RelevanceScore: &score},
 		Enrichments: []kb.Enrichment{{
 			ArtifactID:    a.ID,
 			Kind:          "relevance",
-			Payload:       jsonString(bd),
+			Payload:       string(payload),
 			Model:         "relevance/" + relevancePromptVersion,
 			PromptVersion: relevancePromptVersion,
 		}},

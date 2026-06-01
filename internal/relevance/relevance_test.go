@@ -140,6 +140,34 @@ func TestScore_NegativeSourceWeightFloored(t *testing.T) {
 	}
 }
 
+func TestScore_NonFiniteSourceWeightSanitized(t *testing.T) {
+	// NaN/±Inf source weight must not produce a non-finite score (which would
+	// break JSON marshaling and the relevance_score DESC ordering).
+	for _, w := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		bd := Score(Inputs{Match: 1, AgeHours: 0, Encounters: 1, SourceWeight: w})
+		if math.IsNaN(bd.Score) || math.IsInf(bd.Score, 0) {
+			t.Errorf("score with weight %v = %v, want finite", w, bd.Score)
+		}
+		if bd.SourceWeight != 0 {
+			t.Errorf("non-finite weight %v should sanitize to 0, got %v", w, bd.SourceWeight)
+		}
+	}
+}
+
+func TestBuildProfile_RejectsInconsistentDims(t *testing.T) {
+	// The model returns a 2-dim vector for the first phrase and 3-dim for the
+	// second; construction must abort so Dim() is a real invariant.
+	embed := func(_ context.Context, text string) ([]float32, error) {
+		if text == "a" {
+			return []float32{1, 0}, nil
+		}
+		return []float32{1, 0, 0}, nil
+	}
+	if _, err := BuildProfile(context.Background(), embed, []string{"a", "b"}); err == nil {
+		t.Error("inconsistent interest-vector dimensions must abort profile construction")
+	}
+}
+
 func TestProfile_DimAndWeightClamp(t *testing.T) {
 	if d := NewProfile(nil).Dim(); d != 0 {
 		t.Errorf("empty profile Dim = %d, want 0", d)

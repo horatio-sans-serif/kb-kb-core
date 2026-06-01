@@ -48,17 +48,21 @@ type Profile struct {
 	interests []WeightedVector
 }
 
-// NewProfile builds a profile from weighted interest vectors.
+// NewProfile builds a profile from weighted interest vectors. The vectors are
+// assumed to share a dimension (BuildProfile enforces this); Dim reports that of
+// the first.
 func NewProfile(interests []WeightedVector) *Profile {
 	return &Profile{interests: interests}
 }
 
 // BuildProfile embeds each interest phrase (equal weight) into a profile. Blank
-// phrases are skipped; an embed failure aborts so the daemon can decide whether to
-// proceed with an empty (neutral) profile. The embed func is injected so this
-// stays I/O-free and testable.
+// phrases are skipped; an embed failure, an empty vector, or vectors of differing
+// dimension abort, so a built profile always has a single well-defined dimension
+// (the mismatch guard in the relevance stage relies on that). The embed func is
+// injected so this stays I/O-free and testable.
 func BuildProfile(ctx context.Context, embed func(ctx context.Context, text string) ([]float32, error), interests []string) (*Profile, error) {
 	var ivs []WeightedVector
+	dim := -1
 	for _, phrase := range interests {
 		phrase = strings.TrimSpace(phrase)
 		if phrase == "" {
@@ -67,6 +71,14 @@ func BuildProfile(ctx context.Context, embed func(ctx context.Context, text stri
 		vec, err := embed(ctx, phrase)
 		if err != nil {
 			return nil, fmt.Errorf("relevance: embed interest %q: %w", phrase, err)
+		}
+		if len(vec) == 0 {
+			return nil, fmt.Errorf("relevance: interest %q produced an empty embedding", phrase)
+		}
+		if dim == -1 {
+			dim = len(vec)
+		} else if len(vec) != dim {
+			return nil, fmt.Errorf("relevance: interest %q has embedding dim %d, want %d (inconsistent model output)", phrase, len(vec), dim)
 		}
 		ivs = append(ivs, WeightedVector{Vector: vec, Weight: 1})
 	}
@@ -178,14 +190,17 @@ type Breakdown struct {
 // SourceWeight do not yet differentiate artifacts. Re-scoring on re-encounter and
 // engagement is deferred to the §9 living-profile stage.
 //
-// SourceWeight is floored at 0: source_weight is an externally-mutable column (a
-// future yield feedback loop adjusts it), and a negative value would invert the
-// relevance_score DESC ranking.
+// SourceWeight is sanitized to a finite, non-negative value: source_weight is an
+// externally-mutable column (a future yield feedback loop adjusts it), and a
+// negative — or NaN/Inf — value would otherwise corrupt the score. A non-finite
+// score both breaks JSON-marshaling of the breakdown row and binds a non-finite
+// REAL into relevance_score, leaving the DESC ranking undefined. It is the only
+// externally-sourced input; the other factors are computed finite internally.
 func Score(in Inputs) Breakdown {
 	recency := RecencyFactor(in.AgeHours)
 	encounter := EncounterFactor(in.Encounters)
 	engagement := EngagementFactor(in.Engaged)
-	sourceWeight := math.Max(0, in.SourceWeight)
+	sourceWeight := finiteNonNeg(in.SourceWeight)
 	return Breakdown{
 		ProfileMatch: in.Match,
 		Recency:      recency,
@@ -194,6 +209,14 @@ func Score(in Inputs) Breakdown {
 		SourceWeight: sourceWeight,
 		Score:        in.Match * recency * encounter * engagement * sourceWeight,
 	}
+}
+
+// finiteNonNeg maps NaN, ±Inf, and negatives to 0, leaving other values intact.
+func finiteNonNeg(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	return v
 }
 
 func clamp01(v float64) float64 {
