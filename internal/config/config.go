@@ -10,7 +10,7 @@ import (
 // Config is the daemon's runtime configuration.
 type Config struct {
 	DBPath          string // KB_DB (required)
-	ListenAddr      string // KB_LISTEN_ADDR (default 127.0.0.1:8087)
+	ListenAddr      string // KB_LISTEN_ADDR (default 127.0.0.1:8087; binding beyond loopback exposes the token-guarded API, e.g. on a Tailscale interface)
 	APIToken        string // KB_API_TOKEN (required)
 	DefaultPrivacy  string // KB_DEFAULT_PRIVACY (default personal)
 	CloudLLMEnabled bool   // KB_CLOUD_LLM (default false)

@@ -64,7 +64,14 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config) error {
 	// Placeholder until Phase 2 wires the real enrichment pipeline; for now an
 	// ingest job simply completes so the walking skeleton runs end to end.
 	runner.Handle("ingest", func(context.Context, store.Job) error { return nil })
-	go func() { _ = runner.Run(ctx, time.Second) }()
+
+	// Recover crash-orphaned jobs synchronously so a startup failure is fatal
+	// rather than leaving the daemon serving with a dead job loop.
+	if _, err := runner.ReclaimStuck(ctx); err != nil {
+		return fmt.Errorf("reclaim stuck jobs: %w", err)
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- runner.Run(ctx, time.Second) }()
 
 	srv := api.NewServer(api.Deps{
 		Store:          st,
@@ -73,7 +80,15 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config) error {
 		DefaultPrivacy: cfg.DefaultPrivacy,
 		Build:          api.BuildInfo{Version: Version},
 	})
-	httpSrv := &http.Server{Handler: srv.Handler()}
+	httpSrv := &http.Server{
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,   // slowloris guard; safe for SSE
+		ReadTimeout:       15 * time.Second,  // full request incl. /ingest body
+		IdleTimeout:       120 * time.Second, // reclaim idle keep-alives
+		// WriteTimeout deliberately unset: GET /events streams indefinitely and a
+		// server-wide write deadline would sever it. Bound writes per-handler if
+		// the non-streaming routes ever need it.
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -85,6 +100,11 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config) error {
 	log.Printf("kbd: serving on %s", ln.Addr())
 	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+
+	// Wait for the runner to observe ctx cancellation and exit cleanly.
+	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("kbd: runner exited: %v", err)
 	}
 	return nil
 }

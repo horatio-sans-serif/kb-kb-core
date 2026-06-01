@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"kb/internal/store"
@@ -118,17 +119,17 @@ func (r *Runner) ReclaimStuck(ctx context.Context) (int, error) {
 	return r.store.Jobs.ReclaimStuck(ctx, nowTS())
 }
 
-// Run reclaims jobs orphaned by a prior crash once, then drains the queue on
-// each interval tick until ctx is cancelled. A transient infra error from a
-// drain is swallowed so the loop keeps running; only context cancellation (or a
-// failed initial reclaim) returns.
+// Run drains the queue on each interval tick until ctx is cancelled. A transient
+// (non-context) drain error is logged and the loop continues, so a wedged queue
+// is visible rather than silent; only context cancellation returns. Call
+// ReclaimStuck once before Run to recover jobs orphaned by a prior crash.
 func (r *Runner) Run(ctx context.Context, interval time.Duration) error {
-	if _, err := r.ReclaimStuck(ctx); err != nil {
-		return err
-	}
 	for {
-		if _, err := r.Drain(ctx); err != nil && ctx.Err() != nil {
-			return ctx.Err()
+		if _, err := r.Drain(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("jobs: drain error (continuing): %v", err)
 		}
 		select {
 		case <-ctx.Done():

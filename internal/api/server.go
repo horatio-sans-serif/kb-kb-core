@@ -38,6 +38,10 @@ func NewServer(d Deps) *Server { return &Server{deps: d} }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	// /events uses bearer-header auth, which suits local CLI tools. A browser
+	// EventSource cannot set headers, so the Stage 10 web UI will need a
+	// query-param/cookie token path scoped to this route (same constant-time
+	// compare). Header auth is correct for Phase 0.
 	mux.Handle("GET /events", s.requireAuth(SSEHandler(s.deps.Bus)))
 	mux.Handle("POST /ingest", s.requireAuth(http.HandlerFunc(s.handleIngest)))
 	return mux
@@ -50,7 +54,10 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := r.Header.Get("Authorization")
 		token := strings.TrimPrefix(h, prefix)
-		if !strings.HasPrefix(h, prefix) ||
+		// An empty configured token must never authenticate (config forbids it;
+		// this is defense-in-depth, since "" == "" would otherwise pass).
+		if s.deps.Token == "" ||
+			!strings.HasPrefix(h, prefix) ||
 			subtle.ConstantTimeCompare([]byte(token), []byte(s.deps.Token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -78,9 +85,19 @@ type ingestResponse struct {
 // and an enrichment job atomically, then publishes artifact.ingested. The
 // publish happens only after the transaction commits, so a rolled-back ingest
 // emits no event.
+// maxIngestBytes caps the ingest request body; raise it when real capture
+// payloads are sized (Phase 1+).
+const maxIngestBytes = 8 << 20 // 8 MiB
+
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxIngestBytes)
 	var req ingestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
@@ -128,6 +145,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return err
 		}
+		// TODO(Phase 2): re-ingesting a known URL re-enqueues enrichment even
+		// though the artifact is unchanged. Make this idempotent (skip when
+		// enrichments already exist) once UpsertByCanonical reports
+		// inserted-vs-updated, so the cloud pipeline doesn't re-run for free.
 		_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "ingest", ArtifactID: &art.ID})
 		return err
 	})

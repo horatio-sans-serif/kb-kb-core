@@ -314,6 +314,25 @@ DB-free, the runner and `/ingest` are the only writers, both serialized on the
 one writer; SSE holds no DB connection). The `ingest` job handler is a
 placeholder until Phase 2 wires the enrichment pipeline.
 
+Review fixes applied (54 tests total under `-race`):
+
+- **HTTP timeouts (critical):** `ReadHeaderTimeout` 5s / `ReadTimeout` 15s /
+  `IdleTimeout` 120s; `WriteTimeout` deliberately unset (a server-wide write
+  deadline would sever the long-lived `/events` SSE stream), documented inline.
+- **Body limit (critical):** `/ingest` wraps the body in `http.MaxBytesReader`
+  (8 MiB) → 413 (`TestIngest_BodyTooLarge`, verified over a real socket).
+- **Runner lifecycle:** `ReclaimStuck` now runs synchronously at startup (a
+  failure is fatal, not a silently dead loop); `Run` is the drain loop only and
+  logs non-context drain errors; the runner goroutine is joined at shutdown.
+- **Defense-in-depth:** an empty configured token never authenticates
+  (`TestAuth_EmptyConfiguredTokenRejects`).
+- **Coverage backfill:** `body`/note ingest, malformed JSON → 400, missing-field
+  → 400, and API-level re-ingest dedup (`TestIngest_BodyType`,
+  `_MalformedJSON`, `_MissingFields`, `_ReingestDedups`).
+- **Forward constraints documented:** `/events` header-auth vs browser
+  `EventSource` (Stage 10), `KB_LISTEN_ADDR` beyond-loopback exposure, and a
+  `TODO(Phase 2)` for the redundant enrichment enqueue on re-ingest.
+
 ---
 
 ## Definition of Done (Phase 0) — MET
