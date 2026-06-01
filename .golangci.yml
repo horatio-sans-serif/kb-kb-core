@@ -1,0 +1,23 @@
+# golangci-lint configuration for KB Core.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck # unchecked errors
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+    - bodyclose # http response bodies closed
+    - noctx # http requests carry a context
+    - sqlclosecheck # sql.Rows/Stmt closed
+
+issues:
+  exclude-rules:
+    # Tests legitimately ignore some errors (e.g. best-effort cleanup, doIngest).
+    - path: _test\.go
+      linters:
+        - errcheck
+        - noctx

@@ -3,25 +3,14 @@ package jobs
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"kb/internal/store"
+	"kb/internal/storetest"
 )
 
-func newStore(t *testing.T) *store.Store {
-	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "kb.db"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	if _, err := store.Migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	return store.New(db)
-}
+func newStore(t *testing.T) *store.Store { return storetest.New(t) }
 
 func TestBackoff_Increasing(t *testing.T) {
 	b := ExpBackoff(time.Second, time.Hour)

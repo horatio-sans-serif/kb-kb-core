@@ -14,22 +14,12 @@ import (
 
 	"kb/internal/events"
 	"kb/internal/store"
+	"kb/internal/storetest"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func newStore(t *testing.T) *store.Store {
-	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "kb.db"))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	if _, err := store.Migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	return store.New(db)
-}
+func newStore(t *testing.T) *store.Store { return storetest.New(t) }
 
 func testServer(t *testing.T) (*store.Store, *events.Bus, http.Handler) {
 	t.Helper()
