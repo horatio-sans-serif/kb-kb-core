@@ -22,7 +22,8 @@ const maxResponseBytes = 16 << 20
 
 // GenerateRequest is one completion request. Format is passed straight through to
 // Ollama's "format" field: the JSON token `"json"` for free-form JSON, or a JSON
-// schema object for structured output; nil for plain text.
+// schema object for structured output; nil for plain text. Format must be valid
+// JSON when set (a malformed value fails the request marshal).
 type GenerateRequest struct {
 	Model  string
 	System string
@@ -119,6 +120,11 @@ func (o *Ollama) Generate(ctx context.Context, req GenerateRequest) (string, err
 	}
 	if out.Error != "" {
 		return "", fmt.Errorf("llm: ollama error: %s", out.Error)
+	}
+	// With stream:false Ollama returns done:true; a non-done body means a
+	// truncated/partial response we must not treat as a complete answer.
+	if !out.Done {
+		return "", fmt.Errorf("llm: ollama returned an incomplete (not done) response")
 	}
 	return out.Response, nil
 }

@@ -462,7 +462,7 @@ func TestIngest_FetchThenSummarize_EndToEnd(t *testing.T) {
 	p := pipeline.New()
 	p.Register(enrich.NewFetch(fetch.NewWebFetcher(page.Client())))
 	p.Register(enrich.NewSummarize(
-		staticLLM{resp: `{"summary":"S","tags":["go","kb"],"critical_analysis":"C"}`}, "fake-model"))
+		staticLLM{resp: `{"summary":"S","tags":["go","kb"],"critical_analysis":"C"}`}, "fake-model", true))
 	p.RegisterHandlers(st, runner, bus)
 	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p})
 	h := srv.Handler()

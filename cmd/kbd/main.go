@@ -102,10 +102,14 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// The enrichment pipeline: each ingested artifact is expanded into its stages.
 	// fetch retrieves the body; summarize runs a local Ollama model over it to
 	// produce summary/tags/critical-analysis enrichment rows (design §8.5).
+	if !cfg.OllamaIsLocal {
+		logger.Warn("Ollama endpoint is not loopback; sensitive/restricted artifacts will skip summarization",
+			"url", cfg.OllamaURL)
+	}
 	llmClient := llm.NewOllama(cfg.OllamaURL)
 	enrichment := pipeline.New()
 	enrichment.Register(enrich.NewFetch(fetch.New()))
-	enrichment.Register(enrich.NewSummarize(llmClient, cfg.SummarizeModel))
+	enrichment.Register(enrich.NewSummarize(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	enrichment.RegisterHandlers(st, runner, bus)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not

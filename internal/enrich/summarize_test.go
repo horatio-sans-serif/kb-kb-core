@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"kb/internal/kb"
 	"kb/internal/llm"
@@ -32,7 +33,7 @@ const goodSummaryJSON = `{
 
 func TestSummarize_EmitsThreeRows(t *testing.T) {
 	f := &fakeLLM{resp: goodSummaryJSON}
-	s := NewSummarize(f, "test-model")
+	s := NewSummarize(f, "test-model", true)
 
 	res, err := s.Enrich(context.Background(), &kb.Artifact{ID: "01ART", Title: "T", BodyMarkdown: "Some body text."})
 	if err != nil {
@@ -75,7 +76,7 @@ func TestSummarize_EmitsThreeRows(t *testing.T) {
 
 func TestSummarize_EmptyBodyIsNoop(t *testing.T) {
 	f := &fakeLLM{resp: goodSummaryJSON}
-	s := NewSummarize(f, "m")
+	s := NewSummarize(f, "m", true)
 	res, err := s.Enrich(context.Background(), &kb.Artifact{ID: "01ART", BodyMarkdown: "   "})
 	if err != nil {
 		t.Fatalf("enrich: %v", err)
@@ -87,7 +88,7 @@ func TestSummarize_EmptyBodyIsNoop(t *testing.T) {
 
 func TestSummarize_ModelErrorPropagates(t *testing.T) {
 	f := &fakeLLM{err: errors.New("ollama down")}
-	s := NewSummarize(f, "m")
+	s := NewSummarize(f, "m", true)
 	if _, err := s.Enrich(context.Background(), &kb.Artifact{ID: "01ART", BodyMarkdown: "text"}); err == nil {
 		t.Error("a model error must propagate so the stage retries/fails")
 	}
@@ -95,7 +96,7 @@ func TestSummarize_ModelErrorPropagates(t *testing.T) {
 
 func TestSummarize_BadJSONIsError(t *testing.T) {
 	f := &fakeLLM{resp: "not json at all"}
-	s := NewSummarize(f, "m")
+	s := NewSummarize(f, "m", true)
 	if _, err := s.Enrich(context.Background(), &kb.Artifact{ID: "01ART", BodyMarkdown: "text"}); err == nil {
 		t.Error("unparseable model output must be an error")
 	}
@@ -103,14 +104,14 @@ func TestSummarize_BadJSONIsError(t *testing.T) {
 
 func TestSummarize_EmptySummaryIsError(t *testing.T) {
 	f := &fakeLLM{resp: `{"summary":"  ","tags":["x"],"critical_analysis":"y"}`}
-	s := NewSummarize(f, "m")
+	s := NewSummarize(f, "m", true)
 	if _, err := s.Enrich(context.Background(), &kb.Artifact{ID: "01ART", BodyMarkdown: "text"}); err == nil {
 		t.Error("an empty summary must be an error (the model failed its task)")
 	}
 }
 
 func TestSummarize_Contract(t *testing.T) {
-	s := NewSummarize(&fakeLLM{}, "m")
+	s := NewSummarize(&fakeLLM{}, "m", true)
 	if s.Name() != "summarize" {
 		t.Errorf("name = %q, want summarize", s.Name())
 	}
@@ -119,7 +120,33 @@ func TestSummarize_Contract(t *testing.T) {
 	}
 	for _, tier := range []kb.PrivacyTier{kb.Public, kb.Personal, kb.Sensitive, kb.Restricted} {
 		if !s.PrivacyOK(tier) {
-			t.Errorf("PrivacyOK(%s) = false, want true (local Ollama processes every tier)", tier)
+			t.Errorf("local PrivacyOK(%s) = false, want true (local Ollama processes every tier)", tier)
 		}
+	}
+}
+
+func TestSummarize_RemoteEndpointGatesSensitiveTiers(t *testing.T) {
+	// A non-local endpoint (operator opted in) must keep sensitive/restricted
+	// artifacts off the remote model — the §8.17 floor.
+	s := NewSummarize(&fakeLLM{}, "m", false)
+	if !s.PrivacyOK(kb.Public) || !s.PrivacyOK(kb.Personal) {
+		t.Error("remote endpoint should still process public/personal")
+	}
+	if s.PrivacyOK(kb.Sensitive) || s.PrivacyOK(kb.Restricted) {
+		t.Error("remote endpoint must refuse sensitive/restricted (privacy floor)")
+	}
+}
+
+func TestSummarize_TruncatesOnRuneBoundary(t *testing.T) {
+	// A body whose byte cap lands inside a multi-byte rune must not corrupt the
+	// trailing character sent to the model.
+	body := strings.Repeat("a", maxSummarizeInputBytes-1) + "€" // '€' is 3 bytes, starts at cap-1
+	f := &fakeLLM{resp: goodSummaryJSON}
+	s := NewSummarize(f, "m", true)
+	if _, err := s.Enrich(context.Background(), &kb.Artifact{ID: "01ART", BodyMarkdown: body}); err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+	if !utf8.ValidString(f.gotReq.Prompt) {
+		t.Error("prompt sent to the model contains invalid UTF-8 (rune split by truncation)")
 	}
 }

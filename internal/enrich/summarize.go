@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"kb/internal/kb"
 	"kb/internal/llm"
@@ -12,10 +13,13 @@ import (
 
 const (
 	summarizePromptVersion = "v1"
-	// maxSummarizeInputChars caps the body sent to the local model (~6k tokens),
+	// maxSummarizeInputBytes caps the body sent to the local model (~6k tokens),
 	// so a large artifact does not blow the context window or stall generation.
-	maxSummarizeInputChars = 24000
+	maxSummarizeInputBytes = 24000
 	maxTags                = 12
+	// maxTagLen drops pathologically long "tags": a topic label is short, and a
+	// misbehaving model could otherwise return a whole sentence as one tag.
+	maxTagLen = 64
 )
 
 // summarizeSchema is the Ollama structured-output schema: the model must return
@@ -43,31 +47,41 @@ type summaryOutput struct {
 // missing context — §6.4, which exists to prevent uncritical hoarding). The stage
 // writes three enrichment rows from that single call.
 //
-// PrivacyOK is always true: Ollama runs on-device, so even sensitive/restricted
-// artifacts may be summarized locally. The privacy gate exists to keep a *cloud*
-// enricher off those tiers (§8.17); a cloud summarizer would be a separate stage.
+// local reports whether the configured LLM endpoint runs on-device. When it
+// does, PrivacyOK is true for every tier — nothing leaves the machine, so even
+// sensitive/restricted artifacts may be summarized. When the operator points the
+// endpoint off-box (opt-in), the stage degrades to the cloud floor (§8.17):
+// sensitive/restricted artifacts are gated off, so the privacy guarantee holds by
+// construction rather than by assumption.
 type Summarize struct {
 	client llm.Client
 	model  string
+	local  bool
 }
 
-// NewSummarize wraps a local LLM client as the "summarize" stage.
-func NewSummarize(client llm.Client, model string) *Summarize {
-	return &Summarize{client: client, model: model}
+// NewSummarize wraps an LLM client as the "summarize" stage. local must reflect
+// whether the client's endpoint is on-device (see config.Config.OllamaIsLocal);
+// it governs the privacy gate for this stage.
+func NewSummarize(client llm.Client, model string, local bool) *Summarize {
+	return &Summarize{client: client, model: model, local: local}
 }
 
-func (*Summarize) Name() string                  { return "summarize" }
-func (*Summarize) DependsOn() []string           { return []string{"fetch"} }
-func (*Summarize) PrivacyOK(kb.PrivacyTier) bool { return true }
+func (*Summarize) Name() string        { return "summarize" }
+func (*Summarize) DependsOn() []string { return []string{"fetch"} }
+
+func (s *Summarize) PrivacyOK(tier kb.PrivacyTier) bool {
+	if s.local {
+		return true // on-device: every tier may be processed
+	}
+	return tier.AllowsCloud() // remote endpoint: keep sensitive/restricted local-only
+}
 
 func (s *Summarize) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult, error) {
 	body := strings.TrimSpace(a.BodyMarkdown)
 	if body == "" {
 		return kb.EnrichResult{}, nil // nothing to summarize yet (e.g. fetch produced no body)
 	}
-	if len(body) > maxSummarizeInputChars {
-		body = body[:maxSummarizeInputChars]
-	}
+	body = truncateBytes(body, maxSummarizeInputBytes)
 
 	out, err := s.generate(ctx, a.Title, body)
 	if err != nil {
@@ -118,14 +132,15 @@ func (s *Summarize) row(artifactID, kind, payload string) kb.Enrichment {
 	}
 }
 
-// normalizeTags lowercases, trims, de-duplicates, drops empties, and caps the
-// list so a chatty model cannot flood the tag set.
+// normalizeTags lowercases, trims, de-duplicates, drops empties and
+// over-long entries, and caps the list — so a chatty model can flood the tag set
+// neither by count nor by length.
 func normalizeTags(tags []string) []string {
 	seen := make(map[string]bool, len(tags))
 	out := make([]string, 0, len(tags))
 	for _, t := range tags {
 		t = strings.ToLower(strings.TrimSpace(t))
-		if t == "" || seen[t] {
+		if t == "" || len(t) > maxTagLen || seen[t] {
 			continue
 		}
 		seen[t] = true
@@ -135,6 +150,25 @@ func normalizeTags(tags []string) []string {
 		}
 	}
 	return out
+}
+
+// truncateBytes caps s to at most n bytes without splitting a UTF-8 rune: it
+// trims back to the last rune boundary at or before n, so the model never
+// receives a corrupted trailing character.
+func truncateBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[:n]
+	for len(s) > 0 && !utf8.RuneStart(s[len(s)-1]) {
+		s = s[:len(s)-1]
+	}
+	// The kept prefix may still end in a lone continuation-less start byte of a
+	// multi-byte rune; drop it if it no longer decodes cleanly.
+	if r, size := utf8.DecodeLastRuneInString(s); r == utf8.RuneError && size <= 1 {
+		s = s[:len(s)-size]
+	}
+	return s
 }
 
 // jsonString marshals v to a JSON string; the simple maps used here cannot fail

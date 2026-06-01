@@ -590,13 +590,29 @@ daemon wires a real local Ollama.
   for both fetched URLs and notes). One `Generate` call returns
   `{summary, tags[], critical_analysis}`; the stage writes three enrichment rows
   (`summary`, `tags`, `critical_analysis`). Tags are normalized (lowercase, trim,
-  dedup, capped). The body is truncated to a fixed character cap before the call.
-  `PrivacyOK` is always true: Ollama is on-device, so the privacy gate (which
-  exists to keep _cloud_ enrichers off sensitive/restricted tiers) does not apply.
-  An empty body is a graceful no-op.
-- **Config + wiring.** `KB_OLLAMA_URL` (default `http://127.0.0.1:11434`) and
-  `KB_SUMMARIZE_MODEL` (default model). `cmd/kbd` registers `summarize` after
-  `fetch`.
+  dedup, length-bounded, count-capped). The body is truncated to a byte cap on a
+  rune boundary before the call.
+- **Privacy is enforced, not assumed.** `PrivacyOK` is true for every tier only
+  when the LLM endpoint is on-device. Config verifies `KB_OLLAMA_URL` is loopback;
+  a remote endpoint requires `KB_ALLOW_REMOTE_OLLAMA=true`, and when opted in the
+  stage degrades to the cloud floor (sensitive/restricted artifacts are gated off
+  the remote model — §8.17). So the local-LLM privacy guarantee holds by
+  construction.
+- **Config + wiring.** `KB_OLLAMA_URL` (default `http://127.0.0.1:11434`),
+  `KB_SUMMARIZE_MODEL` (default `llama3.2`), `KB_ALLOW_REMOTE_OLLAMA`. `cmd/kbd`
+  registers `summarize` after `fetch` and warns when the endpoint is not loopback.
+
+**Review fixes applied (Phase 2 Stage 2):** rune-safe body truncation (a byte cap
+could split a UTF-8 rune); enforceable on-device privacy (above); assert Ollama's
+`done` flag (a partial 200 body is not a complete answer); bound individual tag
+length.
+
+**Known limitation — at-least-once enrichment writes.** A stage writes its rows
+and is then marked done in two steps; a crash between them re-runs the stage on
+restart and writes duplicate enrichment rows. This affects every enricher (fetch
+included), not just summarize. A later stage will make it exactly-once — either an
+idempotent upsert keyed on `(artifact_id, kind, prompt_version)` or folding the
+`MarkDone` write into the enrichment transaction. Out of scope here.
 
 **Next (Stage 3 — embeddings + relevance):** `embed` (sqlite-vec — needs the
 vec0 runtime extension + a vector store) producing artifact- and chunk-level
