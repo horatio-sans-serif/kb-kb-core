@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,13 @@ type BuildInfo struct {
 	Version string `json:"version"`
 }
 
+// Enqueuer expands an ingested artifact into its enrichment-pipeline jobs within
+// the caller's transaction (satisfied by *pipeline.Pipeline). When nil, ingest
+// enqueues a single placeholder "ingest" job instead.
+type Enqueuer interface {
+	EnqueueTx(ctx context.Context, tx *store.Store, artifactID string) error
+}
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -28,6 +36,7 @@ type Deps struct {
 	DefaultPrivacy string
 	Build          BuildInfo
 	Logger         *slog.Logger
+	Enqueue        Enqueuer
 }
 
 // Server wires the HTTP handlers.
@@ -218,10 +227,12 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return err
 		}
-		// TODO(Phase 2): re-ingesting a known URL re-enqueues enrichment even
+		// TODO(Phase 2.x): re-ingesting a known URL re-runs the pipeline even
 		// though the artifact is unchanged. Make this idempotent once
-		// UpsertByCanonical reports inserted-vs-updated, so the (cloud-billable)
-		// pipeline doesn't re-run for free.
+		// UpsertByCanonical reports inserted-vs-updated.
+		if s.deps.Enqueue != nil {
+			return s.deps.Enqueue.EnqueueTx(ctx, tx, art.ID)
+		}
 		_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "ingest", ArtifactID: &art.ID})
 		return err
 	})

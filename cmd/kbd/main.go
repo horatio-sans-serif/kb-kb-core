@@ -18,8 +18,11 @@ import (
 
 	"kb/internal/api"
 	"kb/internal/config"
+	"kb/internal/enrich"
 	"kb/internal/events"
+	"kb/internal/fetch"
 	"kb/internal/jobs"
+	"kb/internal/pipeline"
 	"kb/internal/store"
 )
 
@@ -94,9 +97,11 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	bus := events.NewBus()
 
 	runner := jobs.NewRunner(st, jobs.WithLogger(logger))
-	// Placeholder until Phase 2 wires the real enrichment pipeline; for now an
-	// ingest job simply completes so the walking skeleton runs end to end.
-	runner.Handle("ingest", func(context.Context, store.Job) error { return nil })
+
+	// The enrichment pipeline: each ingested artifact is expanded into its stages.
+	enrichment := pipeline.New()
+	enrichment.Register(enrich.NewFetch(fetch.New()))
+	enrichment.RegisterHandlers(st, runner)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not
 	// serve with a dead loop), then purge old terminal jobs (best-effort).
@@ -143,6 +148,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		DefaultPrivacy: cfg.DefaultPrivacy,
 		Build:          api.BuildInfo{Version: Version},
 		Logger:         logger,
+		Enqueue:        enrichment,
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

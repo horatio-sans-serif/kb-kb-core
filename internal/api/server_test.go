@@ -12,7 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"kb/internal/enrich"
 	"kb/internal/events"
+	"kb/internal/fetch"
+	"kb/internal/jobs"
+	"kb/internal/pipeline"
 	"kb/internal/store"
 	"kb/internal/storetest"
 )
@@ -387,6 +391,52 @@ func TestSSEHandler_NonFlusherReturns500(t *testing.T) {
 	SSEHandler(events.NewBus())(w, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500 for a non-flushing writer", rec.Code)
+	}
+}
+
+func TestIngest_PipelineFetchesAndMarksReady(t *testing.T) {
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, `<html><head><title>P</title></head><body><p>Fetched body.</p></body></html>`)
+	}))
+	defer page.Close()
+
+	st := storetest.New(t)
+	bus := events.NewBus()
+	runner := jobs.NewRunner(st, jobs.WithLogger(discardLogger()))
+	p := pipeline.New()
+	p.Register(enrich.NewFetch(fetch.NewWebFetcher(page.Client()))) // injected client reaches loopback
+	p.RegisterHandlers(st, runner)
+	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p})
+	h := srv.Handler()
+
+	ctx := context.Background()
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	body := `{"source_id":"` + src.ID + `","url":"` + page.URL + `/article"}`
+	if rec := doIngest(h, body, "tok"); rec.Code != http.StatusOK {
+		t.Fatalf("ingest status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := runner.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	arts, err := st.Artifacts.List(ctx)
+	if err != nil || len(arts) != 1 {
+		t.Fatalf("artifacts = %v (err %v), want one", arts, err)
+	}
+	a := arts[0]
+	if !strings.Contains(a.BodyMarkdown, "Fetched body.") {
+		t.Errorf("artifact body was not fetched: %q", a.BodyMarkdown)
+	}
+	if a.Status != "ready" {
+		t.Errorf("artifact status = %q, want ready after the pipeline completes", a.Status)
+	}
+	if ens, _ := st.Enrichments.ListForArtifact(ctx, a.ID); len(ens) != 1 || ens[0].Kind != "fetch" {
+		t.Errorf("enrichments = %v, want one 'fetch' row", ens)
 	}
 }
 
