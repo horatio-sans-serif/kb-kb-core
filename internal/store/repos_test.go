@@ -328,6 +328,52 @@ func TestStore_NestedTxDisallowed(t *testing.T) {
 	}
 }
 
+func TestSource_ListUpdateSetEnabled(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	sched := `{"cron":"0 * * * *"}`
+	budget := 1000
+	s := &Source{Kind: "PULL", Connector: "rss", DefaultPrivacy: "sensitive", Schedule: &sched, StorageBudget: &budget}
+	if err := st.Sources.Create(ctx, s); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// The previously-unmapped columns round-trip.
+	got, err := st.Sources.Get(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Schedule == nil || *got.Schedule != sched {
+		t.Errorf("schedule = %v, want %q", got.Schedule, sched)
+	}
+	if got.StorageBudget == nil || *got.StorageBudget != budget {
+		t.Errorf("storage_budget = %v, want %d", got.StorageBudget, budget)
+	}
+	if !got.Enabled || got.SourceWeight != 1.0 {
+		t.Errorf("new source defaults: enabled=%v weight=%v, want true/1.0", got.Enabled, got.SourceWeight)
+	}
+
+	if list, err := st.Sources.List(ctx); err != nil || len(list) != 1 || list[0].ID != s.ID {
+		t.Errorf("list = %v (err %v), want one source", list, err)
+	}
+
+	got.DefaultPrivacy = "restricted"
+	got.SourceWeight = 2.5
+	if err := st.Sources.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if re, _ := st.Sources.Get(ctx, s.ID); re.DefaultPrivacy != "restricted" || re.SourceWeight != 2.5 {
+		t.Errorf("after update: %+v, want privacy=restricted weight=2.5", re)
+	}
+
+	if err := st.Sources.SetEnabled(ctx, s.ID, false); err != nil {
+		t.Fatalf("set enabled: %v", err)
+	}
+	if re, _ := st.Sources.Get(ctx, s.ID); re.Enabled {
+		t.Error("source should be disabled after SetEnabled(false)")
+	}
+}
+
 func TestSource_GetNotFound(t *testing.T) {
 	st := newTestStore(t)
 	if _, err := st.Sources.Get(context.Background(), "01NONE"); !errors.Is(err, ErrNotFound) {
