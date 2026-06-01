@@ -65,19 +65,19 @@ func (r *EnrichmentRepo) LatestByKind(ctx context.Context, artifactID, kind stri
 	return &e, nil
 }
 
-// EmbeddingRow is one artifact's latest embedding payload (raw JSON — the search
-// layer parses it into kb.EmbeddingPayload).
-type EmbeddingRow struct {
-	ArtifactID string
-	Payload    string
-}
-
-// LatestEmbeddings returns the latest `embedding` enrichment payload for every
-// live (non-tombstoned) artifact — the candidate set for semantic search. A
-// window function picks the most recent row per artifact in one pass. This loads
-// all embeddings; the vec0 ANN index (deferred) replaces it for sublinear
+// ForEachLatestEmbedding streams the latest `embedding` enrichment payload for
+// every live (non-tombstoned) artifact — the candidate set for semantic search —
+// invoking fn once per row with the raw JSON payload (the search layer parses it
+// into kb.EmbeddingPayload). A window function picks the most recent row per
+// artifact in one pass; streaming lets the caller keep only a bounded top-k
+// rather than materializing every vector. Returning an error from fn aborts the
+// scan. The vec0 ANN index (deferred) replaces the full scan for sublinear
 // retrieval at scale.
-func (r *EnrichmentRepo) LatestEmbeddings(ctx context.Context) ([]EmbeddingRow, error) {
+//
+// Privacy: this intentionally does not filter by privacy_tier — search serves the
+// single owner behind the bearer token, so all live tiers are searchable. A
+// future lower-trust read path (see KB_LISTEN_ADDR) must add a tier ceiling here.
+func (r *EnrichmentRepo) ForEachLatestEmbedding(ctx context.Context, fn func(artifactID, payload string) error) error {
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT artifact_id, payload FROM (
 		   SELECT e.artifact_id, e.payload,
@@ -87,19 +87,20 @@ func (r *EnrichmentRepo) LatestEmbeddings(ctx context.Context) ([]EmbeddingRow, 
 		   WHERE e.kind = 'embedding'
 		 ) WHERE rn = 1`)
 	if err != nil {
-		return nil, fmt.Errorf("latest embeddings: %w", err)
+		return fmt.Errorf("latest embeddings: %w", err)
 	}
 	defer rows.Close()
 
-	var out []EmbeddingRow
 	for rows.Next() {
-		var er EmbeddingRow
-		if err := rows.Scan(&er.ArtifactID, &er.Payload); err != nil {
-			return nil, fmt.Errorf("scan embedding row: %w", err)
+		var artifactID, payload string
+		if err := rows.Scan(&artifactID, &payload); err != nil {
+			return fmt.Errorf("scan embedding row: %w", err)
 		}
-		out = append(out, er)
+		if err := fn(artifactID, payload); err != nil {
+			return err
+		}
 	}
-	return out, rows.Err()
+	return rows.Err()
 }
 
 // Get returns the enrichment by id, or ErrNotFound.

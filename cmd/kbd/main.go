@@ -176,7 +176,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Build:          api.BuildInfo{Version: Version},
 		Logger:         logger,
 		Enqueue:        enrichment,
-		Search:         search.NewSearcher(st, llmClient, cfg.EmbedModel),
+		Search:         search.NewSearcher(st, llmClient, cfg.EmbedModel, cfg.OllamaIsLocal),
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

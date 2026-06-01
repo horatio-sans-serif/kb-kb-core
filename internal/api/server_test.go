@@ -474,7 +474,7 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	p.Register(enrich.NewEmbed(model, "fake-embed", true))
 	p.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	p.RegisterHandlers(st, runner, bus)
-	searcher := search.NewSearcher(st, model, "fake-embed")
+	searcher := search.NewSearcher(st, model, "fake-embed", true)
 	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p, Search: searcher})
 	h := srv.Handler()
 
@@ -654,5 +654,14 @@ func TestSearch_NotConfiguredIs503(t *testing.T) {
 	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()}) // no Search
 	if rec := doGet(srv.Handler(), "/search?q=x", "tok"); rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503 when search is not configured", rec.Code)
+	}
+}
+
+func TestSearch_RemoteDisallowedIs503(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(),
+		Search: &fakeSearcher{err: search.ErrRemoteDisallowed}})
+	if rec := doGet(srv.Handler(), "/search?q=x", "tok"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when queries cannot leave the box", rec.Code)
 	}
 }

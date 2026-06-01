@@ -718,6 +718,24 @@ the artifact) plus unit coverage of ranking, dim-skip, and the endpoint.
 - **API.** `GET /search?q=...&k=...` (bearer-auth), returning ranked results with
   artifact title/url for display.
 
+**Review fixes applied (Phase 3 Stage 1):**
+
+- **Query text honors the privacy gate.** The searcher carries the same locality
+  flag as the enrichers; a non-loopback embed endpoint makes `Semantic` refuse
+  (`ErrRemoteDisallowed` → 503) so a search query never leaves the machine —
+  closing the egress channel the enrichers already gate sensitive content off.
+- **Non-finite / non-positive scores are skipped.** A pre-validation embedding row
+  with a NaN component would corrupt the sort (strict-weak-ordering violation) and
+  truncate the JSON response; such scores, and anti-correlated (cosine ≤ 0) hits,
+  are dropped. `writeJSON` now encodes to a buffer first, so any marshal failure
+  is a clean 500 rather than a half-written 200 — a fix for every endpoint.
+- **Bounded memory.** `ForEachLatestEmbedding` streams candidates and the searcher
+  keeps only a top-k min-heap (O(k)), instead of materializing every vector — no
+  per-query memory cliff at scale.
+- **Tier exposure is a documented decision.** Search is intentionally unfiltered
+  by privacy tier (it serves the single owner behind the bearer token); a future
+  lower-trust read path must add a tier ceiling in `ForEachLatestEmbedding`.
+
 **Next (Phase 3):** FTS5 keyword search (build tag + local index), hybrid ranking
 blend, then RAG (retrieve → rerank → synthesize with citations). Plus the deferred
 items: chunk-level embeddings (Decision 3 chunking), the living profile and

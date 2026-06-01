@@ -295,6 +295,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	hits, err := s.deps.Search.Semantic(ctx, q, k)
 	if err != nil {
+		if errors.Is(err, search.ErrRemoteDisallowed) {
+			http.Error(w, "semantic search requires an on-device embed endpoint", http.StatusServiceUnavailable)
+			return
+		}
 		s.serverError(w, "search", err)
 		return
 	}
@@ -303,7 +307,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	for _, h := range hits {
 		a, err := s.deps.Store.Artifacts.Get(ctx, h.ArtifactID)
 		if err != nil {
-			continue // artifact gone (raced with a delete) — drop from results
+			continue // artifact hard-deleted / not found between ranking and load — drop
 		}
 		res := searchResultJSON{ArtifactID: h.ArtifactID, Title: a.Title, Score: h.Score}
 		if a.CanonicalURL != nil {
@@ -320,10 +324,18 @@ func (s *Server) serverError(w http.ResponseWriter, what string, err error) {
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, v any) {
+	// Encode to a buffer first so a marshal failure becomes a clean 500 instead of
+	// a 200 with a half-written, invalid body (the status line and prefix would
+	// otherwise already be committed).
+	buf, err := json.Marshal(v)
+	if err != nil {
+		s.serverError(w, "encode response", err)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		s.deps.Logger.Error("api: encode response", "err", err)
+	if _, err := w.Write(buf); err != nil {
+		s.deps.Logger.Error("api: write response", "err", err)
 	}
 }

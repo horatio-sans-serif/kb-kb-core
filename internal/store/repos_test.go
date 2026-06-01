@@ -639,14 +639,18 @@ func TestEnrichment_LatestEmbeddings(t *testing.T) {
 		t.Fatalf("soft delete: %v", err)
 	}
 
-	rows, err := st.Enrichments.LatestEmbeddings(ctx)
-	if err != nil {
-		t.Fatalf("latest embeddings: %v", err)
+	type row struct{ id, payload string }
+	var rows []row
+	if err := st.Enrichments.ForEachLatestEmbedding(ctx, func(artifactID, payload string) error {
+		rows = append(rows, row{artifactID, payload})
+		return nil
+	}); err != nil {
+		t.Fatalf("for each latest embedding: %v", err)
 	}
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1 (live artifact, latest only, tombstoned excluded)", len(rows))
 	}
-	if rows[0].ArtifactID != live.ID || rows[0].Payload != `{"v":2}` {
+	if rows[0].id != live.ID || rows[0].payload != `{"v":2}` {
 		t.Errorf("row = %+v, want live artifact with the latest payload {\"v\":2}", rows[0])
 	}
 }

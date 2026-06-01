@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 
 	"kb/internal/kb"
@@ -37,28 +38,53 @@ func TestSemantic_RanksByCosine(t *testing.T) {
 		}
 		return a.ID
 	}
-	aligned := seed("aligned", []float32{1, 0})       // cos 1
-	orthogonal := seed("orthogonal", []float32{0, 1}) // cos 0
-	opposite := seed("opposite", []float32{-1, 0})    // cos -1
+	aligned := seed("aligned", []float32{1, 0})           // cos 1
+	partial := seed("partial", []float32{0.7071, 0.7071}) // cos ~0.707
+	opposite := seed("opposite", []float32{-1, 0})        // cos -1 (skipped: non-positive)
 	_ = opposite
 
-	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m")
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
 
-	results, err := s.Semantic(ctx, "find aligned things", 2)
+	results, err := s.Semantic(ctx, "find aligned things", 10)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}
 	if len(results) != 2 {
-		t.Fatalf("results = %d, want 2 (top-k)", len(results))
+		t.Fatalf("results = %d, want 2 (the opposite-meaning artifact is floored out)", len(results))
 	}
-	if results[0].ArtifactID != aligned {
-		t.Errorf("rank 0 = %s, want the aligned artifact %s", results[0].ArtifactID, aligned)
-	}
-	if results[1].ArtifactID != orthogonal {
-		t.Errorf("rank 1 = %s, want the orthogonal artifact %s", results[1].ArtifactID, orthogonal)
+	if results[0].ArtifactID != aligned || results[1].ArtifactID != partial {
+		t.Errorf("ranking = %+v, want [aligned, partial]", results)
 	}
 	if results[0].Score <= results[1].Score {
 		t.Errorf("scores not descending: %v then %v", results[0].Score, results[1].Score)
+	}
+}
+
+func TestSemantic_RemoteEndpointRefuses(t *testing.T) {
+	st := storetest.New(t)
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", false) // not local
+	if _, err := s.Semantic(context.Background(), "secret query", 5); !errors.Is(err, ErrRemoteDisallowed) {
+		t.Errorf("err = %v, want ErrRemoteDisallowed (query must not leave the box)", err)
+	}
+}
+
+func TestSemantic_SkipsNonFiniteScore(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+	// A pre-validation row whose vector contains a NaN: cosine is NaN and must be
+	// skipped, not ranked (a NaN would corrupt the sort and the JSON response).
+	hash := "nan"
+	a, _ := st.Artifacts.UpsertByContentHash(ctx, &kb.Artifact{Type: kb.Note, BodyMarkdown: hash, ContentHash: &hash})
+	payload, _ := json.Marshal(kb.EmbeddingPayload{Model: "m", Dim: 2, Vector: []float32{float32(math.NaN()), 0}})
+	_ = st.Enrichments.Create(ctx, &kb.Enrichment{ArtifactID: a.ID, Kind: "embedding", Payload: string(payload), Model: "m", PromptVersion: "v1"})
+
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
+	results, err := s.Semantic(ctx, "q", 10)
+	if err != nil {
+		t.Fatalf("semantic: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("results = %+v, want 0 (the NaN-vector artifact is skipped)", results)
 	}
 }
 
@@ -76,7 +102,7 @@ func TestSemantic_SkipsDimMismatch(t *testing.T) {
 	bp, _ := json.Marshal(kb.EmbeddingPayload{Model: "old", Dim: 3, Vector: []float32{1, 0, 0}})
 	_ = st.Enrichments.Create(ctx, &kb.Enrichment{ArtifactID: b.ID, Kind: "embedding", Payload: string(bp), Model: "old", PromptVersion: "v1"})
 
-	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m")
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
 	results, err := s.Semantic(ctx, "q", 10)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
@@ -88,7 +114,7 @@ func TestSemantic_SkipsDimMismatch(t *testing.T) {
 
 func TestSemantic_EmptyQueryIsError(t *testing.T) {
 	st := storetest.New(t)
-	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m")
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
 	if _, err := s.Semantic(context.Background(), "   ", 5); err == nil {
 		t.Error("an empty query should be an error")
 	}
@@ -96,7 +122,7 @@ func TestSemantic_EmptyQueryIsError(t *testing.T) {
 
 func TestSemantic_EmbedErrorPropagates(t *testing.T) {
 	st := storetest.New(t)
-	s := NewSearcher(st, queryEmbedder{err: errors.New("ollama down")}, "m")
+	s := NewSearcher(st, queryEmbedder{err: errors.New("ollama down")}, "m", true)
 	if _, err := s.Semantic(context.Background(), "q", 5); err == nil {
 		t.Error("an embed error must propagate")
 	}
