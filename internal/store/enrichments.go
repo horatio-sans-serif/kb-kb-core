@@ -65,6 +65,43 @@ func (r *EnrichmentRepo) LatestByKind(ctx context.Context, artifactID, kind stri
 	return &e, nil
 }
 
+// EmbeddingRow is one artifact's latest embedding payload (raw JSON — the search
+// layer parses it into kb.EmbeddingPayload).
+type EmbeddingRow struct {
+	ArtifactID string
+	Payload    string
+}
+
+// LatestEmbeddings returns the latest `embedding` enrichment payload for every
+// live (non-tombstoned) artifact — the candidate set for semantic search. A
+// window function picks the most recent row per artifact in one pass. This loads
+// all embeddings; the vec0 ANN index (deferred) replaces it for sublinear
+// retrieval at scale.
+func (r *EnrichmentRepo) LatestEmbeddings(ctx context.Context) ([]EmbeddingRow, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT artifact_id, payload FROM (
+		   SELECT e.artifact_id, e.payload,
+		          ROW_NUMBER() OVER (PARTITION BY e.artifact_id ORDER BY e.created_at DESC, e.id DESC) AS rn
+		   FROM enrichments e
+		   JOIN artifacts a ON a.id = e.artifact_id AND a.deleted_at IS NULL
+		   WHERE e.kind = 'embedding'
+		 ) WHERE rn = 1`)
+	if err != nil {
+		return nil, fmt.Errorf("latest embeddings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []EmbeddingRow
+	for rows.Next() {
+		var er EmbeddingRow
+		if err := rows.Scan(&er.ArtifactID, &er.Payload); err != nil {
+			return nil, fmt.Errorf("scan embedding row: %w", err)
+		}
+		out = append(out, er)
+	}
+	return out, rows.Err()
+}
+
 // Get returns the enrichment by id, or ErrNotFound.
 func (r *EnrichmentRepo) Get(ctx context.Context, id string) (*Enrichment, error) {
 	var e Enrichment

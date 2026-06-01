@@ -693,7 +693,32 @@ the multi-source factors don't yet differentiate artifacts over time. The §9
 living-profile stage adds the re-scoring trigger (on re-encounter, engagement, and
 profile change).
 
-**Next (Phase 3 — retrieval):** the `vec0`/FTS5 local indexes (rebuilt from synced
-enrichment data, §6.0), hybrid search, and RAG. Plus the deferred items: chunk-
-level embeddings (Decision 3 chunking), the living profile and re-scoring on
-engagement/profile change (§9), and exactly-once enrichment writes.
+## Phase 3 — Stage 1: Semantic search
+
+**Goal:** find artifacts by meaning, not keywords (design §8.8) — embed the query
+and rank artifacts by cosine similarity to their stored embeddings, exposed at
+`GET /search`.
+
+**Status: Complete.** Verified end to end (ingest → embed → `GET /search` returns
+the artifact) plus unit coverage of ranking, dim-skip, and the endpoint.
+
+- **Brute-force first, `vec0` later.** Embeddings already live as `enrichment`
+  rows (§6.0). Stage 1 ranks them in-process with `relevance.Cosine` and a top-K
+  heap — no new dependency, correct results, fine at personal scale. The
+  `sqlite-vec` (`vec0`) ANN index is the same ranking with sublinear candidate
+  retrieval; it's a localized swap behind the same `Searcher` interface and is
+  deferred until scale needs it. The O(n) per-query scan is the documented
+  trade-off.
+- **`internal/search`.** A `Searcher` embeds the query (injected `llm.Embedder`),
+  streams the latest embedding per live artifact from the store, ranks by cosine,
+  and returns the top-K `(artifact_id, score)`. Dimension-mismatched vectors
+  (stale embed model) are skipped, not scored 0.
+- **Store.** `EnrichmentRepo.LatestEmbeddings` — latest `embedding` payload per
+  live (non-tombstoned) artifact, via a window function.
+- **API.** `GET /search?q=...&k=...` (bearer-auth), returning ranked results with
+  artifact title/url for display.
+
+**Next (Phase 3):** FTS5 keyword search (build tag + local index), hybrid ranking
+blend, then RAG (retrieve → rerank → synthesize with citations). Plus the deferred
+items: chunk-level embeddings (Decision 3 chunking), the living profile and
+re-scoring (§9), and exactly-once enrichment writes.

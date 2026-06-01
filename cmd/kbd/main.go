@@ -26,6 +26,7 @@ import (
 	"kb/internal/pipeline"
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
+	"kb/internal/search"
 	"kb/internal/store"
 )
 
@@ -175,6 +176,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Build:          api.BuildInfo{Version: Version},
 		Logger:         logger,
 		Enqueue:        enrichment,
+		Search:         search.NewSearcher(st, llmClient, cfg.EmbedModel),
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

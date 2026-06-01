@@ -7,12 +7,14 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"kb/internal/canon"
 	"kb/internal/events"
 	"kb/internal/kb"
+	"kb/internal/search"
 	"kb/internal/store"
 )
 
@@ -28,6 +30,12 @@ type Enqueuer interface {
 	EnqueueTx(ctx context.Context, tx *store.Store, artifactID string) error
 }
 
+// Searcher ranks artifacts for a query (satisfied by *search.Searcher). When nil,
+// the /search route reports 503.
+type Searcher interface {
+	Semantic(ctx context.Context, query string, k int) ([]search.Result, error)
+}
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -37,6 +45,7 @@ type Deps struct {
 	Build          BuildInfo
 	Logger         *slog.Logger
 	Enqueue        Enqueuer
+	Search         Searcher
 }
 
 // Server wires the HTTP handlers.
@@ -62,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	// compare). Header auth is correct for Phase 0.
 	mux.Handle("GET /events", s.requireAuth(SSEHandler(s.deps.Bus)))
 	mux.Handle("POST /ingest", s.requireAuth(http.HandlerFunc(s.handleIngest)))
+	mux.Handle("GET /search", s.requireAuth(http.HandlerFunc(s.handleSearch)))
 	return mux
 }
 
@@ -246,6 +256,62 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		map[string]string{"artifact_id": artifactID, "source_id": req.SourceID}))
 
 	s.writeJSON(w, http.StatusOK, ingestResponse{ArtifactID: artifactID})
+}
+
+type searchResultJSON struct {
+	ArtifactID string  `json:"artifact_id"`
+	Title      string  `json:"title,omitempty"`
+	URL        string  `json:"url,omitempty"`
+	Score      float64 `json:"score"`
+}
+
+type searchResponse struct {
+	Query   string             `json:"query"`
+	Results []searchResultJSON `json:"results"`
+}
+
+// handleSearch ranks artifacts by semantic similarity to ?q and attaches each
+// hit's title/url for display. ?k bounds the result count (the searcher caps it).
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Search == nil {
+		http.Error(w, "search not configured", http.StatusServiceUnavailable)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "q is required", http.StatusBadRequest)
+		return
+	}
+	k := 0
+	if ks := r.URL.Query().Get("k"); ks != "" {
+		n, err := strconv.Atoi(ks)
+		if err != nil || n < 0 {
+			http.Error(w, "k must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		k = n
+	}
+
+	ctx := r.Context()
+	hits, err := s.deps.Search.Semantic(ctx, q, k)
+	if err != nil {
+		s.serverError(w, "search", err)
+		return
+	}
+
+	out := searchResponse{Query: q, Results: make([]searchResultJSON, 0, len(hits))}
+	for _, h := range hits {
+		a, err := s.deps.Store.Artifacts.Get(ctx, h.ArtifactID)
+		if err != nil {
+			continue // artifact gone (raced with a delete) — drop from results
+		}
+		res := searchResultJSON{ArtifactID: h.ArtifactID, Title: a.Title, Score: h.Score}
+		if a.CanonicalURL != nil {
+			res.URL = *a.CanonicalURL
+		}
+		out.Results = append(out.Results, res)
+	}
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) serverError(w http.ResponseWriter, what string, err error) {

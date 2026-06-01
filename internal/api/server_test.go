@@ -20,6 +20,7 @@ import (
 	"kb/internal/pipeline"
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
+	"kb/internal/search"
 	"kb/internal/store"
 	"kb/internal/storetest"
 )
@@ -473,7 +474,8 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	p.Register(enrich.NewEmbed(model, "fake-embed", true))
 	p.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	p.RegisterHandlers(st, runner, bus)
-	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p})
+	searcher := search.NewSearcher(st, model, "fake-embed")
+	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p, Search: searcher})
 	h := srv.Handler()
 
 	ctx := context.Background()
@@ -507,6 +509,24 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 		if !kinds[want] {
 			t.Errorf("missing %q enrichment; got kinds %v", want, kinds)
 		}
+	}
+
+	// The embedded artifact is now retrievable via semantic search (the query
+	// embeds to the same vector under the fake model, so it ranks first).
+	rec := doGet(h, "/search?q=anything", "tok")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("search status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var sr struct {
+		Results []struct {
+			ArtifactID string `json:"artifact_id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sr); err != nil {
+		t.Fatalf("decode search: %v", err)
+	}
+	if len(sr.Results) != 1 || sr.Results[0].ArtifactID != a.ID {
+		t.Errorf("search results = %+v, want the ingested artifact %s", sr.Results, a.ID)
 	}
 }
 
@@ -559,4 +579,80 @@ func doIngest(h http.Handler, body, token string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+func doGet(h http.Handler, path, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+type fakeSearcher struct {
+	results []search.Result
+	err     error
+	gotQ    string
+	gotK    int
+}
+
+func (f *fakeSearcher) Semantic(_ context.Context, query string, k int) ([]search.Result, error) {
+	f.gotQ, f.gotK = query, k
+	return f.results, f.err
+}
+
+func TestSearch_ReturnsRankedResultsWithMetadata(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	u1, u2 := "https://example.com/first", "https://example.com/second"
+	a1, _ := st.Artifacts.UpsertByCanonical(ctx, &store.Artifact{Type: "webpage", Title: "First", CanonicalURL: &u1})
+	a2, _ := st.Artifacts.UpsertByCanonical(ctx, &store.Artifact{Type: "webpage", Title: "Second", CanonicalURL: &u2})
+
+	fs := &fakeSearcher{results: []search.Result{{ArtifactID: a1.ID, Score: 0.9}, {ArtifactID: a2.ID, Score: 0.5}}}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Search: fs})
+	h := srv.Handler()
+
+	rec := doGet(h, "/search?q=hello%20world&k=5", "tok")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if fs.gotQ != "hello world" || fs.gotK != 5 {
+		t.Errorf("searcher called with q=%q k=%d, want q=\"hello world\" k=5", fs.gotQ, fs.gotK)
+	}
+	var resp struct {
+		Query   string `json:"query"`
+		Results []struct {
+			ArtifactID string  `json:"artifact_id"`
+			Title      string  `json:"title"`
+			URL        string  `json:"url"`
+			Score      float64 `json:"score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Results) != 2 {
+		t.Fatalf("results = %d, want 2", len(resp.Results))
+	}
+	if resp.Results[0].Title != "First" || resp.Results[0].URL != u1 || resp.Results[0].Score != 0.9 {
+		t.Errorf("result 0 = %+v, want First/%s/0.9 (metadata attached, order preserved)", resp.Results[0], u1)
+	}
+}
+
+func TestSearch_MissingQueryIs400(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Search: &fakeSearcher{}})
+	if rec := doGet(srv.Handler(), "/search?q=", "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an empty query", rec.Code)
+	}
+}
+
+func TestSearch_NotConfiguredIs503(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()}) // no Search
+	if rec := doGet(srv.Handler(), "/search?q=x", "tok"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when search is not configured", rec.Code)
+	}
 }

@@ -608,3 +608,45 @@ func TestEnrichment_CreateGet(t *testing.T) {
 		t.Errorf("got %+v, want kind=summary payload={\"text\":\"hi\"} artifact=%s", got, a.ID)
 	}
 }
+
+func TestEnrichment_LatestEmbeddings(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	live, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "a", ContentHash: ptrStr("h1")})
+	if err != nil {
+		t.Fatalf("create live: %v", err)
+	}
+	gone, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "b", ContentHash: ptrStr("h2")})
+	if err != nil {
+		t.Fatalf("create gone: %v", err)
+	}
+
+	// live: two embeddings (only the latest should be returned) + a non-embedding.
+	for _, p := range []string{`{"v":1}`, `{"v":2}`} {
+		if err := st.Enrichments.Create(ctx, &Enrichment{ArtifactID: live.ID, Kind: "embedding", Payload: p, Model: "m", PromptVersion: "v1"}); err != nil {
+			t.Fatalf("create embedding: %v", err)
+		}
+	}
+	if err := st.Enrichments.Create(ctx, &Enrichment{ArtifactID: live.ID, Kind: "summary", Payload: `{"x":1}`, Model: "m", PromptVersion: "v1"}); err != nil {
+		t.Fatalf("create summary: %v", err)
+	}
+	// tombstoned artifact's embedding must be excluded.
+	if err := st.Enrichments.Create(ctx, &Enrichment{ArtifactID: gone.ID, Kind: "embedding", Payload: `{"v":9}`, Model: "m", PromptVersion: "v1"}); err != nil {
+		t.Fatalf("create gone embedding: %v", err)
+	}
+	if err := st.Artifacts.SoftDelete(ctx, gone.ID); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+
+	rows, err := st.Enrichments.LatestEmbeddings(ctx)
+	if err != nil {
+		t.Fatalf("latest embeddings: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (live artifact, latest only, tombstoned excluded)", len(rows))
+	}
+	if rows[0].ArtifactID != live.ID || rows[0].Payload != `{"v":2}` {
+		t.Errorf("row = %+v, want live artifact with the latest payload {\"v\":2}", rows[0])
+	}
+}
