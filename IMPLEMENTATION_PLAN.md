@@ -782,7 +782,12 @@ default search mode.
   best-effort — if it is unavailable (non-local embed endpoint, or the model is
   down) Hybrid fuses keyword alone instead of failing.
 - **API.** `mode` now defaults to `hybrid` (was semantic); `semantic` and
-  `keyword` remain explicit options.
+  `keyword` remain explicit options. Note the `score` scale differs by mode
+  (cosine for semantic, bm25 for keyword, RRF sums for hybrid) — clients should
+  rank by it, not threshold on an absolute value.
+- **Review fix.** Hybrid degrades to keyword only when semantic is _legitimately_
+  unavailable (non-local endpoint / model down); a cancelled or expired context
+  propagates as an error rather than fabricating a degraded `200`.
 
 **Next (Phase 3):** RAG (retrieve → rerank → synthesize with citations). Plus the
 deferred items: chunk-level embeddings (Decision 3 chunking), the living profile

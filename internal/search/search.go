@@ -171,9 +171,8 @@ func (s *Searcher) Hybrid(ctx context.Context, query string, k int) ([]Result, e
 	k = clampK(k)
 	depth := k
 	if depth < fuseDepth {
-		depth = fuseDepth
+		depth = fuseDepth // fuseDepth and k are both <= maxK, so depth needs no re-clamp
 	}
-	depth = clampK(depth)
 
 	keyword, err := s.Keyword(ctx, query, depth)
 	if err != nil {
@@ -181,7 +180,14 @@ func (s *Searcher) Hybrid(ctx context.Context, query string, k int) ([]Result, e
 	}
 	semantic, err := s.Semantic(ctx, query, depth)
 	if err != nil {
-		semantic = nil // semantic unavailable — fuse keyword alone
+		// Degrade to keyword-only only when semantic is legitimately unavailable
+		// (non-local endpoint, model down). A cancelled/expired context means the
+		// request itself is dead — propagate it rather than fabricating a 200 with
+		// a silently-degraded ranking.
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		semantic = nil
 	}
 	return rrf(k, semantic, keyword), nil
 }

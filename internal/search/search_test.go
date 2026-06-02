@@ -229,3 +229,31 @@ func TestHybrid_DegradesToKeywordWhenSemanticUnavailable(t *testing.T) {
 		t.Errorf("results = %+v, want the keyword hit %s (semantic degraded)", results, b)
 	}
 }
+
+func TestHybrid_DegradesWhenEmbedModelDown(t *testing.T) {
+	st := storetest.New(t)
+	b := seedNote(t, st, "h2", "Beta", "beta keyword text")
+
+	// Local endpoint but the embed model errors (not a context error): degrade to
+	// keyword rather than failing the whole search.
+	s := NewSearcher(st, queryEmbedder{err: errors.New("model not loaded")}, "m", true)
+	results, err := s.Hybrid(context.Background(), "beta", 10)
+	if err != nil {
+		t.Fatalf("hybrid should degrade on a model error, got %v", err)
+	}
+	if len(results) != 1 || results[0].ArtifactID != b {
+		t.Errorf("results = %+v, want the keyword hit %s", results, b)
+	}
+}
+
+func TestHybrid_CancelledContextPropagates(t *testing.T) {
+	st := storetest.New(t)
+	seedNote(t, st, "h2", "Beta", "beta keyword text")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // dead request
+
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
+	if _, err := s.Hybrid(ctx, "beta", 10); err == nil {
+		t.Error("a cancelled context must propagate as an error, not a degraded 200")
+	}
+}
