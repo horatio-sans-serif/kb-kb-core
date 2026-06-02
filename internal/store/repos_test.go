@@ -586,6 +586,37 @@ func TestStore_TxPanicRollsBack(t *testing.T) {
 	}
 }
 
+func TestEnrichment_EngagedEmbeddings(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	mk := func(hash string, engage bool) string {
+		a, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: hash, ContentHash: &hash})
+		if err != nil {
+			t.Fatalf("create %s: %v", hash, err)
+		}
+		if err := st.Enrichments.Create(ctx, &Enrichment{ArtifactID: a.ID, Kind: "embedding", Payload: `{"vector":[1,0]}`, Model: "m", PromptVersion: "v1"}); err != nil {
+			t.Fatalf("embed %s: %v", hash, err)
+		}
+		if engage {
+			if _, err := st.Artifacts.RecordEngagement(ctx, a.ID); err != nil {
+				t.Fatalf("engage %s: %v", hash, err)
+			}
+		}
+		return a.ID
+	}
+	engaged := mk("h1", true)
+	mk("h2", false)            // not engaged → excluded
+	excluded := mk("h3", true) // engaged but passed as excludeID
+
+	rows, err := st.Enrichments.EngagedEmbeddings(ctx, excluded, 10)
+	if err != nil {
+		t.Fatalf("engaged embeddings: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ArtifactID != engaged {
+		t.Errorf("rows = %+v, want only the engaged, non-excluded artifact %s", rows, engaged)
+	}
+}
+
 func TestArtifact_RecordEngagement(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

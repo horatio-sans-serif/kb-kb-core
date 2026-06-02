@@ -900,9 +900,31 @@ no retention/purge. Coalescing bounds bursts, but sustained engagement still
 accumulates rows. A retention policy (keep latest K per `(artifact, kind)`, or
 prune old versions) is deferred.
 
-**Next (§9 part 2 — living profile):** the profile evolves from engagement
-(engaged artifacts' embeddings feed the interest vectors) rather than being purely
-static from `KB_INTERESTS`. Plus recency-decay re-scoring (a periodic sweep) so
-old unengaged artifacts fade.
+## Phase 4 — Stage 2: Living profile (§9 part 2)
 
-**Deferred:** the rerank/chunking items above; cr-sqlite peer sync (Phase 10).
+**Goal:** the relevance profile evolves from engagement, not just the static
+`KB_INTERESTS` (§8.9) — engaging with topic X raises future X artifacts' scores.
+
+**Status: Complete.**
+
+- **Derived, not persisted.** The interest vectors a candidate is matched against
+  are the static `KB_INTERESTS` vectors **plus the embeddings of the recently
+  engaged artifacts** (`relevance.Profile.MatchWith`). No new table or migration —
+  it derives from data already in the store (`last_engaged_at` + the embedding
+  enrichment rows), so it survives restarts for free and stays consistent with the
+  rest of the model.
+- **`store.EnrichmentRepo.EngagedEmbeddings`** returns the latest embedding per
+  live engaged artifact, most-recently-engaged first, capped (`maxEngagedInterests
+= 32`) and excluding the artifact being scored (no self-match). `relsignals`
+  parses them into vectors via the extended `SignalProvider`.
+- **Discounted (`engagedInterestWeight = 0.85`)** so an explicitly configured
+  interest stays authoritative, while a dimension-mismatched engaged vector
+  contributes 0 (harmless). Combined with Stage 1's re-score triggers, engaging an
+  artifact reshapes relevance for the whole corpus on the next score.
+
+**Next:** recency-decay re-scoring (a periodic sweep so old unengaged artifacts
+fade) — the relevance factors are all live now, but only recompute on
+ingest/engage/re-encounter, so time-based decay needs a background pass.
+
+**Deferred:** that decay sweep; enrichment-row retention (above); rerank +
+citation validation; chunk-level embeddings; cr-sqlite peer sync (Phase 10).

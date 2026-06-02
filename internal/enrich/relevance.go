@@ -17,11 +17,13 @@ const relevancePromptVersion = "v1"
 const RelevanceStage = "relevance"
 
 // SignalProvider supplies the cross-artifact signals the relevance stage needs
-// beyond the artifact row: its embedding vector, encounter count, and the weight
-// of its most authoritative source. A store-backed adapter implements it; the
+// beyond the artifact row: its embedding vector, encounter count, the weight of
+// its most authoritative source, and the embeddings of recently-engaged artifacts
+// (the living-profile signal, §8.9). A store-backed adapter implements it; the
 // enricher stays a pure plugin over kb types.
 type SignalProvider interface {
 	Signals(ctx context.Context, artifactID string) (relevance.Signals, error)
+	EngagedVectors(ctx context.Context, excludeID string) ([][]float32, error)
 }
 
 // Relevance scores an artifact against the profile (design §8.9) and writes the
@@ -61,8 +63,15 @@ func (r *Relevance) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 		return kb.EnrichResult{}, fmt.Errorf("relevance: embedding dim %d != profile dim %d (embed model mismatch?)", len(sig.Embedding), d)
 	}
 
+	// Living profile: also match against recently-engaged artifacts' embeddings
+	// (excluding this artifact, so it never matches itself).
+	engaged, err := r.provider.EngagedVectors(ctx, a.ID)
+	if err != nil {
+		return kb.EnrichResult{}, err
+	}
+
 	bd := relevance.Score(relevance.Inputs{
-		Match:        r.profile.Match(sig.Embedding),
+		Match:        r.profile.MatchWith(sig.Embedding, engaged),
 		AgeHours:     r.ageHours(a.LastSeenAt),
 		Encounters:   sig.Encounters,
 		Engaged:      a.LastEngagedAt != nil,

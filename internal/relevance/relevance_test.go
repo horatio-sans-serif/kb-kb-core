@@ -47,6 +47,30 @@ func TestProfile_Match(t *testing.T) {
 	}
 }
 
+func TestProfile_MatchWith_LivingProfile(t *testing.T) {
+	// Static interest {0,1}; the artifact {1,0} is orthogonal → static match 0.
+	p := NewProfile([]WeightedVector{{Vector: []float32{0, 1}, Weight: 1}})
+	if m := p.MatchWith([]float32{1, 0}, nil); m != 0 {
+		t.Errorf("static-only match = %v, want 0", m)
+	}
+	// An engaged vector aligned with the artifact lifts the match (discounted).
+	if m := p.MatchWith([]float32{1, 0}, [][]float32{{1, 0}}); !almost(m, engagedInterestWeight) {
+		t.Errorf("living match = %v, want %v (engaged, weighted)", m, engagedInterestWeight)
+	}
+	// A perfect static interest match still dominates an engaged one.
+	if m := p.MatchWith([]float32{0, 1}, [][]float32{{0, 1}}); !almost(m, 1) {
+		t.Errorf("static perfect match = %v, want 1 (beats the discounted engaged)", m)
+	}
+	// A dimension-mismatched engaged vector contributes nothing (no panic).
+	if m := p.MatchWith([]float32{1, 0}, [][]float32{{1, 0, 0}}); m != 0 {
+		t.Errorf("mismatched-dim engaged = %v, want 0", m)
+	}
+	// Empty everything is still neutral.
+	if m := NewProfile(nil).MatchWith([]float32{1, 0}, nil); !almost(m, 1) {
+		t.Errorf("empty match = %v, want 1 (neutral)", m)
+	}
+}
+
 func TestProfile_Match_RespectsWeight(t *testing.T) {
 	// A down-weighted interest contributes less even when perfectly aligned.
 	p := NewProfile([]WeightedVector{

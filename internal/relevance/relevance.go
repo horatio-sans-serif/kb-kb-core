@@ -98,19 +98,34 @@ func (p *Profile) Dim() int {
 	return len(p.interests[0].Vector)
 }
 
-// Match scores vec against the profile: the maximum weight-scaled cosine over all
-// interests, clamped to [0,1]. With the default equal weights this is simply the
-// best cosine match; a non-unit weight scales an interest's contribution (a weight
-// above 1 is capped by the clamp). An empty profile returns 1 (neutral — no
-// interest bias), so relevance still ranks by the other factors when no interests
-// are set.
-func (p *Profile) Match(vec []float32) float64 {
-	if len(p.interests) == 0 {
+// engagedInterestWeight discounts an engaged-artifact interest vector relative to
+// an explicitly configured one, so configured interests stay authoritative while
+// engagement still shapes relevance (§8.9 living profile).
+const engagedInterestWeight = 0.85
+
+// Match scores vec against the static profile only (no engagement signal). See
+// MatchWith for the living-profile variant.
+func (p *Profile) Match(vec []float32) float64 { return p.MatchWith(vec, nil) }
+
+// MatchWith scores vec against the profile augmented with the embeddings of
+// recently-engaged artifacts — the living-profile signal (§8.9). The result is
+// the maximum of the static interest match (weight-scaled cosine over configured
+// interests) and the discounted cosine to any engaged vector, clamped to [0,1].
+// With neither interests nor engaged vectors it is neutral (1), so relevance
+// still ranks by the other factors. A dimension-mismatched vector contributes 0
+// (Cosine handles it), so a stale-model engaged embedding is harmless.
+func (p *Profile) MatchWith(vec []float32, engaged [][]float32) float64 {
+	if len(p.interests) == 0 && len(engaged) == 0 {
 		return 1
 	}
 	best := 0.0
 	for _, iv := range p.interests {
 		if s := Cosine(vec, iv.Vector) * iv.Weight; s > best {
+			best = s
+		}
+	}
+	for _, e := range engaged {
+		if s := Cosine(vec, e) * engagedInterestWeight; s > best {
 			best = s
 		}
 	}

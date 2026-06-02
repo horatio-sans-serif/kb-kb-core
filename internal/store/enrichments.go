@@ -103,6 +103,46 @@ func (r *EnrichmentRepo) ForEachLatestEmbedding(ctx context.Context, fn func(art
 	return rows.Err()
 }
 
+// EmbeddingRow is one artifact's embedding payload (raw JSON — the caller parses
+// it into kb.EmbeddingPayload).
+type EmbeddingRow struct {
+	ArtifactID string
+	Payload    string
+}
+
+// EngagedEmbeddings returns the latest embedding payload of each live artifact
+// the user has engaged with (last_engaged_at set), most-recently-engaged first,
+// capped at limit and excluding excludeID. These feed the living profile (§8.9):
+// recently-engaged content shapes what scores as relevant. excludeID keeps the
+// artifact currently being scored out of its own profile (no self-match).
+func (r *EnrichmentRepo) EngagedEmbeddings(ctx context.Context, excludeID string, limit int) ([]EmbeddingRow, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT artifact_id, payload FROM (
+		   SELECT e.artifact_id, e.payload, a.last_engaged_at,
+		          ROW_NUMBER() OVER (PARTITION BY e.artifact_id ORDER BY e.created_at DESC, e.id DESC) AS rn
+		   FROM enrichments e
+		   JOIN artifacts a ON a.id = e.artifact_id
+		     AND a.deleted_at IS NULL AND a.last_engaged_at IS NOT NULL
+		   WHERE e.kind = 'embedding' AND e.artifact_id <> ?
+		 ) WHERE rn = 1
+		 ORDER BY last_engaged_at DESC
+		 LIMIT ?`, excludeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("engaged embeddings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []EmbeddingRow
+	for rows.Next() {
+		var er EmbeddingRow
+		if err := rows.Scan(&er.ArtifactID, &er.Payload); err != nil {
+			return nil, fmt.Errorf("scan engaged embedding: %w", err)
+		}
+		out = append(out, er)
+	}
+	return out, rows.Err()
+}
+
 // Get returns the enrichment by id, or ErrNotFound.
 func (r *EnrichmentRepo) Get(ctx context.Context, id string) (*Enrichment, error) {
 	var e Enrichment

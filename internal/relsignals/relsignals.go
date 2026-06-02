@@ -14,11 +14,34 @@ import (
 	"kb/internal/store"
 )
 
+// maxEngagedInterests bounds how many recently-engaged artifacts feed the living
+// profile per scoring — enough to shape relevance, cheap to load.
+const maxEngagedInterests = 32
+
 // Provider gathers an artifact's relevance signals from the store.
 type Provider struct{ st *store.Store }
 
 // New builds a Provider over the store.
 func New(st *store.Store) *Provider { return &Provider{st: st} }
+
+// EngagedVectors returns the embeddings of recently-engaged artifacts (excluding
+// excludeID) for the living profile (§8.9). Corrupt payloads are skipped; the set
+// is bounded by maxEngagedInterests.
+func (p *Provider) EngagedVectors(ctx context.Context, excludeID string) ([][]float32, error) {
+	rows, err := p.st.Enrichments.EngagedEmbeddings(ctx, excludeID, maxEngagedInterests)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]float32, 0, len(rows))
+	for _, r := range rows {
+		var ep kb.EmbeddingPayload
+		if json.Unmarshal([]byte(r.Payload), &ep) != nil || len(ep.Vector) == 0 {
+			continue // skip a corrupt/empty payload rather than fail scoring
+		}
+		out = append(out, ep.Vector)
+	}
+	return out, nil
+}
 
 // Signals reads the artifact's embedding (the latest `embedding` enrichment), its
 // encounter count, and its most-authoritative source weight. A missing embedding

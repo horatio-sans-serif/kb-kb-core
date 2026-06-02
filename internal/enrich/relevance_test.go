@@ -13,12 +13,17 @@ import (
 )
 
 type fakeSignals struct {
-	sig relevance.Signals
-	err error
+	sig     relevance.Signals
+	err     error
+	engaged [][]float32
 }
 
 func (f fakeSignals) Signals(_ context.Context, _ string) (relevance.Signals, error) {
 	return f.sig, f.err
+}
+
+func (f fakeSignals) EngagedVectors(_ context.Context, _ string) ([][]float32, error) {
+	return f.engaged, nil
 }
 
 func fixedClock(t time.Time) func() time.Time { return func() time.Time { return t } }
@@ -64,6 +69,36 @@ func TestRelevance_NoEmbeddingIsNoop(t *testing.T) {
 	}
 	if res.Patch != nil || len(res.Enrichments) != 0 {
 		t.Errorf("no embedding should be a no-op, got %+v", res)
+	}
+}
+
+func TestRelevance_LivingProfileBoostsMatch(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	// Static interest {0,1}; the artifact's embedding {1,0} is orthogonal, so the
+	// static-only match is 0 → score 0.
+	prof := relevance.NewProfile([]relevance.WeightedVector{{Vector: []float32{0, 1}, Weight: 1}})
+	a := &kb.Artifact{ID: "01ART", LastSeenAt: now.Format(time.RFC3339Nano)}
+	sig := relevance.Signals{Embedding: []float32{1, 0}, Encounters: 1, SourceWeight: 1}
+
+	noEngage := NewRelevance(fakeSignals{sig: sig}, prof)
+	noEngage.now = fixedClock(now)
+	res0, err := noEngage.Enrich(context.Background(), a)
+	if err != nil {
+		t.Fatalf("enrich (no engagement): %v", err)
+	}
+	s0 := *res0.Patch.RelevanceScore
+
+	// An engaged artifact aligned with this one lifts its match (and score).
+	withEngage := NewRelevance(fakeSignals{sig: sig, engaged: [][]float32{{1, 0}}}, prof)
+	withEngage.now = fixedClock(now)
+	res1, err := withEngage.Enrich(context.Background(), a)
+	if err != nil {
+		t.Fatalf("enrich (engaged): %v", err)
+	}
+	s1 := *res1.Patch.RelevanceScore
+
+	if !(s1 > s0) {
+		t.Errorf("score with engaged interest = %v, want > static-only %v (living profile)", s1, s0)
 	}
 }
 
