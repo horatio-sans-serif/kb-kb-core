@@ -139,23 +139,28 @@ func checkHTMLContentType(ct string) error {
 
 var (
 	reScriptStyle = regexp.MustCompile(`(?is)<(script|style|noscript)[^>]*>.*?</(?:script|style|noscript)>`)
-	reHead        = regexp.MustCompile(`(?is)<head[^>]*>.*?</head>`)
-	reTitle       = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
-	reBlockClose  = regexp.MustCompile(`(?i)</(p|div|h[1-6]|li|tr|article|section)>|<br\s*/?>`)
-	reTag         = regexp.MustCompile(`(?s)<[^>]+>`)
-	reInlineWS    = regexp.MustCompile(`[ \t\r\f\v]+`)
-	reBlankLines  = regexp.MustCompile(`\n{3,}`)
+	// reHead requires whitespace or an immediate '>' after "head" so it cannot
+	// match <header>; the non-greedy body stops at the first (real) </head>.
+	reHead       = regexp.MustCompile(`(?is)<head(?:\s[^>]*)?>.*?</head>`)
+	reTitle      = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	reBlockClose = regexp.MustCompile(`(?i)</(p|div|h[1-6]|li|tr|article|section)>|<br\s*/?>`)
+	reTag        = regexp.MustCompile(`(?s)<[^>]+>`)
+	reInlineWS   = regexp.MustCompile(`[ \t\r\f\v]+`)
+	reBlankLines = regexp.MustCompile(`\n{3,}`)
 )
 
 // htmlToMarkdown is a basic HTML-to-text extraction: title from <title>, body
 // text with the head section and script/style removed and block tags turned into
-// line breaks. The head is dropped after the title is captured so head content
-// (title, meta) does not leak into — and pollute the tokens of — the body.
+// line breaks. The head and the <title> element are dropped after the title is
+// captured so head content does not leak into — and pollute the tokens of — the
+// body. Stripping <title> explicitly also covers a page that omits </head> (the
+// end tag is optional), which reHead would otherwise miss entirely.
 func htmlToMarkdown(s string) (title, body string) {
 	if m := reTitle.FindStringSubmatch(s); m != nil {
 		title = strings.TrimSpace(html.UnescapeString(reTag.ReplaceAllString(m[1], "")))
 	}
 	s = reHead.ReplaceAllString(s, " ")
+	s = reTitle.ReplaceAllString(s, " ")
 	s = reScriptStyle.ReplaceAllString(s, " ")
 	s = reBlockClose.ReplaceAllString(s, "\n")
 	s = reTag.ReplaceAllString(s, "")

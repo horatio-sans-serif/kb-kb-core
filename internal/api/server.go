@@ -113,9 +113,10 @@ type ingestResponse struct {
 }
 
 const (
-	maxIngestBytes   = 8 << 20 // 8 MiB body cap
-	maxTitleBytes    = 4096
-	maxSourceIDBytes = 64
+	maxIngestBytes      = 8 << 20 // 8 MiB body cap
+	maxTitleBytes       = 4096
+	maxSourceIDBytes    = 64
+	maxSearchQueryBytes = 1024 // bound MATCH/embed work on the authenticated search route
 )
 
 func validPrivacy(t string) bool {
@@ -282,6 +283,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
 		http.Error(w, "q is required", http.StatusBadRequest)
+		return
+	}
+	if len(q) > maxSearchQueryBytes {
+		http.Error(w, "query too long", http.StatusBadRequest)
 		return
 	}
 	k := 0

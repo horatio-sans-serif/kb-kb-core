@@ -80,8 +80,14 @@ func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, conflict string)
 	if err != nil {
 		return nil, fmt.Errorf("upsert artifact: %w", err)
 	}
-	if err := r.reindexFTS(ctx, got.ID); err != nil {
-		return nil, err
+	// Only index on a fresh insert. The ON CONFLICT touch bumps last_seen_at/
+	// updated_at and never changes title/body, so re-indexing it would rewrite an
+	// identical FTS row — and re-sighting is the hot path (Principle 1). The
+	// insert is the only case where created_at == updated_at.
+	if got.CreatedAt == got.UpdatedAt {
+		if err := r.reindexFTS(ctx, got.ID); err != nil {
+			return nil, err
+		}
 	}
 	return got, nil
 }

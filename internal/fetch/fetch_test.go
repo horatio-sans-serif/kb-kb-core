@@ -59,6 +59,48 @@ func TestWebFetcher_HeadDoesNotLeakIntoBody(t *testing.T) {
 	}
 }
 
+func TestWebFetcher_HeadStrippingEdgeCases(t *testing.T) {
+	cases := []struct {
+		name           string
+		html           string
+		wantContains   string
+		wantNotContain string
+	}{
+		{
+			// <header> is body content and must NOT be stripped as if it were <head>.
+			name:         "header element preserved",
+			html:         `<html><head><title>T</title></head><body><header>SiteNav</header><p>Main text</p></body></html>`,
+			wantContains: "SiteNav",
+		},
+		{
+			// </head> omitted (legal): the <title> element strip still removes the leak.
+			name:           "missing head close tag",
+			html:           `<html><head><title>LeakWord</title><body><p>Real text</p></body></html>`,
+			wantContains:   "Real text",
+			wantNotContain: "LeakWord",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				_, _ = io.WriteString(w, tc.html)
+			}))
+			defer srv.Close()
+			got, err := NewWebFetcher(srv.Client()).Extract(context.Background(), kb.ResourceRef{URL: srv.URL})
+			if err != nil {
+				t.Fatalf("extract: %v", err)
+			}
+			if tc.wantContains != "" && !strings.Contains(got.BodyMarkdown, tc.wantContains) {
+				t.Errorf("body %q, want it to contain %q", got.BodyMarkdown, tc.wantContains)
+			}
+			if tc.wantNotContain != "" && strings.Contains(got.BodyMarkdown, tc.wantNotContain) {
+				t.Errorf("body %q, want it NOT to contain %q", got.BodyMarkdown, tc.wantNotContain)
+			}
+		})
+	}
+}
+
 func TestWebFetcher_StripsNoscript(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
