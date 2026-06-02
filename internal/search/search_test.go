@@ -183,3 +183,49 @@ func TestKeyword_EmptyQueryIsError(t *testing.T) {
 		t.Error("an empty query should be an error")
 	}
 }
+
+func seedNoteWithEmbedding(t *testing.T, st *store.Store, hash, title, body string, vec []float32) string {
+	t.Helper()
+	id := seedNote(t, st, hash, title, body)
+	payload, _ := json.Marshal(kb.EmbeddingPayload{Model: "m", Dim: len(vec), Vector: vec})
+	if err := st.Enrichments.Create(context.Background(), &kb.Enrichment{ArtifactID: id, Kind: "embedding", Payload: string(payload), Model: "m", PromptVersion: "v1"}); err != nil {
+		t.Fatalf("seed embedding: %v", err)
+	}
+	return id
+}
+
+func TestHybrid_FusesSemanticAndKeyword(t *testing.T) {
+	st := storetest.New(t)
+	// A: semantic match (embedding aligns with query {1,0}), body lacks the term.
+	// B: keyword match (body has "beta"), embedding orthogonal → floored from semantic.
+	a := seedNoteWithEmbedding(t, st, "h1", "Alpha", "alpha content", []float32{1, 0})
+	b := seedNoteWithEmbedding(t, st, "h2", "Beta", "beta keyword text", []float32{0, 1})
+
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
+	results, err := s.Hybrid(context.Background(), "beta", 10)
+	if err != nil {
+		t.Fatalf("hybrid: %v", err)
+	}
+	got := map[string]bool{}
+	for _, r := range results {
+		got[r.ArtifactID] = true
+	}
+	if !got[a] || !got[b] {
+		t.Errorf("hybrid results = %+v, want both the semantic hit %s and the keyword hit %s", results, a, b)
+	}
+}
+
+func TestHybrid_DegradesToKeywordWhenSemanticUnavailable(t *testing.T) {
+	st := storetest.New(t)
+	b := seedNoteWithEmbedding(t, st, "h2", "Beta", "beta keyword text", []float32{0, 1})
+
+	// local=false → Semantic refuses; Hybrid must still return keyword results.
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", false)
+	results, err := s.Hybrid(context.Background(), "beta", 10)
+	if err != nil {
+		t.Fatalf("hybrid: %v", err)
+	}
+	if len(results) != 1 || results[0].ArtifactID != b {
+		t.Errorf("results = %+v, want the keyword hit %s (semantic degraded)", results, b)
+	}
+}

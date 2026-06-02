@@ -767,7 +767,23 @@ finds the artifact by its fetched body) plus unit coverage.
   so the page title leaked into — and corrupted the tokens of — the body text. It
   now strips `<head>` after extracting the title.
 
-**Next (Phase 3):** hybrid ranking (blend semantic + keyword), then RAG (retrieve
-→ rerank → synthesize with citations). Plus the deferred items: chunk-level
-embeddings (Decision 3 chunking), the living profile and re-scoring (§9), and
-exactly-once enrichment writes.
+## Phase 3 — Stage 3: Hybrid ranking
+
+**Goal:** blend semantic and keyword results into one ranking (design §8.8), the
+default search mode.
+
+**Status: Complete.**
+
+- **Reciprocal Rank Fusion.** `Searcher.Hybrid` pulls `fuseDepth` (50, capped at
+  maxK) candidates from each ranker and fuses by RRF (`1/(rrfK+rank)`, rrfK=60).
+  RRF is rank-based, so it combines the two incomparable score scales (cosine vs
+  bm25) without normalization; ties break by artifact id.
+- **Graceful degradation.** Keyword runs always (local, reliable); semantic is
+  best-effort — if it is unavailable (non-local embed endpoint, or the model is
+  down) Hybrid fuses keyword alone instead of failing.
+- **API.** `mode` now defaults to `hybrid` (was semantic); `semantic` and
+  `keyword` remain explicit options.
+
+**Next (Phase 3):** RAG (retrieve → rerank → synthesize with citations). Plus the
+deferred items: chunk-level embeddings (Decision 3 chunking), the living profile
+and re-scoring (§9), and exactly-once enrichment writes.

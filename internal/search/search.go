@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
 
 	"kb/internal/kb"
@@ -23,7 +24,25 @@ import (
 const (
 	defaultK = 20
 	maxK     = 200
+	// fuseDepth is how many candidates Hybrid pulls from each ranker before
+	// fusing, so an item ranked modestly by one but well by the other still
+	// surfaces. Capped at maxK.
+	fuseDepth = 50
+	// rrfK is the Reciprocal Rank Fusion constant (the standard 60): it damps the
+	// weight of top ranks so a single ranker cannot dominate the blend.
+	rrfK = 60
 )
+
+func clampK(k int) int {
+	switch {
+	case k <= 0:
+		return defaultK
+	case k > maxK:
+		return maxK
+	default:
+		return k
+	}
+}
 
 // ErrRemoteDisallowed is returned when the embed endpoint is not on-device: a
 // search query would otherwise be sent in plaintext to a remote model, leaking
@@ -67,12 +86,7 @@ func (s *Searcher) Semantic(ctx context.Context, query string, k int) ([]Result,
 	if query == "" {
 		return nil, fmt.Errorf("search: empty query")
 	}
-	switch {
-	case k <= 0:
-		k = defaultK
-	case k > maxK:
-		k = maxK
-	}
+	k = clampK(k)
 
 	qvec, err := s.embedder.Embed(ctx, llm.EmbedRequest{Model: s.model, Input: query})
 	if err != nil {
@@ -127,12 +141,7 @@ func (s *Searcher) Keyword(ctx context.Context, query string, k int) ([]Result, 
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("search: empty query")
 	}
-	switch {
-	case k <= 0:
-		k = defaultK
-	case k > maxK:
-		k = maxK
-	}
+	k = clampK(k)
 
 	match := ftsMatch(query)
 	if match == "" {
@@ -147,6 +156,60 @@ func (s *Searcher) Keyword(ctx context.Context, query string, k int) ([]Result, 
 		out[i] = Result{ArtifactID: h.ArtifactID, Score: h.Score}
 	}
 	return out, nil
+}
+
+// Hybrid blends keyword and semantic results with Reciprocal Rank Fusion (design
+// §8.8). Keyword runs always (local, reliable); semantic is best-effort — if it
+// is unavailable (a non-local embed endpoint, or the embed model is down) Hybrid
+// degrades to keyword-only rather than failing, since the keyword half still
+// serves the user. RRF is rank-based, so it fuses the two incomparable score
+// scales (cosine vs bm25) without normalization.
+func (s *Searcher) Hybrid(ctx context.Context, query string, k int) ([]Result, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("search: empty query")
+	}
+	k = clampK(k)
+	depth := k
+	if depth < fuseDepth {
+		depth = fuseDepth
+	}
+	depth = clampK(depth)
+
+	keyword, err := s.Keyword(ctx, query, depth)
+	if err != nil {
+		return nil, err
+	}
+	semantic, err := s.Semantic(ctx, query, depth)
+	if err != nil {
+		semantic = nil // semantic unavailable — fuse keyword alone
+	}
+	return rrf(k, semantic, keyword), nil
+}
+
+// rrf fuses ranked lists by Reciprocal Rank Fusion: each artifact accumulates
+// 1/(rrfK + rank) across the lists it appears in (rank is 0-based). Returns the
+// top-k by fused score, ties broken by artifact id for determinism.
+func rrf(k int, lists ...[]Result) []Result {
+	scores := make(map[string]float64)
+	for _, list := range lists {
+		for rank, r := range list {
+			scores[r.ArtifactID] += 1.0 / float64(rrfK+rank)
+		}
+	}
+	fused := make([]Result, 0, len(scores))
+	for id, sc := range scores {
+		fused = append(fused, Result{ArtifactID: id, Score: sc})
+	}
+	sort.Slice(fused, func(i, j int) bool {
+		if fused[i].Score != fused[j].Score {
+			return fused[i].Score > fused[j].Score
+		}
+		return fused[i].ArtifactID < fused[j].ArtifactID
+	})
+	if len(fused) > k {
+		fused = fused[:k]
+	}
+	return fused
 }
 
 // ftsMatch builds a safe FTS5 MATCH expression from raw user input: each word

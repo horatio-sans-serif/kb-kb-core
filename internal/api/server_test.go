@@ -626,6 +626,11 @@ func (f *fakeSearcher) Keyword(_ context.Context, query string, k int) ([]search
 	return f.results, f.err
 }
 
+func (f *fakeSearcher) Hybrid(_ context.Context, query string, k int) ([]search.Result, error) {
+	f.gotQ, f.gotK, f.gotMode = query, k, "hybrid"
+	return f.results, f.err
+}
+
 func TestSearch_ReturnsRankedResultsWithMetadata(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -672,8 +677,11 @@ func TestSearch_ModeRouting(t *testing.T) {
 	if rec := doGet(h, "/search?q=x&mode=keyword", "tok"); rec.Code != http.StatusOK || fs.gotMode != "keyword" {
 		t.Errorf("mode=keyword: status %d mode %q, want 200/keyword", rec.Code, fs.gotMode)
 	}
-	if rec := doGet(h, "/search?q=x", "tok"); rec.Code != http.StatusOK || fs.gotMode != "semantic" {
-		t.Errorf("default mode: status %d mode %q, want 200/semantic", rec.Code, fs.gotMode)
+	if rec := doGet(h, "/search?q=x&mode=semantic", "tok"); rec.Code != http.StatusOK || fs.gotMode != "semantic" {
+		t.Errorf("mode=semantic: status %d mode %q, want 200/semantic", rec.Code, fs.gotMode)
+	}
+	if rec := doGet(h, "/search?q=x", "tok"); rec.Code != http.StatusOK || fs.gotMode != "hybrid" {
+		t.Errorf("default mode: status %d mode %q, want 200/hybrid", rec.Code, fs.gotMode)
 	}
 	if rec := doGet(h, "/search?q=x&mode=bogus", "tok"); rec.Code != http.StatusBadRequest {
 		t.Errorf("mode=bogus: status %d, want 400", rec.Code)

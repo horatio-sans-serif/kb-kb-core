@@ -32,10 +32,11 @@ type Enqueuer interface {
 
 // Searcher ranks artifacts for a query (satisfied by *search.Searcher). When nil,
 // the /search route reports 503. Semantic is meaning-based (embeds the query);
-// Keyword is full-text (FTS5).
+// Keyword is full-text (FTS5); Hybrid blends both (the default).
 type Searcher interface {
 	Semantic(ctx context.Context, query string, k int) ([]search.Result, error)
 	Keyword(ctx context.Context, query string, k int) ([]search.Result, error)
+	Hybrid(ctx context.Context, query string, k int) ([]search.Result, error)
 }
 
 // Deps are the server's collaborators and settings.
@@ -303,12 +304,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	var hits []search.Result
 	var err error
 	switch mode := r.URL.Query().Get("mode"); mode {
-	case "", "semantic":
+	case "", "hybrid":
+		hits, err = s.deps.Search.Hybrid(ctx, q, k)
+	case "semantic":
 		hits, err = s.deps.Search.Semantic(ctx, q, k)
 	case "keyword":
 		hits, err = s.deps.Search.Keyword(ctx, q, k)
 	default:
-		http.Error(w, "mode must be 'semantic' or 'keyword'", http.StatusBadRequest)
+		http.Error(w, "mode must be 'hybrid', 'semantic', or 'keyword'", http.StatusBadRequest)
 		return
 	}
 	if err != nil {
