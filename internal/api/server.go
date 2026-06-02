@@ -14,6 +14,7 @@ import (
 	"kb/internal/canon"
 	"kb/internal/events"
 	"kb/internal/kb"
+	"kb/internal/rag"
 	"kb/internal/search"
 	"kb/internal/store"
 )
@@ -39,6 +40,12 @@ type Searcher interface {
 	Hybrid(ctx context.Context, query string, k int) ([]search.Result, error)
 }
 
+// Asker answers a question over retrieved artifacts (satisfied by *rag.Engine).
+// When nil, the /ask route reports 503.
+type Asker interface {
+	Answer(ctx context.Context, query string, k int) (rag.Answer, error)
+}
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -49,6 +56,7 @@ type Deps struct {
 	Logger         *slog.Logger
 	Enqueue        Enqueuer
 	Search         Searcher
+	Ask            Asker
 }
 
 // Server wires the HTTP handlers.
@@ -75,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /events", s.requireAuth(SSEHandler(s.deps.Bus)))
 	mux.Handle("POST /ingest", s.requireAuth(http.HandlerFunc(s.handleIngest)))
 	mux.Handle("GET /search", s.requireAuth(http.HandlerFunc(s.handleSearch)))
+	mux.Handle("GET /ask", s.requireAuth(http.HandlerFunc(s.handleAsk)))
 	return mux
 }
 
@@ -336,6 +345,43 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		out.Results = append(out.Results, res)
 	}
 	s.writeJSON(w, http.StatusOK, out)
+}
+
+// handleAsk answers a question (RAG) over the user's artifacts with citations.
+func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Ask == nil {
+		http.Error(w, "question answering not configured", http.StatusServiceUnavailable)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "q is required", http.StatusBadRequest)
+		return
+	}
+	if len(q) > maxSearchQueryBytes {
+		http.Error(w, "query too long", http.StatusBadRequest)
+		return
+	}
+	k := 0
+	if ks := r.URL.Query().Get("k"); ks != "" {
+		n, err := strconv.Atoi(ks)
+		if err != nil || n < 0 {
+			http.Error(w, "k must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		k = n
+	}
+
+	ans, err := s.deps.Ask.Answer(r.Context(), q, k)
+	if err != nil {
+		if errors.Is(err, rag.ErrLocalRequired) {
+			http.Error(w, "question answering requires an on-device LLM endpoint", http.StatusServiceUnavailable)
+			return
+		}
+		s.serverError(w, "ask", err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, ans)
 }
 
 func (s *Server) serverError(w http.ResponseWriter, what string, err error) {

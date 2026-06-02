@@ -789,6 +789,32 @@ default search mode.
   unavailable (non-local endpoint / model down); a cancelled or expired context
   propagates as an error rather than fabricating a degraded `200`.
 
-**Next (Phase 3):** RAG (retrieve → rerank → synthesize with citations). Plus the
-deferred items: chunk-level embeddings (Decision 3 chunking), the living profile
-and re-scoring (§9), and exactly-once enrichment writes.
+## Phase 3 — Stage 4: RAG (question answering)
+
+**Goal:** answer a question over the knowledge base, grounded on retrieved
+artifacts, with mandatory citations back to sources (design §8.8).
+
+**Status: Complete.** Verified end to end (ingest → `GET /ask` returns a
+synthesized answer citing the ingested artifact).
+
+- **`internal/rag`.** `Engine.Answer` retrieves the top-k via the hybrid
+  `Retriever`, loads each artifact's body, builds a numbered-source prompt
+  (rune-safe excerpts), and has the local LLM synthesize an answer instructed to
+  cite every claim inline as `[n]`. Returns `{query, answer, sources[]}` where the
+  source list position is the cited `[n]`. No relevant sources → a stock answer,
+  no model call.
+- **Privacy: on-device required.** Synthesis sends artifact bodies _and_ the
+  question to the model — exactly what the gate keeps off a remote endpoint
+  (§8.17). A non-local endpoint is refused (`ErrLocalRequired` → 503) rather than
+  partially answered, since silently dropping sensitive sources would mislead.
+- **API.** `GET /ask?q=...&k=...` (bearer-auth) returns the answer + sources; 400
+  on empty/too-long query, 503 when unconfigured or non-local. Reuses the
+  generation model (`KB_SUMMARIZE_MODEL`).
+
+This completes Phase 3 retrieval (semantic, keyword, hybrid, RAG).
+
+**Deferred (future phases):** "rerank" between retrieve and synthesize (a
+cross-encoder/LLM rerank pass — currently the hybrid order is used directly);
+chunk-level embeddings (Decision 3 chunking) for finer RAG grounding; the living
+profile and re-scoring (§9); exactly-once enrichment writes; cr-sqlite peer sync
+(Phase 10).

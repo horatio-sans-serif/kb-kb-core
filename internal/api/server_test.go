@@ -18,6 +18,7 @@ import (
 	"kb/internal/jobs"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
+	"kb/internal/rag"
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
 	"kb/internal/search"
@@ -475,7 +476,8 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	p.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	p.RegisterHandlers(st, runner, bus)
 	searcher := search.NewSearcher(st, model, "fake-embed", true)
-	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p, Search: searcher})
+	asker := rag.NewEngine(searcher, st, model, "fake-model", true)
+	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p, Search: searcher, Ask: asker})
 	h := srv.Handler()
 
 	ctx := context.Background()
@@ -544,6 +546,24 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	}
 	if len(kr.Results) != 1 || kr.Results[0].ArtifactID != a.ID {
 		t.Errorf("keyword results = %+v, want the ingested artifact %s (body was indexed)", kr.Results, a.ID)
+	}
+
+	// RAG answers over the retrieved artifact, citing it as a source.
+	arec := doGet(h, "/ask?q=what%20is%20this", "tok")
+	if arec.Code != http.StatusOK {
+		t.Fatalf("ask status = %d: %s", arec.Code, arec.Body.String())
+	}
+	var ar struct {
+		Answer  string `json:"answer"`
+		Sources []struct {
+			ArtifactID string `json:"artifact_id"`
+		} `json:"sources"`
+	}
+	if err := json.Unmarshal(arec.Body.Bytes(), &ar); err != nil {
+		t.Fatalf("decode ask: %v", err)
+	}
+	if ar.Answer == "" || len(ar.Sources) != 1 || ar.Sources[0].ArtifactID != a.ID {
+		t.Errorf("ask = %+v, want a synthesized answer citing the ingested artifact %s", ar, a.ID)
 	}
 }
 
@@ -685,6 +705,68 @@ func TestSearch_ModeRouting(t *testing.T) {
 	}
 	if rec := doGet(h, "/search?q=x&mode=bogus", "tok"); rec.Code != http.StatusBadRequest {
 		t.Errorf("mode=bogus: status %d, want 400", rec.Code)
+	}
+}
+
+type fakeAsker struct {
+	ans rag.Answer
+	err error
+}
+
+func (f fakeAsker) Answer(_ context.Context, _ string, _ int) (rag.Answer, error) {
+	return f.ans, f.err
+}
+
+func TestAsk_ReturnsAnswer(t *testing.T) {
+	st := newStore(t)
+	asker := fakeAsker{ans: rag.Answer{
+		Query:   "what is tokio",
+		Answer:  "Tokio is an async runtime [1].",
+		Sources: []rag.Source{{ArtifactID: "01ABC", Title: "Rust async", Score: 0.9}},
+	}}
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Ask: asker}).Handler()
+
+	rec := doGet(h, "/ask?q=what%20is%20tokio", "tok")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Answer  string `json:"answer"`
+		Sources []struct {
+			ArtifactID string `json:"artifact_id"`
+			Title      string `json:"title"`
+		} `json:"sources"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Answer != "Tokio is an async runtime [1]." || len(resp.Sources) != 1 || resp.Sources[0].Title != "Rust async" {
+		t.Errorf("response = %+v, want the synthesized answer + cited source", resp)
+	}
+}
+
+func TestAsk_NotConfiguredIs503(t *testing.T) {
+	st := newStore(t)
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()}).Handler() // no Ask
+	if rec := doGet(h, "/ask?q=x", "tok"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when RAG is not configured", rec.Code)
+	}
+}
+
+func TestAsk_LocalRequiredIs503(t *testing.T) {
+	st := newStore(t)
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(),
+		Ask: fakeAsker{err: rag.ErrLocalRequired}}).Handler()
+	if rec := doGet(h, "/ask?q=x", "tok"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when the LLM endpoint is not on-device", rec.Code)
+	}
+}
+
+func TestAsk_MissingQueryIs400(t *testing.T) {
+	st := newStore(t)
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Ask: fakeAsker{}}).Handler()
+	if rec := doGet(h, "/ask?q=", "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an empty query", rec.Code)
 	}
 }
 

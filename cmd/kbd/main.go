@@ -24,6 +24,7 @@ import (
 	"kb/internal/jobs"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
+	"kb/internal/rag"
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
 	"kb/internal/search"
@@ -168,6 +169,10 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	runErr := make(chan error, 1)
 	go func() { runErr <- runner.Run(ctx, wake, 30*time.Second) }()
 
+	// Retrieval: hybrid search, and RAG question-answering grounded on it. Both
+	// take the daemon's locality so the privacy gate extends to query embedding
+	// (search) and answer synthesis (rag).
+	searcher := search.NewSearcher(st, llmClient, cfg.EmbedModel, cfg.OllamaIsLocal)
 	srv := api.NewServer(api.Deps{
 		Store:          st,
 		Bus:            bus,
@@ -176,7 +181,8 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Build:          api.BuildInfo{Version: Version},
 		Logger:         logger,
 		Enqueue:        enrichment,
-		Search:         search.NewSearcher(st, llmClient, cfg.EmbedModel, cfg.OllamaIsLocal),
+		Search:         searcher,
+		Ask:            rag.NewEngine(searcher, st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal),
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),
