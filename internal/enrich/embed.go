@@ -9,6 +9,7 @@ import (
 
 	"kb/internal/kb"
 	"kb/internal/llm"
+	"kb/internal/textutil"
 )
 
 const (
@@ -53,7 +54,7 @@ func (e *Embed) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult, er
 	if body == "" {
 		return kb.EnrichResult{}, nil // nothing to embed yet
 	}
-	body = truncateBytes(body, maxEmbedInputBytes)
+	body = textutil.TruncateBytes(body, maxEmbedInputBytes)
 
 	vec, err := e.embedder.Embed(ctx, llm.EmbedRequest{Model: e.model, Input: body})
 	if err != nil {

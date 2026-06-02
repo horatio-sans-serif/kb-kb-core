@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"kb/internal/kb"
 	"kb/internal/llm"
+	"kb/internal/textutil"
 )
 
 const (
@@ -81,7 +81,7 @@ func (s *Summarize) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 	if body == "" {
 		return kb.EnrichResult{}, nil // nothing to summarize yet (e.g. fetch produced no body)
 	}
-	body = truncateBytes(body, maxSummarizeInputBytes)
+	body = textutil.TruncateBytes(body, maxSummarizeInputBytes)
 
 	out, err := s.generate(ctx, a.Title, body)
 	if err != nil {
@@ -150,25 +150,6 @@ func normalizeTags(tags []string) []string {
 		}
 	}
 	return out
-}
-
-// truncateBytes caps s to at most n bytes without splitting a UTF-8 rune: it
-// trims back to the last rune boundary at or before n, so the model never
-// receives a corrupted trailing character.
-func truncateBytes(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	s = s[:n]
-	for len(s) > 0 && !utf8.RuneStart(s[len(s)-1]) {
-		s = s[:len(s)-1]
-	}
-	// The kept prefix may still end in a lone continuation-less start byte of a
-	// multi-byte rune; drop it if it no longer decodes cleanly.
-	if r, size := utf8.DecodeLastRuneInString(s); r == utf8.RuneError && size <= 1 {
-		s = s[:len(s)-size]
-	}
-	return s
 }
 
 // jsonString marshals v to a JSON string; the simple maps used here cannot fail

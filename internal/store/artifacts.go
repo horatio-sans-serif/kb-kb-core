@@ -168,6 +168,20 @@ func (r *ArtifactRepo) Get(ctx context.Context, id string) (*Artifact, error) {
 	return a, nil
 }
 
+// GetLive is Get scoped to live (non-tombstoned) rows: it returns ErrNotFound for
+// a soft-deleted artifact. Retrieval paths (search/RAG) use it so a delete that
+// races ranking-then-load cannot resurface a tombstoned artifact's content.
+func (r *ArtifactRepo) GetLive(ctx context.Context, id string) (*Artifact, error) {
+	a, err := scanArtifact(r.rq.QueryRowContext(ctx, artifactSelect+` WHERE id = ? AND deleted_at IS NULL`, id))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("get live artifact %q: %w", id, ErrNotFound)
+		}
+		return nil, fmt.Errorf("get live artifact %q: %w", id, err)
+	}
+	return a, nil
+}
+
 // List returns live (non-tombstoned) artifacts, ordered by id (ULIDs are
 // monotonic by creation time and replica-safe, unlike string timestamps).
 func (r *ArtifactRepo) List(ctx context.Context) ([]*Artifact, error) {

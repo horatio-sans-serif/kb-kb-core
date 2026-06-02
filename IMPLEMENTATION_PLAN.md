@@ -811,10 +811,26 @@ synthesized answer citing the ingested artifact).
   on empty/too-long query, 503 when unconfigured or non-local. Reuses the
   generation model (`KB_SUMMARIZE_MODEL`).
 
+**Review fixes applied (Phase 3 Stage 4):**
+
+- **Tombstone leak closed.** Retrieval now loads sources via `Artifacts.GetLive`
+  (a `deleted_at IS NULL`-scoped accessor), so a delete racing ranking can't feed
+  a soft-deleted artifact's body into the prompt — the highest-value leak surface.
+- **Empty model answer is an error** (was a misleading `200` with sources and no
+  text), matching `summarize`'s empty-output guard.
+- **Prompt-injection hardening.** Source bodies are fenced and the model is told
+  to treat them as data, not instructions (a mitigation, not a guarantee).
+- **Citations are instructed, not verified** — documented honestly; validation is
+  deferred to rerank.
+- **Refactors.** Extracted the duplicated rune-safe truncation into
+  `internal/textutil.TruncateBytes` (used by summarize/embed/rag); extracted the
+  shared `?q`/`?k` parsing into `parseQueryAndK`; renamed `maxSearchQueryBytes` →
+  `maxQueryBytes`; fixed the stale `Handler` auth doc.
+
 This completes Phase 3 retrieval (semantic, keyword, hybrid, RAG).
 
 **Deferred (future phases):** "rerank" between retrieve and synthesize (a
-cross-encoder/LLM rerank pass — currently the hybrid order is used directly);
-chunk-level embeddings (Decision 3 chunking) for finer RAG grounding; the living
-profile and re-scoring (§9); exactly-once enrichment writes; cr-sqlite peer sync
-(Phase 10).
+cross-encoder/LLM rerank pass with citation validation — currently the hybrid
+order is used directly); chunk-level embeddings (Decision 3 chunking) for finer
+RAG grounding; the living profile and re-scoring (§9); exactly-once enrichment
+writes; cr-sqlite peer sync (Phase 10).

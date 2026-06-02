@@ -773,7 +773,7 @@ func TestAsk_MissingQueryIs400(t *testing.T) {
 func TestSearch_TooLongQueryIs400(t *testing.T) {
 	st := newStore(t)
 	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Search: &fakeSearcher{}})
-	long := strings.Repeat("a", maxSearchQueryBytes+1)
+	long := strings.Repeat("a", maxQueryBytes+1)
 	if rec := doGet(srv.Handler(), "/search?q="+long, "tok"); rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for an over-long query", rec.Code)
 	}

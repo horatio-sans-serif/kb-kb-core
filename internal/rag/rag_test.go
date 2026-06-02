@@ -64,9 +64,40 @@ func TestAnswer_SynthesizesWithSources(t *testing.T) {
 	if len(ans.Sources) != 2 || ans.Sources[0].ArtifactID != a1 || ans.Sources[0].Title != "Rust async" {
 		t.Errorf("sources = %+v, want both loaded with metadata, a1 first", ans.Sources)
 	}
-	// The prompt must contain the numbered source bodies for grounding.
-	if !strings.Contains(llmc.gotPromt, "[1]") || !strings.Contains(llmc.gotPromt, "Tokio is an async runtime") {
+	// The prompt must contain the numbered, fenced source bodies for grounding.
+	if !strings.Contains(llmc.gotPromt, "SOURCE 1") || !strings.Contains(llmc.gotPromt, "Tokio is an async runtime") {
 		t.Errorf("prompt missing numbered source content: %q", llmc.gotPromt)
+	}
+}
+
+func TestAnswer_EmptyModelAnswerIsError(t *testing.T) {
+	st := storetest.New(t)
+	a1 := seed(t, st, "h1", "T", "some body text")
+	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}}}, st, &fakeLLM{resp: "   "}, "model", true)
+	if _, err := e.Answer(context.Background(), "q", 5); err == nil {
+		t.Error("an empty/whitespace model answer must be an error, not a 200 with sources and no text")
+	}
+}
+
+func TestAnswer_SkipsTombstonedSource(t *testing.T) {
+	st := storetest.New(t)
+	a1 := seed(t, st, "h1", "Live", "live body")
+	gone := seed(t, st, "h2", "Gone", "deleted body")
+	if err := st.Artifacts.SoftDelete(context.Background(), gone); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	llmc := &fakeLLM{resp: "answer [1]"}
+	// Both ranked (a stale ranking), but the tombstoned one must not reach the prompt.
+	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}, {ArtifactID: gone}}}, st, llmc, "model", true)
+	ans, err := e.Answer(context.Background(), "q", 5)
+	if err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	if len(ans.Sources) != 1 || ans.Sources[0].ArtifactID != a1 {
+		t.Errorf("sources = %+v, want only the live artifact %s", ans.Sources, a1)
+	}
+	if strings.Contains(llmc.gotPromt, "deleted body") {
+		t.Errorf("tombstoned body leaked into the prompt: %q", llmc.gotPromt)
 	}
 }
 

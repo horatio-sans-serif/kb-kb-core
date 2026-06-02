@@ -71,8 +71,8 @@ func NewServer(d Deps) *Server {
 	return &Server{deps: d}
 }
 
-// Handler builds the routed, auth-wrapped HTTP handler. /healthz is public;
-// /events and /ingest require a bearer token.
+// Handler builds the routed, auth-wrapped HTTP handler. /healthz is public; all
+// other routes (/events, /ingest, /search, /ask) require a bearer token.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -123,10 +123,10 @@ type ingestResponse struct {
 }
 
 const (
-	maxIngestBytes      = 8 << 20 // 8 MiB body cap
-	maxTitleBytes       = 4096
-	maxSourceIDBytes    = 64
-	maxSearchQueryBytes = 1024 // bound MATCH/embed work on the authenticated search route
+	maxIngestBytes   = 8 << 20 // 8 MiB body cap
+	maxTitleBytes    = 4096
+	maxSourceIDBytes = 64
+	maxQueryBytes    = 1024 // bound MATCH/embed/synthesis work on the /search and /ask routes
 )
 
 func validPrivacy(t string) bool {
@@ -285,28 +285,37 @@ type searchResponse struct {
 
 // handleSearch ranks artifacts by semantic similarity to ?q and attaches each
 // hit's title/url for display. ?k bounds the result count (the searcher caps it).
+// parseQueryAndK reads and validates the shared ?q and ?k params for the search
+// and ask routes, writing the 400 itself and returning ok=false on bad input.
+func parseQueryAndK(w http.ResponseWriter, r *http.Request) (q string, k int, ok bool) {
+	q = strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "q is required", http.StatusBadRequest)
+		return "", 0, false
+	}
+	if len(q) > maxQueryBytes {
+		http.Error(w, "query too long", http.StatusBadRequest)
+		return "", 0, false
+	}
+	if ks := r.URL.Query().Get("k"); ks != "" {
+		n, err := strconv.Atoi(ks)
+		if err != nil || n < 0 {
+			http.Error(w, "k must be a non-negative integer", http.StatusBadRequest)
+			return "", 0, false
+		}
+		k = n
+	}
+	return q, k, true
+}
+
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Search == nil {
 		http.Error(w, "search not configured", http.StatusServiceUnavailable)
 		return
 	}
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if q == "" {
-		http.Error(w, "q is required", http.StatusBadRequest)
+	q, k, ok := parseQueryAndK(w, r)
+	if !ok {
 		return
-	}
-	if len(q) > maxSearchQueryBytes {
-		http.Error(w, "query too long", http.StatusBadRequest)
-		return
-	}
-	k := 0
-	if ks := r.URL.Query().Get("k"); ks != "" {
-		n, err := strconv.Atoi(ks)
-		if err != nil || n < 0 {
-			http.Error(w, "k must be a non-negative integer", http.StatusBadRequest)
-			return
-		}
-		k = n
 	}
 
 	ctx := r.Context()
@@ -353,23 +362,9 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "question answering not configured", http.StatusServiceUnavailable)
 		return
 	}
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if q == "" {
-		http.Error(w, "q is required", http.StatusBadRequest)
+	q, k, ok := parseQueryAndK(w, r)
+	if !ok {
 		return
-	}
-	if len(q) > maxSearchQueryBytes {
-		http.Error(w, "query too long", http.StatusBadRequest)
-		return
-	}
-	k := 0
-	if ks := r.URL.Query().Get("k"); ks != "" {
-		n, err := strconv.Atoi(ks)
-		if err != nil || n < 0 {
-			http.Error(w, "k must be a non-negative integer", http.StatusBadRequest)
-			return
-		}
-		k = n
 	}
 
 	ans, err := s.deps.Ask.Answer(r.Context(), q, k)
