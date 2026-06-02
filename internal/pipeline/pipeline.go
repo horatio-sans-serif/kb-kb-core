@@ -155,22 +155,29 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 		if err != nil {
 			return fmt.Errorf("pipeline: load artifact for %s: %w", e.Name(), err)
 		}
+
+		// Resolve the stage's effects. The slow work (fetch, LLM) happens here,
+		// OUTSIDE any transaction, so it never holds the single-writer connection.
+		var res kb.EnrichResult
 		if !e.PrivacyOK(a.PrivacyTier) {
 			// Privacy gate: this enricher may not process this tier. Record the
-			// skip as an enrichment row so the gap is auditable, then complete
-			// the job — a privacy skip is a deliberate no-op, not a failure, so
-			// it must not fail the artifact.
-			return st.Enrichments.Create(ctx, &store.Enrichment{
+			// skip as an auditable enrichment row — a deliberate no-op, not a
+			// failure, so it must not fail the artifact.
+			res = kb.EnrichResult{Enrichments: []kb.Enrichment{{
 				ArtifactID:    a.ID,
 				Kind:          "skipped",
 				Payload:       skippedPayload(e.Name(), a.PrivacyTier),
 				PromptVersion: "1",
-			})
-		}
-		res, err := e.Enrich(ctx, a)
-		if err != nil {
+			}}}
+		} else if res, err = e.Enrich(ctx, a); err != nil {
 			return err
 		}
+
+		// Commit the effects and the job's completion in ONE short transaction, so
+		// they are atomic: a crash before commit re-runs the stage cleanly (nothing
+		// was written), and a commit lands the rows together with the 'done' status
+		// so a reclaim can never re-run a stage that already wrote — exactly-once
+		// enrichment writes. (The runner's own MarkDone afterward is then a no-op.)
 		return st.Tx(ctx, func(tx *store.Store) error {
 			for i := range res.Enrichments {
 				if err := tx.Enrichments.Create(ctx, &res.Enrichments[i]); err != nil {
@@ -182,7 +189,7 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 					return err
 				}
 			}
-			return nil
+			return tx.Jobs.MarkDone(ctx, job.ID)
 		})
 	}
 }

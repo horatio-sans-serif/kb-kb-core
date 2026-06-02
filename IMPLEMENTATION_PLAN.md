@@ -607,12 +607,13 @@ could split a UTF-8 rune); enforceable on-device privacy (above); assert Ollama'
 `done` flag (a partial 200 body is not a complete answer); bound individual tag
 length.
 
-**Known limitation — at-least-once enrichment writes.** A stage writes its rows
-and is then marked done in two steps; a crash between them re-runs the stage on
-restart and writes duplicate enrichment rows. This affects every enricher (fetch
-included), not just summarize. A later stage will make it exactly-once — either an
-idempotent upsert keyed on `(artifact_id, kind, prompt_version)` or folding the
-`MarkDone` write into the enrichment transaction. Out of scope here.
+**~~Known limitation — at-least-once enrichment writes.~~ Resolved (Phase 3
+Stage 5).** The pipeline handler now folds the job's `MarkDone` into the same
+short transaction as its enrichment/patch writes, after the slow Enrich work
+completes outside any transaction. Effects and completion are atomic: a crash
+before commit re-runs the stage cleanly (nothing written); a commit lands the
+rows with the `done` status, and a `done` job is never reclaimed — so a re-run
+can't duplicate writes. Exactly-once.
 
 ## Phase 2 — Stage 3.1: Artifact embeddings
 
@@ -829,8 +830,27 @@ synthesized answer citing the ingested artifact).
 
 This completes Phase 3 retrieval (semantic, keyword, hybrid, RAG).
 
-**Deferred (future phases):** "rerank" between retrieve and synthesize (a
-cross-encoder/LLM rerank pass with citation validation — currently the hybrid
-order is used directly); chunk-level embeddings (Decision 3 chunking) for finer
-RAG grounding; the living profile and re-scoring (§9); exactly-once enrichment
-writes; cr-sqlite peer sync (Phase 10).
+## Phase 3 — Stage 5: Exactly-once enrichment writes
+
+**Goal:** a crash can no longer duplicate a stage's enrichment rows (the
+at-least-once limitation noted in Stage 2.x).
+
+**Status: Complete.** The pipeline handler does its slow work (fetch/LLM) outside
+any transaction, then commits the stage's effects (enrichment rows + artifact
+patch) **and** the job's `MarkDone` in one short transaction. Atomicity makes it
+exactly-once: a crash before commit re-runs the stage cleanly (nothing was
+written); a commit lands the rows with the `done` status, and a `done` job is
+never reclaimed, so a re-run cannot duplicate writes. The runner's own subsequent
+`MarkDone` becomes a harmless no-op.
+
+**Residual:** the finalize hook (which sets the artifact's terminal `ready`/
+`failed` status) still runs as a post-completion notification, so a crash in the
+narrow window between a job's commit and its finalize can leave an artifact in
+`enriching` with all jobs terminal. A startup reconciliation sweep (finalize any
+`enriching` artifact whose jobs are all terminal) is the fix — deferred.
+
+**Deferred (future phases):** that reconciliation sweep; "rerank" between retrieve
+and synthesize (a cross-encoder/LLM rerank pass with citation validation —
+currently the hybrid order is used directly); chunk-level embeddings (Decision 3
+chunking) for finer RAG grounding; the living profile and re-scoring (§9);
+cr-sqlite peer sync (Phase 10).

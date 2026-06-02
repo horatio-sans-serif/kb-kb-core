@@ -202,6 +202,51 @@ func TestPipeline_StageFailure_FinalizesArtifactFailed(t *testing.T) {
 	}
 }
 
+func TestPipeline_HandlerCompletesAtomically(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+	e := &fakeEnricher{name: "a"}
+	p := New()
+	p.Register(e)
+
+	art, err := st.Artifacts.UpsertByCanonical(ctx, &kb.Artifact{Type: kb.Note, Title: "x"})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if err := p.Enqueue(ctx, st, art.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Claim the stage's job (→ running) and run the handler directly — no runner,
+	// so nothing but the handler's own transaction can mark it done.
+	job, err := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
+	if err != nil || job == nil {
+		t.Fatalf("claim: job=%v err=%v", job, err)
+	}
+	if err := p.handler(st, e)(ctx, *job); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	// The job is done — committed atomically with the enrichment, without the
+	// runner's separate MarkDone.
+	got, err := st.Jobs.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if got.Status != "done" {
+		t.Errorf("job status = %q, want done (handler marks done in its effect tx)", got.Status)
+	}
+	if ens, _ := st.Enrichments.ListForArtifact(ctx, art.ID); len(ens) != 1 {
+		t.Errorf("enrichments = %d, want 1", len(ens))
+	}
+
+	// A reclaim cannot resurrect a done job, so the stage is never re-run and its
+	// enrichment can never be duplicated (exactly-once).
+	if n, err := st.Jobs.ReclaimStuck(ctx, store.FormatTime(time.Now())); err != nil || n != 0 {
+		t.Errorf("reclaimed %d (err %v), want 0 — a done job must not be re-run", n, err)
+	}
+}
+
 func TestPipeline_PrivacyGate(t *testing.T) {
 	st := storetest.New(t)
 	ctx := context.Background()
