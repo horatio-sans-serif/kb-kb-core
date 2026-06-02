@@ -188,6 +188,12 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Enqueue:        enrichment,
 		Search:         searcher,
 		Ask:            rag.NewEngine(searcher, st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal),
+		// Re-score = re-run the relevance stage standalone (no deps; the embedding
+		// already exists). Triggered by a fresh encounter or an engagement (§9).
+		Rescore: func(ctx context.Context, tx *store.Store, artifactID string) error {
+			_, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: enrich.RelevanceStage, ArtifactID: &artifactID})
+			return err
+		},
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

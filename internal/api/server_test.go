@@ -618,6 +618,137 @@ func doIngest(h http.Handler, body, token string) *httptest.ResponseRecorder {
 	return rec
 }
 
+func doPost(h http.Handler, path, body, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// countingRescore records re-score requests and enqueues a relevance job.
+type countingRescore struct{ n int }
+
+func (c *countingRescore) fn(ctx context.Context, tx *store.Store, artifactID string) error {
+	c.n++
+	_, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "relevance", ArtifactID: &artifactID})
+	return err
+}
+
+func TestEngage_RecordsAndRescores(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	h := "h"
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{Type: "note", BodyMarkdown: "b", ContentHash: &h})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+
+	bus := events.NewBus()
+	sub, cancel := bus.Subscribe()
+	defer cancel()
+	rs := &countingRescore{}
+	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", Logger: discardLogger(), Rescore: rs.fn})
+
+	rec := doPost(srv.Handler(), "/engage", `{"artifact_id":"`+a.ID+`"}`, "tok")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204: %s", rec.Code, rec.Body.String())
+	}
+	if got, _ := st.Artifacts.Get(ctx, a.ID); got.LastEngagedAt == nil {
+		t.Error("engagement not recorded")
+	}
+	if rs.n != 1 {
+		t.Errorf("rescore called %d times, want 1", rs.n)
+	}
+	// A relevance re-score job was enqueued in the same transaction.
+	job, _ := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
+	if job == nil || job.Type != "relevance" || job.ArtifactID == nil || *job.ArtifactID != a.ID {
+		t.Errorf("expected a relevance re-score job for %s, got %+v", a.ID, job)
+	}
+	// engagement.recorded published.
+	select {
+	case e := <-sub:
+		if e.Type != events.EngagementRecorded {
+			t.Errorf("event = %q, want engagement.recorded", e.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no engagement.recorded event")
+	}
+}
+
+func TestEngage_BoostsRelevanceEndToEnd(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+	bus := events.NewBus()
+	runner := jobs.NewRunner(st, jobs.WithLogger(discardLogger()))
+
+	model := staticLLM{resp: `{"summary":"S","tags":["t"],"critical_analysis":"C"}`} // also Embed → {0.1,0.2,0.3}
+	profile := relevance.NewProfile([]relevance.WeightedVector{{Vector: []float32{0.1, 0.2, 0.3}, Weight: 1}})
+	p := pipeline.New()
+	p.Register(enrich.NewFetch(fetch.NewWebFetcher(&http.Client{}))) // unused for a note artifact
+	p.Register(enrich.NewSummarize(model, "m", true))
+	p.Register(enrich.NewEmbed(model, "m", true))
+	p.Register(enrich.NewRelevance(relsignals.New(st), profile))
+	p.RegisterHandlers(st, runner, bus)
+
+	rescore := func(ctx context.Context, tx *store.Store, id string) error {
+		_, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "relevance", ArtifactID: &id})
+		return err
+	}
+	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal",
+		Logger: discardLogger(), Enqueue: p, Rescore: rescore})
+	h := srv.Handler()
+
+	src := &store.Source{Kind: "PUSH", Connector: "x"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	// Ingest a note, run the pipeline → initial relevance score (not engaged).
+	if rec := doIngest(h, `{"source_id":"`+src.ID+`","body":"hello world"}`, "tok"); rec.Code != http.StatusOK {
+		t.Fatalf("ingest: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := runner.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	arts, _ := st.Artifacts.List(ctx)
+	if len(arts) != 1 || arts[0].RelevanceScore == nil {
+		t.Fatalf("artifacts = %v, want one scored", arts)
+	}
+	id := arts[0].ID
+	s1 := *arts[0].RelevanceScore
+
+	// Engage → re-score job enqueued → drain → score should rise (engagement boost).
+	if rec := doPost(h, "/engage", `{"artifact_id":"`+id+`"}`, "tok"); rec.Code != http.StatusNoContent {
+		t.Fatalf("engage: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, err := runner.Drain(ctx); err != nil {
+		t.Fatalf("drain after engage: %v", err)
+	}
+	got, _ := st.Artifacts.Get(ctx, id)
+	if got.RelevanceScore == nil || *got.RelevanceScore <= s1 {
+		t.Errorf("relevance after engagement = %v, want > %v (engagement boost via re-score)", got.RelevanceScore, s1)
+	}
+}
+
+func TestEngage_UnknownArtifactIs404(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Rescore: (&countingRescore{}).fn})
+	if rec := doPost(srv.Handler(), "/engage", `{"artifact_id":"01NONEXISTENT"}`, "tok"); rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for an unknown artifact", rec.Code)
+	}
+}
+
+func TestEngage_MissingArtifactIDIs400(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()})
+	if rec := doPost(srv.Handler(), "/engage", `{}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a missing artifact_id", rec.Code)
+	}
+}
+
 func doGet(h http.Handler, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	if token != "" {

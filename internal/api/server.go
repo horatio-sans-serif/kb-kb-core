@@ -46,6 +46,13 @@ type Asker interface {
 	Answer(ctx context.Context, query string, k int) (rag.Answer, error)
 }
 
+// RescoreFunc re-enqueues an artifact's relevance scoring within the caller's
+// transaction — invoked when a fresh encounter or an engagement changes the
+// artifact's relevance inputs (§9). The composition root supplies it (it enqueues
+// the relevance stage standalone). When nil, those events update the record but
+// do not trigger a re-score.
+type RescoreFunc func(ctx context.Context, tx *store.Store, artifactID string) error
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -57,6 +64,7 @@ type Deps struct {
 	Enqueue        Enqueuer
 	Search         Searcher
 	Ask            Asker
+	Rescore        RescoreFunc
 }
 
 // Server wires the HTTP handlers.
@@ -82,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	// compare). Header auth is correct for Phase 0.
 	mux.Handle("GET /events", s.requireAuth(SSEHandler(s.deps.Bus)))
 	mux.Handle("POST /ingest", s.requireAuth(http.HandlerFunc(s.handleIngest)))
+	mux.Handle("POST /engage", s.requireAuth(http.HandlerFunc(s.handleEngage)))
 	mux.Handle("GET /search", s.requireAuth(http.HandlerFunc(s.handleSearch)))
 	mux.Handle("GET /ask", s.requireAuth(http.HandlerFunc(s.handleAsk)))
 	return mux
@@ -250,13 +259,17 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return err
 		}
-		// Only a fresh INSERT starts a pipeline. Re-ingesting a known artifact
-		// records another encounter (a relevance signal, §8.9) but must not
-		// re-run enrichment on unchanged content. The upsert leaves
-		// created_at==updated_at only on insert; a re-sighting bumps updated_at.
+		// Only a fresh INSERT starts the full pipeline. Re-ingesting a known
+		// artifact records another encounter (a relevance signal, §8.9) on
+		// unchanged content — so it re-scores (the encounter factor changed)
+		// rather than re-enriching. The upsert leaves created_at==updated_at only
+		// on insert; a re-sighting bumps updated_at.
 		inserted := art.CreatedAt == art.UpdatedAt
-		if inserted && s.deps.Enqueue != nil {
+		switch {
+		case inserted && s.deps.Enqueue != nil:
 			return s.deps.Enqueue.EnqueueTx(ctx, tx, art.ID)
+		case !inserted && s.deps.Rescore != nil:
+			return s.deps.Rescore(ctx, tx, art.ID)
 		}
 		return nil
 	})
@@ -270,6 +283,56 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 	s.writeJSON(w, http.StatusOK, ingestResponse{ArtifactID: artifactID})
 }
+
+type engageRequest struct {
+	ArtifactID string `json:"artifact_id"`
+}
+
+// handleEngage records that the user engaged with an artifact (the §8.9
+// engagement signal) and re-scores it so the boost takes effect. Idempotent in
+// effect — engaging again just re-stamps last_engaged_at and re-scores.
+func (s *Server) handleEngage(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req engageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.ArtifactID == "" || len(req.ArtifactID) > maxSourceIDBytes {
+		http.Error(w, "artifact_id is required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	err := s.deps.Store.Tx(ctx, func(tx *store.Store) error {
+		ok, err := tx.Artifacts.RecordEngagement(ctx, req.ArtifactID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errNoSuchArtifact // unknown/tombstoned — surfaced as 404 below
+		}
+		if s.deps.Rescore != nil {
+			return s.deps.Rescore(ctx, tx, req.ArtifactID)
+		}
+		return nil
+	})
+	if errors.Is(err, errNoSuchArtifact) {
+		http.Error(w, "unknown artifact_id", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.serverError(w, "engage", err)
+		return
+	}
+
+	s.deps.Bus.Publish(events.New(events.EngagementRecorded, map[string]string{"artifact_id": req.ArtifactID}))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// errNoSuchArtifact rolls back the engage transaction for an unknown/tombstoned
+// artifact so the handler can return 404 (a sentinel, not a store error).
+var errNoSuchArtifact = errors.New("api: no such artifact")
 
 type searchResultJSON struct {
 	ArtifactID string  `json:"artifact_id"`

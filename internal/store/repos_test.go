@@ -586,6 +586,33 @@ func TestStore_TxPanicRollsBack(t *testing.T) {
 	}
 }
 
+func TestArtifact_RecordEngagement(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	h := "h"
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "b", ContentHash: &h})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if a.LastEngagedAt != nil {
+		t.Fatal("a fresh artifact must have no engagement")
+	}
+
+	ok, err := st.Artifacts.RecordEngagement(ctx, a.ID)
+	if err != nil || !ok {
+		t.Fatalf("record engagement: ok=%v err=%v", ok, err)
+	}
+	got, _ := st.Artifacts.Get(ctx, a.ID)
+	if got.LastEngagedAt == nil {
+		t.Error("last_engaged_at not stamped after engagement")
+	}
+
+	// Unknown (or tombstoned) artifact → false, no error.
+	if ok, err := st.Artifacts.RecordEngagement(ctx, "01NONEXISTENT"); err != nil || ok {
+		t.Errorf("unknown artifact: ok=%v err=%v, want false/nil", ok, err)
+	}
+}
+
 func TestArtifact_KeywordSearch(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

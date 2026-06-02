@@ -855,5 +855,32 @@ done job isn't reclaimed.
 **Deferred (future phases):** "rerank" between retrieve
 and synthesize (a cross-encoder/LLM rerank pass with citation validation —
 currently the hybrid order is used directly); chunk-level embeddings (Decision 3
-chunking) for finer RAG grounding; the living profile and re-scoring (§9);
-cr-sqlite peer sync (Phase 10).
+chunking) for finer RAG grounding; cr-sqlite peer sync (Phase 10).
+
+## Phase 4 — Stage 1: Engagement + re-scoring (§9 living profile, part 1)
+
+**Goal:** activate the relevance factors that were dormant because scoring ran
+only once at first ingest (§8.9): the encounter factor (re-encounter) and the
+engagement boost (`/engage`).
+
+**Status: Complete.** Verified end to end (ingest → score; engage → re-score →
+higher score).
+
+- **Re-score = re-run the relevance stage standalone.** A fresh encounter
+  (re-ingest) or an engagement enqueues a `relevance` job with no deps (the
+  embedding already exists), which recomputes the score from the now-current
+  signals (encounter count, `last_engaged_at`). The stage name is one const
+  (`enrich.RelevanceStage`); the composition root supplies the enqueue closure via
+  `api.RescoreFunc`, so the API and pipeline stay decoupled.
+- **Engagement.** `POST /engage {artifact_id}` stamps `last_engaged_at`
+  (`Artifacts.RecordEngagement`, live-scoped), re-scores in the same transaction,
+  and publishes `engagement.recorded`; 404 for an unknown/tombstoned artifact.
+- **Re-encounter.** Re-ingesting a known artifact now re-scores (the encounter
+  factor changed) instead of doing nothing.
+
+**Next (§9 part 2 — living profile):** the profile evolves from engagement
+(engaged artifacts' embeddings feed the interest vectors) rather than being purely
+static from `KB_INTERESTS`. Plus recency-decay re-scoring (a periodic sweep) so
+old unengaged artifacts fade.
+
+**Deferred:** the rerank/chunking items above; cr-sqlite peer sync (Phase 10).

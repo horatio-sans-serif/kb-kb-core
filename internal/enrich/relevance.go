@@ -12,6 +12,10 @@ import (
 
 const relevancePromptVersion = "v1"
 
+// RelevanceStage is the relevance stage's name — the single source of truth for
+// both the enricher and the re-score path that re-enqueues it standalone (§9).
+const RelevanceStage = "relevance"
+
 // SignalProvider supplies the cross-artifact signals the relevance stage needs
 // beyond the artifact row: its embedding vector, encounter count, and the weight
 // of its most authoritative source. A store-backed adapter implements it; the
@@ -38,7 +42,7 @@ func NewRelevance(provider SignalProvider, profile *relevance.Profile) *Relevanc
 	return &Relevance{provider: provider, profile: profile, now: time.Now}
 }
 
-func (*Relevance) Name() string                  { return "relevance" }
+func (*Relevance) Name() string                  { return RelevanceStage }
 func (*Relevance) DependsOn() []string           { return []string{"embed"} }
 func (*Relevance) PrivacyOK(kb.PrivacyTier) bool { return true }
 

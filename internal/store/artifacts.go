@@ -211,6 +211,25 @@ func (r *ArtifactRepo) list(ctx context.Context, clause string) ([]*Artifact, er
 	return out, rows.Err()
 }
 
+// RecordEngagement stamps last_engaged_at (and updated_at) on a live artifact —
+// the engagement signal the relevance model boosts (§8.9). It does not touch
+// title/body, so no FTS reindex is needed. Reports whether a live row was updated
+// (false = unknown or tombstoned artifact).
+func (r *ArtifactRepo) RecordEngagement(ctx context.Context, id string) (bool, error) {
+	ts := now()
+	res, err := r.q.ExecContext(ctx,
+		`UPDATE artifacts SET last_engaged_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		ts, ts, id)
+	if err != nil {
+		return false, fmt.Errorf("record engagement for %q: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("record engagement for %q (rows affected): %w", id, err)
+	}
+	return n > 0, nil
+}
+
 // EnrichingIDs returns the ids of live artifacts still in the 'enriching' status
 // — the candidates for startup reconciliation (an artifact whose jobs are all
 // terminal but whose finalize hook never ran, e.g. a crash between a job's commit
