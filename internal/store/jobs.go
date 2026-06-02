@@ -208,17 +208,36 @@ func (r *JobRepo) Purge(ctx context.Context, olderThan string) (int, error) {
 // running), and anyFailed reports whether at least one reached 'failed'. The
 // finalize hook reads it after each job completes to decide when every stage is
 // terminal — pending==0 — and whether the artifact is ready or failed. Read pool.
-func (r *JobRepo) ArtifactPipelineState(ctx context.Context, artifactID string) (pending int, anyFailed bool, err error) {
+//
+// excludeType, when non-empty, drops jobs of that type from the tally — the
+// pipeline passes its re-score type so a later re-score (which is not part of the
+// original enrichment generation) cannot pollute the artifact's terminal state.
+func (r *JobRepo) ArtifactPipelineState(ctx context.Context, artifactID, excludeType string) (pending int, anyFailed bool, err error) {
 	row := r.rq.QueryRowContext(ctx,
 		`SELECT
 		   COALESCE(SUM(CASE WHEN status NOT IN ('done', 'failed') THEN 1 ELSE 0 END), 0),
 		   COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
-		 FROM jobs WHERE artifact_id = ?`, artifactID)
+		 FROM jobs WHERE artifact_id = ? AND (? = '' OR type <> ?)`, artifactID, excludeType, excludeType)
 	var failed int
 	if err := row.Scan(&pending, &failed); err != nil {
 		return 0, false, fmt.Errorf("artifact %q pipeline state: %w", artifactID, err)
 	}
 	return pending, failed > 0, nil
+}
+
+// HasUnfinishedType reports whether the artifact has a non-terminal (pending or
+// running) job of the given type — used to coalesce a burst of re-score requests
+// into a single queued job. Called inside the enqueue transaction (which holds
+// the write lock), so the check-then-insert is atomic.
+func (r *JobRepo) HasUnfinishedType(ctx context.Context, artifactID, jobType string) (bool, error) {
+	var exists int
+	err := r.q.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM jobs WHERE artifact_id = ? AND type = ? AND status IN ('pending','running'))`,
+		artifactID, jobType).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check unfinished %q for %q: %w", jobType, artifactID, err)
+	}
+	return exists == 1, nil
 }
 
 func (r *JobRepo) Get(ctx context.Context, id string) (*Job, error) {

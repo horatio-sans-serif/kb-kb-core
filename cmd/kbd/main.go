@@ -129,6 +129,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	enrichment.Register(enrich.NewSummarize(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewEmbed(llmClient, cfg.EmbedModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewRelevance(relsignals.New(st), profile))
+	enrichment.SetRescoreStage(enrich.RelevanceStage) // re-scores re-run the relevance stage
 	enrichment.RegisterHandlers(st, runner, bus)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not
@@ -190,8 +191,13 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Ask:            rag.NewEngine(searcher, st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal),
 		// Re-score = re-run the relevance stage standalone (no deps; the embedding
 		// already exists). Triggered by a fresh encounter or an engagement (§9).
+		// Coalesce: skip if a re-score for this artifact is already queued.
 		Rescore: func(ctx context.Context, tx *store.Store, artifactID string) error {
-			_, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: enrich.RelevanceStage, ArtifactID: &artifactID})
+			has, err := tx.Jobs.HasUnfinishedType(ctx, artifactID, pipeline.RescoreJobType)
+			if err != nil || has {
+				return err
+			}
+			_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: pipeline.RescoreJobType, ArtifactID: &artifactID})
 			return err
 		},
 	})

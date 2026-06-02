@@ -339,6 +339,84 @@ func TestPipeline_Reconcile(t *testing.T) {
 	t.Run("a failure → failed", func(t *testing.T) { run(t, true, kb.StatusFailed, events.ArtifactFailed) })
 }
 
+func TestPipeline_RescoreDoesNotRefinalize(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+	bus := events.NewBus()
+	sub, unsub := bus.Subscribe()
+	defer unsub()
+
+	p := New()
+	p.Register(&fakeEnricher{name: "score"})
+	p.SetRescoreStage("score")
+	r := jobs.NewRunner(st)
+	p.RegisterHandlers(st, r, bus)
+
+	art, err := st.Artifacts.UpsertByCanonical(ctx, &kb.Artifact{Type: kb.Note, Title: "x"})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if err := p.Enqueue(ctx, st, art.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := r.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got, _ := st.Artifacts.Get(ctx, art.ID); got.Status != kb.StatusReady {
+		t.Fatalf("precondition: status %q, want ready", got.Status)
+	}
+	drainEvents(sub) // discard the initial artifact.ready
+
+	// A standalone re-score must run but NOT re-fire finalize.
+	if _, err := st.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: RescoreJobType, ArtifactID: &art.ID}); err != nil {
+		t.Fatalf("enqueue rescore: %v", err)
+	}
+	if _, err := r.Drain(ctx); err != nil {
+		t.Fatalf("drain rescore: %v", err)
+	}
+	for _, e := range drainEvents(sub) {
+		if e.Type == events.ArtifactReady || e.Type == events.ArtifactFailed {
+			t.Errorf("re-score re-published %q; finalize must skip re-score jobs", e.Type)
+		}
+	}
+	if got, _ := st.Artifacts.Get(ctx, art.ID); got.Status != kb.StatusReady {
+		t.Errorf("status = %q after re-score, want unchanged ready", got.Status)
+	}
+}
+
+func TestPipeline_RescoreDoesNotLaunderFailedStatus(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+	bus := events.NewBus()
+
+	p := New()
+	p.Register(&fakeEnricher{name: "score"})
+	p.SetRescoreStage("score")
+	r := jobs.NewRunner(st)
+	p.RegisterHandlers(st, r, bus)
+
+	// An artifact left 'failed' by a prior enrichment whose original jobs have
+	// since been purged — only a fresh re-score job will exist.
+	art, err := st.Artifacts.UpsertByCanonical(ctx, &kb.Artifact{Type: kb.Note, Title: "x"})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	failed := kb.StatusFailed
+	if err := st.Artifacts.Patch(ctx, art.ID, store.ArtifactPatch{Status: &failed}); err != nil {
+		t.Fatalf("set failed: %v", err)
+	}
+
+	if _, err := st.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: RescoreJobType, ArtifactID: &art.ID}); err != nil {
+		t.Fatalf("enqueue rescore: %v", err)
+	}
+	if _, err := r.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got, _ := st.Artifacts.Get(ctx, art.ID); got.Status != kb.StatusFailed {
+		t.Errorf("status = %q after re-score, want failed (a re-score must not launder a failed artifact to ready)", got.Status)
+	}
+}
+
 func TestPipeline_PrivacyGate(t *testing.T) {
 	st := storetest.New(t)
 	ctx := context.Background()

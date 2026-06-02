@@ -628,12 +628,17 @@ func doPost(h http.Handler, path, body, token string) *httptest.ResponseRecorder
 	return rec
 }
 
-// countingRescore records re-score requests and enqueues a relevance job.
+// countingRescore mirrors the production re-score closure (coalesce + enqueue a
+// standalone re-score job) while counting invocations.
 type countingRescore struct{ n int }
 
 func (c *countingRescore) fn(ctx context.Context, tx *store.Store, artifactID string) error {
 	c.n++
-	_, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "relevance", ArtifactID: &artifactID})
+	has, err := tx.Jobs.HasUnfinishedType(ctx, artifactID, pipeline.RescoreJobType)
+	if err != nil || has {
+		return err
+	}
+	_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: pipeline.RescoreJobType, ArtifactID: &artifactID})
 	return err
 }
 
@@ -662,10 +667,10 @@ func TestEngage_RecordsAndRescores(t *testing.T) {
 	if rs.n != 1 {
 		t.Errorf("rescore called %d times, want 1", rs.n)
 	}
-	// A relevance re-score job was enqueued in the same transaction.
+	// A standalone re-score job was enqueued in the same transaction.
 	job, _ := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
-	if job == nil || job.Type != "relevance" || job.ArtifactID == nil || *job.ArtifactID != a.ID {
-		t.Errorf("expected a relevance re-score job for %s, got %+v", a.ID, job)
+	if job == nil || job.Type != pipeline.RescoreJobType || job.ArtifactID == nil || *job.ArtifactID != a.ID {
+		t.Errorf("expected a re-score job for %s, got %+v", a.ID, job)
 	}
 	// engagement.recorded published.
 	select {
@@ -675,6 +680,50 @@ func TestEngage_RecordsAndRescores(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no engagement.recorded event")
+	}
+}
+
+func TestEngage_CoalescesRescores(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	h := "h"
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{Type: "note", BodyMarkdown: "b", ContentHash: &h})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	rs := &countingRescore{}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Rescore: rs.fn})
+
+	// Two engagements before anything drains the queue: only one re-score job
+	// should be queued (the second coalesces into the pending first).
+	for i := 0; i < 2; i++ {
+		if rec := doPost(srv.Handler(), "/engage", `{"artifact_id":"`+a.ID+`"}`, "tok"); rec.Code != http.StatusNoContent {
+			t.Fatalf("engage %d: %d", i, rec.Code)
+		}
+	}
+	if rs.n != 2 {
+		t.Errorf("rescore invoked %d times, want 2", rs.n)
+	}
+	pending := 0
+	for {
+		job, _ := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
+		if job == nil {
+			break
+		}
+		pending++
+		_ = st.Jobs.MarkDone(ctx, job.ID)
+	}
+	if pending != 1 {
+		t.Errorf("queued re-score jobs = %d, want 1 (bursts coalesce)", pending)
+	}
+}
+
+func TestEngage_BodyTooLargeIs413(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()})
+	big := `{"artifact_id":"` + strings.Repeat("a", 2<<20) + `"}`
+	if rec := doPost(srv.Handler(), "/engage", big, "tok"); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413 for an over-limit body", rec.Code)
 	}
 }
 
@@ -691,10 +740,11 @@ func TestEngage_BoostsRelevanceEndToEnd(t *testing.T) {
 	p.Register(enrich.NewSummarize(model, "m", true))
 	p.Register(enrich.NewEmbed(model, "m", true))
 	p.Register(enrich.NewRelevance(relsignals.New(st), profile))
+	p.SetRescoreStage("relevance")
 	p.RegisterHandlers(st, runner, bus)
 
 	rescore := func(ctx context.Context, tx *store.Store, id string) error {
-		_, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: "relevance", ArtifactID: &id})
+		_, err := tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: pipeline.RescoreJobType, ArtifactID: &id})
 		return err
 	}
 	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal",

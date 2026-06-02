@@ -878,6 +878,28 @@ higher score).
 - **Re-encounter.** Re-ingesting a known artifact now re-scores (the encounter
   factor changed) instead of doing nothing.
 
+**Review fixes applied:**
+
+- **Re-score is a distinct job type (`pipeline.RescoreJobType`), not a pipeline
+  stage.** A re-score reuses the relevance handler but is excluded from
+  enrichment-completion tracking: the finalize hook skips it and
+  `ArtifactPipelineState` ignores it (`excludeType`). This fixes a real bug — a
+  re-score job's completion was re-firing `finalize`, which re-published lifecycle
+  events on every engagement and, after the original jobs were purged, could
+  launder a `failed` artifact to `ready`.
+- **Re-scores coalesce.** The enqueue (in the engagement/re-encounter
+  transaction) skips when a non-terminal re-score for the artifact already exists
+  (`Jobs.HasUnfinishedType`), so a scroll-happy UI or hot re-ingest can't pile up
+  duplicate jobs.
+- **`/engage` polish:** 413 (not 400) on an over-limit body; `artifact_id`
+  validated for UTF-8/control chars.
+
+**Known limitation — enrichment rows are unbounded.** Each re-score appends a new
+`relevance` enrichment row (versioned), and unlike the jobs table enrichments have
+no retention/purge. Coalescing bounds bursts, but sustained engagement still
+accumulates rows. A retention policy (keep latest K per `(artifact, kind)`, or
+prune old versions) is deferred.
+
 **Next (§9 part 2 — living profile):** the profile evolves from engagement
 (engaged artifacts' embeddings feed the interest vectors) rather than being purely
 static from `KB_INTERESTS`. Plus recency-decay re-scoring (a periodic sweep) so

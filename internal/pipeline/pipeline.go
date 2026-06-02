@@ -16,16 +16,29 @@ import (
 	"kb/internal/store"
 )
 
+// RescoreJobType is the job type for a standalone relevance re-score (§9). It is
+// deliberately NOT a pipeline stage name: a re-score updates an already-enriched
+// artifact's score and must not participate in enrichment-completion tracking
+// (finalize and ArtifactPipelineState both ignore it), so it can never re-fire a
+// lifecycle event or flip an artifact's terminal status.
+const RescoreJobType = "rescore"
+
 // Pipeline holds the registered enrichment stages.
 type Pipeline struct {
-	enrichers map[string]kb.Enricher
-	order     []string // registration order, for stable expansion
+	enrichers    map[string]kb.Enricher
+	order        []string // registration order, for stable expansion
+	rescoreStage string   // which stage's handler runs a re-score job (see SetRescoreStage)
 }
 
 // New returns an empty pipeline.
 func New() *Pipeline {
 	return &Pipeline{enrichers: make(map[string]kb.Enricher)}
 }
+
+// SetRescoreStage designates the registered stage whose handler runs standalone
+// re-score jobs (the scoring stage, e.g. "relevance"). When set, RegisterHandlers
+// wires that handler under RescoreJobType. A re-score re-runs only that stage.
+func (p *Pipeline) SetRescoreStage(name string) { p.rescoreStage = name }
 
 // Register adds an enricher (one pipeline stage). An empty name, the reserved
 // '@' prefix (held for built-in pseudo-stages), or a duplicate stage name is a
@@ -105,6 +118,16 @@ func (p *Pipeline) RegisterHandlers(st *store.Store, runner *jobs.Runner, bus *e
 	for _, name := range p.order {
 		runner.Handle(name, p.handler(st, p.enrichers[name]))
 	}
+	// Re-score jobs reuse the designated scoring stage's handler under a distinct
+	// type, so a re-score recomputes the score but stays out of completion
+	// tracking (see RescoreJobType / finalize).
+	if p.rescoreStage != "" {
+		e, ok := p.enrichers[p.rescoreStage]
+		if !ok {
+			panic(fmt.Sprintf("pipeline: rescore stage %q is not registered", p.rescoreStage))
+		}
+		runner.Handle(RescoreJobType, p.handler(st, e))
+	}
 	runner.SetOnComplete(p.finalize(st, bus))
 }
 
@@ -126,6 +149,9 @@ func (p *Pipeline) finalize(st *store.Store, bus *events.Bus) func(context.Conte
 		if job.ArtifactID == nil {
 			return nil // non-artifact job: nothing to finalize
 		}
+		if job.Type == RescoreJobType {
+			return nil // a re-score is not part of enrichment completion (§9)
+		}
 		return finalizeArtifact(ctx, st, bus, *job.ArtifactID)
 	}
 }
@@ -135,7 +161,9 @@ func (p *Pipeline) finalize(st *store.Store, bus *events.Bus) func(context.Conte
 // idempotent — re-running it on an already-terminal artifact just re-patches the
 // same status — so both the on-complete hook and the startup reconciler use it.
 func finalizeArtifact(ctx context.Context, st *store.Store, bus *events.Bus, artifactID string) error {
-	pending, anyFailed, err := st.Jobs.ArtifactPipelineState(ctx, artifactID)
+	// Exclude re-score jobs: only the original enrichment generation determines
+	// the artifact's terminal status.
+	pending, anyFailed, err := st.Jobs.ArtifactPipelineState(ctx, artifactID, RescoreJobType)
 	if err != nil {
 		return err
 	}

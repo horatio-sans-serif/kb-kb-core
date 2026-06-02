@@ -295,11 +295,16 @@ func (s *Server) handleEngage(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req engageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	if req.ArtifactID == "" || len(req.ArtifactID) > maxSourceIDBytes {
-		http.Error(w, "artifact_id is required", http.StatusBadRequest)
+	if req.ArtifactID == "" || len(req.ArtifactID) > maxSourceIDBytes || !validText(req.ArtifactID, false) {
+		http.Error(w, "valid artifact_id is required", http.StatusBadRequest)
 		return
 	}
 
