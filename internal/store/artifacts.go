@@ -211,6 +211,29 @@ func (r *ArtifactRepo) list(ctx context.Context, clause string) ([]*Artifact, er
 	return out, rows.Err()
 }
 
+// EnrichingIDs returns the ids of live artifacts still in the 'enriching' status
+// — the candidates for startup reconciliation (an artifact whose jobs are all
+// terminal but whose finalize hook never ran, e.g. a crash between a job's commit
+// and its post-completion finalize).
+func (r *ArtifactRepo) EnrichingIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT id FROM artifacts WHERE status = 'enriching' AND deleted_at IS NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("list enriching artifacts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan enriching id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // SoftDelete sets the tombstone (deleted_at). Idempotent: a no-op on an already
 // deleted row. Tombstones, not hard deletes, so the row merges cleanly under
 // cr-sqlite (design 6.0).

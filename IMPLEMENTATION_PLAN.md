@@ -843,13 +843,16 @@ written); a commit lands the rows with the `done` status, and a `done` job is
 never reclaimed, so a re-run cannot duplicate writes. The runner's own subsequent
 `MarkDone` becomes a harmless no-op.
 
-**Residual:** the finalize hook (which sets the artifact's terminal `ready`/
-`failed` status) still runs as a post-completion notification, so a crash in the
-narrow window between a job's commit and its finalize can leave an artifact in
-`enriching` with all jobs terminal. A startup reconciliation sweep (finalize any
-`enriching` artifact whose jobs are all terminal) is the fix — deferred.
+**Crash-window residual closed (review fix).** A crash between a job's atomic
+commit and its post-completion finalize could leave an artifact in `enriching`
+with all jobs terminal. `Pipeline.Reconcile` (run once at startup, after
+`ReclaimStuck` so a re-pending job is excluded) finalizes any such artifact via
+the same idempotent `finalizeArtifact` the on-complete hook uses. The strengthened
+handler test now also asserts a true rollback: a failed enrichment write rolls
+back the valid rows _and_ the `MarkDone` together (atomicity), not just that a
+done job isn't reclaimed.
 
-**Deferred (future phases):** that reconciliation sweep; "rerank" between retrieve
+**Deferred (future phases):** "rerank" between retrieve
 and synthesize (a cross-encoder/LLM rerank pass with citation validation —
 currently the hybrid order is used directly); chunk-level embeddings (Decision 3
 chunking) for finer RAG grounding; the living profile and re-scoring (§9);

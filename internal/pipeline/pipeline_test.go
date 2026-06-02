@@ -19,6 +19,7 @@ type fakeEnricher struct {
 	okFn      func(kb.PrivacyTier) bool
 	onEnrich  func(*kb.Artifact)
 	enrichErr error
+	extra     []kb.Enrichment // appended to the result (e.g. a bad-FK row to force a tx rollback)
 }
 
 func (f *fakeEnricher) Name() string        { return f.name }
@@ -36,9 +37,9 @@ func (f *fakeEnricher) Enrich(_ context.Context, a *kb.Artifact) (kb.EnrichResul
 	if f.enrichErr != nil {
 		return kb.EnrichResult{}, f.enrichErr
 	}
-	return kb.EnrichResult{
-		Enrichments: []kb.Enrichment{{ArtifactID: a.ID, Kind: f.name, Payload: "{}", Model: "test", PromptVersion: "v1"}},
-	}, nil
+	ens := []kb.Enrichment{{ArtifactID: a.ID, Kind: f.name, Payload: "{}", Model: "test", PromptVersion: "v1"}}
+	ens = append(ens, f.extra...)
+	return kb.EnrichResult{Enrichments: ens}, nil
 }
 
 // failFastRunner builds a runner that fails a job on its first error (no retry
@@ -245,6 +246,97 @@ func TestPipeline_HandlerCompletesAtomically(t *testing.T) {
 	if n, err := st.Jobs.ReclaimStuck(ctx, store.FormatTime(time.Now())); err != nil || n != 0 {
 		t.Errorf("reclaimed %d (err %v), want 0 — a done job must not be re-run", n, err)
 	}
+}
+
+func TestPipeline_HandlerRollsBackOnWriteError(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+	// The enricher returns a valid row plus one with a bogus artifact_id, which
+	// violates the enrichments FK — the second Create fails mid-transaction.
+	e := &fakeEnricher{name: "a", extra: []kb.Enrichment{
+		{ArtifactID: "01NONEXISTENT", Kind: "bad", Payload: "{}", Model: "test", PromptVersion: "v1"},
+	}}
+	p := New()
+	p.Register(e)
+
+	art, err := st.Artifacts.UpsertByCanonical(ctx, &kb.Artifact{Type: kb.Note, Title: "x"})
+	if err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+	if err := p.Enqueue(ctx, st, art.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	job, err := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
+	if err != nil || job == nil {
+		t.Fatalf("claim: job=%v err=%v", job, err)
+	}
+
+	// The handler must fail, and the whole transaction must roll back: neither the
+	// valid enrichment nor the MarkDone may survive (atomicity).
+	if err := p.handler(st, e)(ctx, *job); err == nil {
+		t.Fatal("handler should error when an enrichment write fails")
+	}
+	got, _ := st.Jobs.Get(ctx, job.ID)
+	if got.Status != "running" {
+		t.Errorf("job status = %q, want running (MarkDone rolled back with the failed write)", got.Status)
+	}
+	if ens, _ := st.Enrichments.ListForArtifact(ctx, art.ID); len(ens) != 0 {
+		t.Errorf("enrichments = %d, want 0 (the valid row rolled back with the bad one)", len(ens))
+	}
+}
+
+func TestPipeline_Reconcile(t *testing.T) {
+	run := func(t *testing.T, fail bool, wantStatus kb.ArtifactStatus, wantEvt events.EventType) {
+		t.Helper()
+		st := storetest.New(t)
+		ctx := context.Background()
+		bus := events.NewBus()
+		sub, unsub := bus.Subscribe()
+		defer unsub()
+
+		p := New()
+		p.Register(&fakeEnricher{name: "a"})
+		art, err := st.Artifacts.UpsertByCanonical(ctx, &kb.Artifact{Type: kb.Note, Title: "x"})
+		if err != nil {
+			t.Fatalf("create artifact: %v", err)
+		}
+		if err := p.Enqueue(ctx, st, art.ID); err != nil { // → status enriching, 1 pending job
+			t.Fatalf("enqueue: %v", err)
+		}
+
+		// Drive the job terminal WITHOUT the runner's finalize hook — simulating a
+		// crash between the job's commit and its finalize.
+		job, _ := st.Jobs.Claim(ctx, store.FormatTime(time.Now()))
+		if fail {
+			if err := st.Jobs.MarkFailed(ctx, job.ID, "boom"); err != nil {
+				t.Fatalf("mark failed: %v", err)
+			}
+		} else if err := st.Jobs.MarkDone(ctx, job.ID); err != nil {
+			t.Fatalf("mark done: %v", err)
+		}
+		if got, _ := st.Artifacts.Get(ctx, art.ID); got.Status != kb.StatusEnriching {
+			t.Fatalf("precondition: artifact status = %q, want enriching (finalize was skipped)", got.Status)
+		}
+
+		if err := p.Reconcile(ctx, st, bus); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if got, _ := st.Artifacts.Get(ctx, art.ID); got.Status != wantStatus {
+			t.Errorf("after reconcile status = %q, want %q", got.Status, wantStatus)
+		}
+		var saw bool
+		for _, ev := range drainEvents(sub) {
+			if ev.Type == wantEvt {
+				saw = true
+			}
+		}
+		if !saw {
+			t.Errorf("reconcile did not publish %q", wantEvt)
+		}
+	}
+
+	t.Run("all done → ready", func(t *testing.T) { run(t, false, kb.StatusReady, events.ArtifactReady) })
+	t.Run("a failure → failed", func(t *testing.T) { run(t, true, kb.StatusFailed, events.ArtifactFailed) })
 }
 
 func TestPipeline_PrivacyGate(t *testing.T) {

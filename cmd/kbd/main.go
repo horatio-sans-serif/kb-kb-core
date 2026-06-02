@@ -132,9 +132,14 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	enrichment.RegisterHandlers(st, runner, bus)
 
 	// Startup maintenance: reclaim crash-orphaned jobs (fatal on failure — do not
-	// serve with a dead loop), then purge old terminal jobs (best-effort).
+	// serve with a dead loop), reconcile artifacts whose finalize was skipped by a
+	// crash (after reclaim, so a re-pending job keeps its artifact out of the
+	// sweep), then purge old terminal jobs (best-effort).
 	if _, err := runner.ReclaimStuck(ctx); err != nil {
 		return fmt.Errorf("reclaim stuck jobs: %w", err)
+	}
+	if err := enrichment.Reconcile(ctx, st, bus); err != nil {
+		logger.Warn("reconcile enriching artifacts", "err", err)
 	}
 	cutoff := store.FormatTime(time.Now().Add(-jobRetention))
 	if n, err := st.Jobs.Purge(ctx, cutoff); err != nil {

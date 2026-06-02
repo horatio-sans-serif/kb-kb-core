@@ -126,24 +126,49 @@ func (p *Pipeline) finalize(st *store.Store, bus *events.Bus) func(context.Conte
 		if job.ArtifactID == nil {
 			return nil // non-artifact job: nothing to finalize
 		}
-		artifactID := *job.ArtifactID
-		pending, anyFailed, err := st.Jobs.ArtifactPipelineState(ctx, artifactID)
-		if err != nil {
-			return err
-		}
-		if pending > 0 {
-			return nil // stages remain; the artifact is not terminal yet
-		}
-		status, evt := kb.StatusReady, events.ArtifactReady
-		if anyFailed {
-			status, evt = kb.StatusFailed, events.ArtifactFailed
-		}
-		if err := st.Artifacts.Patch(ctx, artifactID, store.ArtifactPatch{Status: &status}); err != nil {
-			return err
-		}
-		bus.Publish(events.New(evt, map[string]string{"artifact_id": artifactID}))
-		return nil
+		return finalizeArtifact(ctx, st, bus, *job.ArtifactID)
 	}
+}
+
+// finalizeArtifact sets an artifact's terminal status once all its jobs are
+// terminal (a no-op while any remain), publishing the lifecycle event. It is
+// idempotent — re-running it on an already-terminal artifact just re-patches the
+// same status — so both the on-complete hook and the startup reconciler use it.
+func finalizeArtifact(ctx context.Context, st *store.Store, bus *events.Bus, artifactID string) error {
+	pending, anyFailed, err := st.Jobs.ArtifactPipelineState(ctx, artifactID)
+	if err != nil {
+		return err
+	}
+	if pending > 0 {
+		return nil // stages remain; the artifact is not terminal yet
+	}
+	status, evt := kb.StatusReady, events.ArtifactReady
+	if anyFailed {
+		status, evt = kb.StatusFailed, events.ArtifactFailed
+	}
+	if err := st.Artifacts.Patch(ctx, artifactID, store.ArtifactPatch{Status: &status}); err != nil {
+		return err
+	}
+	bus.Publish(events.New(evt, map[string]string{"artifact_id": artifactID}))
+	return nil
+}
+
+// Reconcile finalizes any artifact stuck in 'enriching' whose jobs are all
+// terminal — recovering the rare crash between a job's atomic commit and its
+// post-completion finalize hook. Call it once at startup AFTER ReclaimStuck, so a
+// reclaimed (re-pending) job keeps its artifact out of this sweep until it
+// genuinely finishes.
+func (p *Pipeline) Reconcile(ctx context.Context, st *store.Store, bus *events.Bus) error {
+	ids, err := st.Artifacts.EnrichingIDs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := finalizeArtifact(ctx, st, bus, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
