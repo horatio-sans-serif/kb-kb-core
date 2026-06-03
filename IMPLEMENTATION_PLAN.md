@@ -929,13 +929,28 @@ serialized). Realized: documented the tier-ceiling invariant on
 `EngagedEmbeddings` (sharper than search's — the influence is baked into the
 stored score). Noted below for the decay sweep.
 
-**Next:** recency-decay re-scoring (a periodic sweep so old unengaged artifacts
-fade) — the relevance factors are all live now, but only recompute on
-ingest/engage/re-encounter, so time-based decay needs a background pass. When it
-lands: (a) load the engaged set ONCE per sweep and thread it through, rather than
-calling `EngagedVectors` inside each per-artifact `Enrich` (N× redundant work);
-(b) add a partial index `artifacts(last_engaged_at) WHERE last_engaged_at IS NOT
-NULL AND deleted_at IS NULL` if the engaged query becomes hot.
+## Phase 4 — Stage 3: Recency-decay sweep
 
-**Deferred:** that decay sweep; enrichment-row retention (above); rerank +
-citation validation; chunk-level embeddings; cr-sqlite peer sync (Phase 10).
+**Goal:** old, untouched artifacts fade in ranking over time (§8.9) — the recency
+factor is live but the score only recomputes on ingest/engage/re-encounter, so a
+background pass is needed for time-based decay.
+
+**Status: Complete.**
+
+- **`internal/decay.Sweeper`** re-scores every live artifact in place. It applies
+  the review's two guidances: the living-profile engaged set is loaded **once** per
+  pass (not per artifact), and it **patches `relevance_score` only — no enrichment
+  rows** — so running it on a schedule does not grow the enrichments table. A
+  recomputed score within `scoreEpsilon` of the current one is skipped, so a sweep
+  writes only the artifacts whose relevance actually moved. Context-cancellation
+  aware; reuses the shared `relevance.AgeHours` (extracted from the enricher).
+- **`cmd/kbd`** runs it on a `decayInterval` (6h) ticker, best-effort (logs and
+  continues on error), stopping on shutdown.
+
+This completes the §9 living-profile arc: relevance is now fully alive — profile
+match (static + engaged), recency (with a decay sweep), engagement, encounter, and
+source weight, recomputed on events and on a schedule.
+
+**Deferred:** enrichment-row retention; rerank + citation validation; chunk-level
+embeddings; a partial `last_engaged_at` index if the engaged query gets hot;
+cr-sqlite peer sync (Phase 10).

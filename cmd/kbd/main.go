@@ -18,6 +18,7 @@ import (
 
 	"kb/internal/api"
 	"kb/internal/config"
+	"kb/internal/decay"
 	"kb/internal/enrich"
 	"kb/internal/events"
 	"kb/internal/fetch"
@@ -36,6 +37,9 @@ var Version = "0.0.0-dev"
 
 // jobRetention is how long terminal (done/failed) jobs are kept before purge.
 const jobRetention = 7 * 24 * time.Hour
+
+// decayInterval is how often the relevance decay sweep re-scores all artifacts.
+const decayInterval = 6 * time.Hour
 
 func main() {
 	syscall.Umask(0o077) // daemon-created files (DB, WAL, SHM) are owner-only
@@ -174,6 +178,28 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- runner.Run(ctx, wake, 30*time.Second) }()
+
+	// Relevance decay: periodically re-score every artifact in place so time-based
+	// recency decay takes effect (the score otherwise only recomputes on
+	// ingest/engage/re-encounter). Best-effort and patch-only (no enrichment rows).
+	sweeper := decay.NewSweeper(st, profile)
+	go func() {
+		t := time.NewTicker(decayInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				switch n, err := sweeper.Sweep(ctx); {
+				case err != nil && ctx.Err() == nil:
+					logger.Warn("relevance decay sweep", "err", err)
+				case n > 0:
+					logger.Info("relevance decay sweep", "rescored", n)
+				}
+			}
+		}
+	}()
 
 	// Retrieval: hybrid search, and RAG question-answering grounded on it. Both
 	// take the daemon's locality so the privacy gate extends to query embedding

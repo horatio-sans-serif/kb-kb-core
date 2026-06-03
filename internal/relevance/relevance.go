@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 )
 
 // recencyHalfLifeHours is the age at which the recency factor halves (~30 days).
@@ -130,6 +131,21 @@ func (p *Profile) MatchWith(vec []float32, engaged [][]float32) float64 {
 		}
 	}
 	return clamp01(best)
+}
+
+// AgeHours is the elapsed hours from an ISO-8601 timestamp to now. An unparseable
+// timestamp yields 0 (treated as fully recent) and a future timestamp clamps to
+// 0, so the caller (relevance scoring) never gets a negative age. Shared by the
+// relevance enricher and the decay sweep.
+func AgeHours(at string, now time.Time) float64 {
+	t, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return 0
+	}
+	if d := now.Sub(t).Hours(); d > 0 {
+		return d
+	}
+	return 0
 }
 
 // RecencyFactor decays from 1 (just seen) toward 0 with a ~30-day half-life. A

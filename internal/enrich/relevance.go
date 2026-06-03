@@ -72,7 +72,7 @@ func (r *Relevance) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 
 	bd := relevance.Score(relevance.Inputs{
 		Match:        r.profile.MatchWith(sig.Embedding, engaged),
-		AgeHours:     r.ageHours(a.LastSeenAt),
+		AgeHours:     relevance.AgeHours(a.LastSeenAt, r.now()),
 		Encounters:   sig.Encounters,
 		Engaged:      a.LastEngagedAt != nil,
 		SourceWeight: sig.SourceWeight,
@@ -96,18 +96,4 @@ func (r *Relevance) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 			PromptVersion: relevancePromptVersion,
 		}},
 	}, nil
-}
-
-// ageHours is the artifact's age in hours from last_seen_at to now. An unparseable
-// timestamp is treated as age 0 (fully recent) rather than failing the stage.
-func (r *Relevance) ageHours(lastSeen string) float64 {
-	t, err := time.Parse(time.RFC3339Nano, lastSeen)
-	if err != nil {
-		return 0
-	}
-	d := r.now().Sub(t).Hours()
-	if d < 0 {
-		return 0
-	}
-	return d
 }
