@@ -29,6 +29,7 @@ import (
 	"kb/internal/rag"
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
+	"kb/internal/render"
 	"kb/internal/search"
 	"kb/internal/sources"
 	"kb/internal/sources/rss"
@@ -237,6 +238,26 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// take the daemon's locality so the privacy gate extends to query embedding
 	// (search) and answer synthesis (rag).
 	searcher := search.NewSearcher(st, llmClient, cfg.EmbedModel, cfg.OllamaIsLocal)
+
+	// Output/render layer (§8.14): one Renderer per format over the same assembled
+	// Markdown. The Markdown renderer is dependency-free; the pandoc-backed formats
+	// need the pandoc binary (warn if absent — the route then answers 503), and
+	// patat decks are presented with the patat binary the user runs separately.
+	renderReg := render.NewRegistry()
+	renderReg.Register(render.NewMarkdown(cfg.RenderDir))
+	renderReg.Register(render.NewPatat(cfg.RenderDir))
+	for _, format := range []string{"html", "pdf", "docx", "epub"} {
+		pr, err := render.NewPandoc(format, cfg.RenderDir)
+		if err != nil {
+			return fmt.Errorf("render: %w", err)
+		}
+		renderReg.Register(pr)
+	}
+	if !render.PandocAvailable() {
+		logger.Warn("pandoc not found on PATH; html/pdf/docx/epub renders will return 503 until it is installed")
+	}
+	renderSvc := render.NewService(st, renderReg)
+
 	srv := api.NewServer(api.Deps{
 		Store:          st,
 		Bus:            bus,
@@ -249,6 +270,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Ask:            rag.NewEngine(searcher, st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal),
 		Rescore:        rescore,
 		Connectors:     registry,
+		Render:         renderSvc,
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

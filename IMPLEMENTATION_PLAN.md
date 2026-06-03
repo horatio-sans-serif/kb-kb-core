@@ -1120,5 +1120,30 @@ plus a registration. Every render is privacy-filtered and recorded.
   it can't fracture an artifact across slides; the title is YAML-quoted so a
   `:`/`"` can't break the header.
 
-**Next:** Stage 3 — `POST /render` + `GET /renders` API, daemon wiring,
-`KB_RENDER_DIR` config.
+## Stage 3: Render API + daemon wiring
+
+**Status: Complete.** The render layer is usable end to end:
+
+- **`KB_RENDER_DIR`** config (default: a `renders/` dir beside the DB, inheriting
+  the owner-only umask).
+- **`POST /render`** (bearer-auth): `{format, artifact_ids, title?,
+source_query?, privacy_ceiling?}` → runs the render synchronously and returns
+  the persisted record (201) whose `output_path` names the file. Maps
+  `ErrUnknownFormat`/`ErrInvalidCeiling` → 400, `ErrRendererUnavailable` → 503
+  (pandoc not installed), other → 500 via `serverError` (generic client message,
+  detail logged owner-only — closes the Stage 2 L2 stderr concern). Validates
+  format, non-empty bounded `artifact_ids`, title/query lengths, and ceiling.
+- **`GET /renders`**: render history (newest first).
+- **Daemon wiring** (`cmd/kbd`): one Renderer per format (markdown + patat +
+  pandoc html/pdf/docx/epub) into `cfg.RenderDir`; warns at startup if pandoc is
+  absent.
+
+Verified end to end against the real daemon binary: ingest a note → `POST
+/render` produced a correct `.md`, an `.html` with pandoc-rendered `<strong>`, and
+a 68 KiB `%PDF-1.7` via pandoc+TeX — all files `0600`, all listed by `GET
+/renders`.
+
+**Deferred:** async render-as-a-job (the `renders` table + job queue exist) for
+slow conversions; serving render bytes over HTTP (`GET /renders/{id}/content`);
+render inputs from a saved search/digest rather than explicit ids; audio
+(radio_hn TTS+ffmpeg) renderer.

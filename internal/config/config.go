@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strings"
 )
 
@@ -21,6 +22,7 @@ type Config struct {
 	EmbedModel      string   // KB_EMBED_MODEL (default nomic-embed-text)
 	Interests       []string // KB_INTERESTS (semicolon-separated phrases for the relevance profile)
 	OllamaIsLocal   bool     // computed: true when OllamaURL is a loopback endpoint
+	RenderDir       string   // KB_RENDER_DIR (default: a "renders" dir beside the DB)
 }
 
 // Load reads configuration via getenv (pass os.Getenv in production). It returns
@@ -37,6 +39,12 @@ func Load(getenv func(string) string) (*Config, error) {
 		SummarizeModel:  orDefault(getenv("KB_SUMMARIZE_MODEL"), "llama3.2"),
 		EmbedModel:      orDefault(getenv("KB_EMBED_MODEL"), "nomic-embed-text"),
 		Interests:       splitList(getenv("KB_INTERESTS")),
+		RenderDir:       getenv("KB_RENDER_DIR"),
+	}
+	// Renders default to a directory beside the database so output files live with
+	// the data they derive from (and inherit the daemon's owner-only umask).
+	if cfg.RenderDir == "" && cfg.DBPath != "" {
+		cfg.RenderDir = filepath.Join(filepath.Dir(cfg.DBPath), "renders")
 	}
 
 	var missing []string

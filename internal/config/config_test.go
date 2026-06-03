@@ -40,6 +40,33 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 }
 
+func TestConfig_RenderDirDefaultsBesideDB(t *testing.T) {
+	cfg, err := Load(envFunc(map[string]string{
+		"KB_DB":        "/var/lib/kb/kb.db",
+		"KB_API_TOKEN": "0123456789abcdef0123456789abcdef",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RenderDir != "/var/lib/kb/renders" {
+		t.Errorf("RenderDir = %q, want a 'renders' dir beside the DB", cfg.RenderDir)
+	}
+}
+
+func TestConfig_RenderDirOverride(t *testing.T) {
+	cfg, err := Load(envFunc(map[string]string{
+		"KB_DB":         "/tmp/kb.db",
+		"KB_API_TOKEN":  "0123456789abcdef0123456789abcdef",
+		"KB_RENDER_DIR": "/exports",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RenderDir != "/exports" {
+		t.Errorf("RenderDir = %q, want the override", cfg.RenderDir)
+	}
+}
+
 func TestConfig_MissingTokenFails(t *testing.T) {
 	_, err := Load(envFunc(map[string]string{"KB_DB": "/tmp/kb.db"}))
 	if err == nil {

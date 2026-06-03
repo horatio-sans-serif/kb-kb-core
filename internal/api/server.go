@@ -15,6 +15,7 @@ import (
 	"kb/internal/ingest"
 	"kb/internal/kb"
 	"kb/internal/rag"
+	"kb/internal/render"
 	"kb/internal/search"
 	"kb/internal/store"
 )
@@ -48,6 +49,13 @@ type ConnectorRegistry interface {
 	Kind(name string) (kb.SourceKind, bool)
 }
 
+// RenderService produces an output file from a set of artifacts (satisfied by
+// *render.Service). When nil, the /render route reports 503.
+type RenderService interface {
+	Render(ctx context.Context, req render.Request) (*kb.RenderRecord, error)
+	Formats() []string
+}
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -61,6 +69,7 @@ type Deps struct {
 	Ask            Asker
 	Rescore        ingest.RescoreFunc
 	Connectors     ConnectorRegistry
+	Render         RenderService
 }
 
 // Server wires the HTTP handlers.
@@ -92,6 +101,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /ask", s.requireAuth(http.HandlerFunc(s.handleAsk)))
 	mux.Handle("POST /sources", s.requireAuth(http.HandlerFunc(s.handleCreateSource)))
 	mux.Handle("GET /sources", s.requireAuth(http.HandlerFunc(s.handleListSources)))
+	mux.Handle("POST /render", s.requireAuth(http.HandlerFunc(s.handleRender)))
+	mux.Handle("GET /renders", s.requireAuth(http.HandlerFunc(s.handleListRenders)))
 	return mux
 }
 
@@ -399,6 +410,128 @@ func toSourceJSON(src *store.Source) sourceJSON {
 		j.Health = json.RawMessage(*src.Health)
 	}
 	return j
+}
+
+type renderRequest struct {
+	Format         string   `json:"format"`
+	ArtifactIDs    []string `json:"artifact_ids"`
+	Title          string   `json:"title,omitempty"`
+	SourceQuery    string   `json:"source_query,omitempty"`
+	PrivacyCeiling string   `json:"privacy_ceiling,omitempty"` // export filter ceiling; empty = include all
+}
+
+type renderJSON struct {
+	ID          string   `json:"id"`
+	Format      string   `json:"format"`
+	ArtifactIDs []string `json:"artifact_ids"`
+	OutputPath  string   `json:"output_path"`
+	PrivacyMax  string   `json:"privacy_max"`
+	SourceQuery string   `json:"source_query,omitempty"`
+	CreatedAt   string   `json:"created_at"`
+}
+
+// maxRenderArtifacts bounds the artifact set a single render may name.
+const maxRenderArtifacts = 1000
+
+// handleRender renders a set of artifacts to a file in the requested format. The
+// render is synchronous (a pandoc-backed format runs the converter under the
+// request context, bounded by the renderer's own timeout). On success it returns
+// the persisted render record (201) whose output_path names the file on disk.
+func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Render == nil {
+		http.Error(w, "rendering not configured", http.StatusServiceUnavailable)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var req renderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	switch {
+	case req.Format == "":
+		http.Error(w, "format is required", http.StatusBadRequest)
+		return
+	case len(req.ArtifactIDs) == 0:
+		http.Error(w, "artifact_ids is required", http.StatusBadRequest)
+		return
+	case len(req.ArtifactIDs) > maxRenderArtifacts:
+		http.Error(w, "too many artifact_ids", http.StatusBadRequest)
+		return
+	case len(req.Title) > maxTitleBytes:
+		http.Error(w, "title too long", http.StatusBadRequest)
+		return
+	case len(req.SourceQuery) > maxQueryBytes:
+		http.Error(w, "source_query too long", http.StatusBadRequest)
+		return
+	case req.PrivacyCeiling != "" && !validPrivacy(req.PrivacyCeiling):
+		http.Error(w, "invalid privacy_ceiling", http.StatusBadRequest)
+		return
+	}
+	for _, id := range req.ArtifactIDs {
+		if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+			http.Error(w, "invalid artifact_id", http.StatusBadRequest)
+			return
+		}
+	}
+
+	rec, err := s.deps.Render.Render(r.Context(), render.Request{
+		Format:         req.Format,
+		ArtifactIDs:    req.ArtifactIDs,
+		Title:          req.Title,
+		SourceQuery:    req.SourceQuery,
+		PrivacyCeiling: kb.PrivacyTier(req.PrivacyCeiling),
+	})
+	switch {
+	case errors.Is(err, render.ErrUnknownFormat):
+		http.Error(w, "unknown format (have: "+strings.Join(s.deps.Render.Formats(), ", ")+")", http.StatusBadRequest)
+		return
+	case errors.Is(err, render.ErrInvalidCeiling):
+		http.Error(w, "invalid privacy_ceiling", http.StatusBadRequest)
+		return
+	case errors.Is(err, render.ErrRendererUnavailable):
+		http.Error(w, "the converter for this format is not installed", http.StatusServiceUnavailable)
+		return
+	case err != nil:
+		s.serverError(w, "render", err)
+		return
+	}
+	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
+}
+
+// handleListRenders lists the render history (newest first).
+func (s *Server) handleListRenders(w http.ResponseWriter, r *http.Request) {
+	recs, err := s.deps.Store.Renders.List(r.Context())
+	if err != nil {
+		s.serverError(w, "list renders", err)
+		return
+	}
+	out := make([]renderJSON, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, toRenderJSON(rec))
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"renders": out})
+}
+
+func toRenderJSON(rec *kb.RenderRecord) renderJSON {
+	ids := rec.ArtifactIDs
+	if ids == nil {
+		ids = []string{} // emit [] not null
+	}
+	return renderJSON{
+		ID:          rec.ID,
+		Format:      rec.Format,
+		ArtifactIDs: ids,
+		OutputPath:  rec.OutputPath,
+		PrivacyMax:  string(rec.PrivacyMax),
+		SourceQuery: rec.SourceQuery,
+		CreatedAt:   rec.CreatedAt,
+	}
 }
 
 type searchResultJSON struct {
