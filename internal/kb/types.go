@@ -199,6 +199,29 @@ type RenderRecord struct {
 	CreatedAt   string
 }
 
+// Claim is a single factual assertion extracted from an artifact (design §6.10 /
+// §8.13). Its embedding bounds the contradiction-comparison set (vector
+// pre-filter) before the LLM judges whether two claims conflict.
+type Claim struct {
+	ID         string
+	ArtifactID string
+	Statement  string
+	Embedding  []float32
+	CreatedAt  string
+}
+
+// Conflict records that two claims contradict each other (design §6.10). It is
+// surfaced for human resolution rather than silently storing both; Status moves
+// open → resolved|dismissed.
+type Conflict struct {
+	ID        string
+	ClaimA    string
+	ClaimB    string
+	Status    string // open|resolved|dismissed
+	Rationale string
+	CreatedAt string
+}
+
 // Entity is a node in the knowledge graph (design §6.6 / §8.7): a person, org,
 // technology, concept, or place mentioned across artifacts. Deduped by (Kind,
 // Name); artifacts link to it via artifact_entities.

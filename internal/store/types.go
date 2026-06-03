@@ -15,6 +15,8 @@ type (
 	ReviewState    = kb.ReviewState
 	Entity         = kb.Entity
 	Link           = kb.Link
+	Claim          = kb.Claim
+	Conflict       = kb.Conflict
 	ArtifactPatch  = kb.ArtifactPatch
 	PrivacyTier    = kb.PrivacyTier
 	SourceKind     = kb.SourceKind

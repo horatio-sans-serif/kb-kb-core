@@ -1258,3 +1258,28 @@ entity-extraction enricher that auto-builds it, and the query API.
 **Deferred:** topic clustering over embeddings (`topics`/`artifact_topics`);
 directed backlinks view (incoming `references`); `shares_topic`/`same_as`/
 `derived_from` edge builders; the mindmapper spatial graph UI.
+
+---
+
+# Phase 9 — Conflict detection (§8.13)
+
+Extract factual claims during enrichment, detect contradictions against existing
+claims (vector pre-filter + LLM judgment), and surface them for human resolution
+rather than silently storing both. The claims/conflicts tables exist from Phase 0.
+
+## Stage 1: Claims + conflicts store layer
+
+**Status: Complete.** Pure persistence:
+
+- **`store.ClaimRepo`**: `Create` (embedding round-trips as a JSON float array,
+  NULL when absent); `ListByArtifact`; `ListExcludingArtifact` — the
+  contradiction-comparison candidate set (every OTHER live artifact's *embedded*
+  claims, tombstoned and unembedded claims excluded).
+- **`store.ConflictRepo`**: `Create` canonicalizes the claim pair (claim_a <
+  claim_b) and `INSERT OR IGNORE`s against migration `0008`'s unique index, so the
+  same contradiction from either side dedups; `ListByStatus`; `SetStatus`
+  (ErrNotFound for an unknown id).
+- **`kb.Claim` / `kb.Conflict`** domain types.
+
+**Next:** Stage 2 — claim-extraction enricher (LLM → claims, embedded). Stage 3 —
+conflict detection (cosine pre-filter + LLM judgment → conflicts + event) + API.

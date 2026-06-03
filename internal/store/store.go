@@ -43,6 +43,8 @@ type Store struct {
 	Renders     *RenderRepo
 	Reviews     *ReviewRepo
 	Graph       *GraphRepo
+	Claims      *ClaimRepo
+	Conflicts   *ConflictRepo
 }
 
 // New wires the repositories to a single pool for both reads and writes (used in
@@ -70,6 +72,8 @@ func newStore(db *sql.DB, q, rq Querier) *Store {
 		Renders:     &RenderRepo{q: q, rq: rq},
 		Reviews:     &ReviewRepo{q: q, rq: rq},
 		Graph:       &GraphRepo{q: q, rq: rq},
+		Claims:      &ClaimRepo{q: q, rq: rq},
+		Conflicts:   &ConflictRepo{q: q, rq: rq},
 	}
 }
 
