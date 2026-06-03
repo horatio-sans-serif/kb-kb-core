@@ -126,6 +126,25 @@ func TestScheduler_RecordsHealthOnFetchError(t *testing.T) {
 	}
 }
 
+func TestScheduler_BadURLFallsBackToNote(t *testing.T) {
+	ctx := context.Background()
+	// An item with an uncanonicalizable URL but a real body must become a note,
+	// not be dropped.
+	conn := &stubConnector{items: []kb.RawItem{{URL: "not a url", Title: "T", Body: "real content"}}, cursor: "c"}
+	st, sch := newScheduler(t, conn)
+	src := &store.Source{Kind: "PULL", Connector: "stub", DefaultPrivacy: "personal"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if n, err := sch.Tick(ctx); err != nil || n != 1 {
+		t.Fatalf("tick = %d, %v; want 1, nil", n, err)
+	}
+	arts, _ := st.Artifacts.List(ctx)
+	if len(arts) != 1 || arts[0].Type != "note" || arts[0].BodyMarkdown != "real content" {
+		t.Errorf("artifact = %+v, want a note with the body (URL fell back)", arts)
+	}
+}
+
 func TestScheduler_UnregisteredConnectorSkipped(t *testing.T) {
 	ctx := context.Background()
 	st, sch := newScheduler(t, &stubConnector{})

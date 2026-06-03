@@ -63,7 +63,9 @@ func (p *Provider) Signals(ctx context.Context, artifactID string) (relevance.Si
 		return relevance.Signals{}, err
 	}
 
-	count, err := p.st.Encounters.CountForArtifact(ctx, artifactID)
+	// The relevance encounter factor is "seen from N sources" (§8.9), so it counts
+	// distinct sources — re-polling one feed must not inflate it.
+	count, err := p.st.Encounters.DistinctSourceCountForArtifact(ctx, artifactID)
 	if err != nil {
 		return relevance.Signals{}, err
 	}

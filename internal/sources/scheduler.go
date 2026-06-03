@@ -163,26 +163,34 @@ func toItem(src *kb.Source, raw kb.RawItem) (ingest.Item, bool) {
 		return ingest.Item{}, false
 	}
 	item := ingest.Item{SourceID: src.ID, Title: raw.Title, Tier: src.DefaultPrivacy}
-	switch {
-	case raw.URL != "":
-		c, err := canon.URL(raw.URL)
-		if err != nil {
-			return ingest.Item{}, false
+	// Prefer a usable article URL; if it's missing or not canonicalizable, fall
+	// back to the body as a note rather than dropping a content-bearing item.
+	if raw.URL != "" {
+		if c, err := canon.URL(raw.URL); err == nil {
+			item.Type, item.CanonicalURL, item.RawURL = kb.Webpage, c, raw.URL
+			return item, true
 		}
-		item.Type, item.CanonicalURL, item.RawURL = kb.Webpage, c, raw.URL
-	case raw.Body != "":
-		item.Type, item.Body, item.ContentHash = kb.Note, raw.Body, canon.Content(raw.Body)
-	default:
-		return ingest.Item{}, false
 	}
-	return item, true
+	if raw.Body != "" {
+		item.Type, item.Body, item.ContentHash = kb.Note, raw.Body, canon.Content(raw.Body)
+		return item, true
+	}
+	return ingest.Item{}, false
 }
+
+// maxHealthDetail bounds the error text stored in a source's health JSON so a
+// pathological connector error can't bloat the row.
+const maxHealthDetail = 512
 
 func errString(err error) string {
 	if err == nil {
 		return ""
 	}
-	return err.Error()
+	s := err.Error()
+	if len(s) > maxHealthDetail {
+		s = s[:maxHealthDetail]
+	}
+	return s
 }
 
 func healthJSON(h kb.Health) string {

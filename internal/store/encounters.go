@@ -28,12 +28,26 @@ func (r *EncounterRepo) Record(ctx context.Context, e *Encounter) error {
 	return nil
 }
 
-// CountForArtifact returns how many times the artifact has been encountered.
+// CountForArtifact returns how many times the artifact has been encountered (the
+// total sighting count, including repeats from the same source).
 func (r *EncounterRepo) CountForArtifact(ctx context.Context, artifactID string) (int, error) {
 	var n int
 	if err := r.rq.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM encounters WHERE artifact_id = ?`, artifactID).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count encounters for %q: %w", artifactID, err)
+	}
+	return n, nil
+}
+
+// DistinctSourceCountForArtifact returns how many distinct sources have
+// encountered the artifact — the "seen from N sources" relevance signal (§8.9).
+// Unlike CountForArtifact this does not inflate when one source (e.g. a polled
+// feed) re-encounters the same artifact across refreshes.
+func (r *EncounterRepo) DistinctSourceCountForArtifact(ctx context.Context, artifactID string) (int, error) {
+	var n int
+	if err := r.rq.QueryRowContext(ctx,
+		`SELECT COUNT(DISTINCT source_id) FROM encounters WHERE artifact_id = ?`, artifactID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count distinct sources for %q: %w", artifactID, err)
 	}
 	return n, nil
 }

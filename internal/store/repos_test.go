@@ -209,6 +209,39 @@ func TestEncounter_CountIsRelevanceSignal(t *testing.T) {
 	}
 }
 
+func TestEncounter_DistinctSourceCount(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	s1 := &Source{Kind: "PULL", Connector: "a"}
+	s2 := &Source{Kind: "PUSH", Connector: "b"}
+	if err := st.Sources.Create(ctx, s1); err != nil {
+		t.Fatalf("s1: %v", err)
+	}
+	if err := st.Sources.Create(ctx, s2); err != nil {
+		t.Fatalf("s2: %v", err)
+	}
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", BodyMarkdown: "b", ContentHash: ptrStr("h")})
+	if err != nil {
+		t.Fatalf("artifact: %v", err)
+	}
+	// s1 encounters it twice (a re-poll), s2 once.
+	for _, sid := range []string{s1.ID, s1.ID, s2.ID} {
+		if err := st.Encounters.Record(ctx, &Encounter{ArtifactID: a.ID, SourceID: sid}); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+	if total, _ := st.Encounters.CountForArtifact(ctx, a.ID); total != 3 {
+		t.Errorf("total encounters = %d, want 3", total)
+	}
+	distinct, err := st.Encounters.DistinctSourceCountForArtifact(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("distinct: %v", err)
+	}
+	if distinct != 2 {
+		t.Errorf("distinct sources = %d, want 2 (a re-poll from one source must not inflate)", distinct)
+	}
+}
+
 func TestEncounter_MaxSourceWeight(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

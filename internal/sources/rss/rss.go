@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -61,17 +62,19 @@ func (c *Connector) Fetch(ctx context.Context, src *kb.Source, since kb.Cursor) 
 	for _, it := range items {
 		switch {
 		case it.published.IsZero():
-			if hasSince {
-				continue // skip date-less items on incremental polls
-			}
-		case hasSince && !it.published.After(sinceTime):
-			continue // already seen
+			// Date-less: cannot track incrementally, so always emit and let ingest
+			// dedup absorb repeats — losing a new date-less item is worse.
+		case hasSince && it.published.Before(sinceTime):
+			continue // strictly older than the cursor — already seen
 		default:
+			// Inclusive boundary: an item AT the cursor second is re-emitted (and
+			// deduped) rather than dropped, so a second item published in the same
+			// second as the last cursor is never lost.
 			if it.published.After(newest) {
 				newest = it.published
 			}
 		}
-		out = append(out, kb.RawItem{URL: it.link, Title: it.title, Body: it.body})
+		out = append(out, kb.RawItem{URL: resolveLink(feedURL, it.link), Title: it.title, Body: it.body})
 	}
 
 	cursor := since
@@ -79,6 +82,23 @@ func (c *Connector) Fetch(ctx context.Context, src *kb.Source, since kb.Cursor) 
 		cursor = kb.Cursor(newest.UTC().Format(time.RFC3339))
 	}
 	return out, cursor, nil
+}
+
+// resolveLink makes a relative item link absolute against the feed URL; an
+// already-absolute or unparseable link is returned unchanged.
+func resolveLink(feedURL, link string) string {
+	if link == "" {
+		return ""
+	}
+	base, err := url.Parse(feedURL)
+	if err != nil {
+		return link
+	}
+	ref, err := url.Parse(link)
+	if err != nil {
+		return link
+	}
+	return base.ResolveReference(ref).String()
 }
 
 // HealthCheck reports whether the feed is reachable and parseable.
@@ -121,8 +141,15 @@ func configURL(config string) (string, error) {
 	if err := json.Unmarshal([]byte(config), &cfg); err != nil {
 		return "", fmt.Errorf("rss: parse config: %w", err)
 	}
-	if strings.TrimSpace(cfg.URL) == "" {
+	cfg.URL = strings.TrimSpace(cfg.URL)
+	if cfg.URL == "" {
 		return "", fmt.Errorf("rss: config missing \"url\"")
+	}
+	// Reject non-http(s) feed URLs early (e.g. file://, gopher://). The production
+	// client's dialer also blocks internal IPs; this rejects bad schemes on the
+	// first hop, which the dialer's redirect-only scheme check does not cover.
+	if u, err := url.Parse(cfg.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("rss: feed url must be http or https")
 	}
 	return cfg.URL, nil
 }
@@ -175,8 +202,12 @@ type atomFeed struct {
 		Title   string `xml:"title"`
 		Updated string `xml:"updated"`
 		Summary string `xml:"summary"`
-		Content string `xml:"content"`
-		Links   []struct {
+		Content struct {
+			// Captures both type="html" (text) and type="xhtml" (nested markup) —
+			// innerxml grabs the raw inner content of <content> either way.
+			Inner string `xml:",innerxml"`
+		} `xml:"content"`
+		Links []struct {
 			Href string `xml:"href,attr"`
 			Rel  string `xml:"rel,attr"`
 		} `xml:"link"`
@@ -186,7 +217,7 @@ type atomFeed struct {
 func (a atomFeed) items() []feedItem {
 	out := make([]feedItem, 0, len(a.Entries))
 	for _, e := range a.Entries {
-		body := e.Content
+		body := strings.TrimSpace(e.Content.Inner)
 		if body == "" {
 			body = e.Summary
 		}

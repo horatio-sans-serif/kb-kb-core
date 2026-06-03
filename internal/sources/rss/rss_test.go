@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"kb/internal/kb"
@@ -56,13 +57,15 @@ func TestFetch_RSS(t *testing.T) {
 		t.Errorf("cursor = %q, want the newest item's time", cursor)
 	}
 
-	// A second fetch with that cursor returns nothing new.
+	// A second fetch with that cursor re-emits only the boundary-second item (the
+	// newest), which ingest dedups — an inclusive boundary so same-second items are
+	// never lost. The strictly-older item is filtered out.
 	items2, _, err := c.Fetch(context.Background(), src, cursor)
 	if err != nil {
 		t.Fatalf("fetch 2: %v", err)
 	}
-	if len(items2) != 0 {
-		t.Errorf("incremental fetch returned %d items, want 0", len(items2))
+	if len(items2) != 1 || items2[0].Title != "Newer" {
+		t.Errorf("incremental fetch = %+v, want only the boundary item 'Newer'", items2)
 	}
 }
 
@@ -84,13 +87,53 @@ func TestFetch_Atom(t *testing.T) {
 func TestFetch_Incremental(t *testing.T) {
 	c := New(http.DefaultClient)
 	src := serve(t, rssXML)
-	// Cursor at the older item's time → only the newer item is returned.
-	items, _, err := c.Fetch(context.Background(), src, "2026-06-01T10:00:00Z")
+	// Cursor strictly between the two items → only the newer item is returned (the
+	// older is strictly before the cursor).
+	items, _, err := c.Fetch(context.Background(), src, "2026-06-01T12:00:00Z")
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
 	if len(items) != 1 || items[0].Title != "Newer" {
 		t.Errorf("items = %+v, want only the newer item", items)
+	}
+}
+
+func TestFetch_ResolvesRelativeLinks(t *testing.T) {
+	const relXML = `<?xml version="1.0"?><rss version="2.0"><channel>
+	  <item><title>R</title><link>/articles/5</link><pubDate>Tue, 02 Jun 2026 10:00:00 +0000</pubDate></item>
+	</channel></rss>`
+	c := New(http.DefaultClient)
+	src := serve(t, relXML)
+	items, _, err := c.Fetch(context.Background(), src, "")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(items) != 1 || !strings.HasSuffix(items[0].URL, "/articles/5") || !strings.HasPrefix(items[0].URL, "http") {
+		t.Errorf("link = %q, want it resolved to an absolute URL against the feed", items[0].URL)
+	}
+}
+
+func TestFetch_DatelessItemsAlwaysEmitted(t *testing.T) {
+	const noDateXML = `<?xml version="1.0"?><rss version="2.0"><channel>
+	  <item><title>N</title><link>https://e.com/n</link></item>
+	</channel></rss>`
+	c := New(http.DefaultClient)
+	src := serve(t, noDateXML)
+	// Even with a non-empty cursor, a date-less item is returned (can't track it
+	// incrementally; ingest dedup absorbs the repeat). Losing it would be worse.
+	items, _, err := c.Fetch(context.Background(), src, "2026-06-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(items) != 1 {
+		t.Errorf("date-less items = %d, want 1 (always emitted)", len(items))
+	}
+}
+
+func TestFetch_RejectsNonHTTPFeed(t *testing.T) {
+	c := New(http.DefaultClient)
+	if _, _, err := c.Fetch(context.Background(), &kb.Source{Config: `{"url":"file:///etc/passwd"}`}, ""); err == nil {
+		t.Error("a non-http feed url must be rejected")
 	}
 }
 

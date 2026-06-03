@@ -1019,5 +1019,23 @@ Plus one concrete connector (RSS/Atom) and a cursor column.
 
 This closes the biggest functional gap: the daemon now fetches on its own.
 
+**Review fixes applied:**
+
+- **No same-second item loss (P1).** The cursor boundary is now inclusive
+  (re-emit items AT the cursor second, deduped at ingest) instead of strictly
+  after — a second item published in the same second as the last cursor is never
+  dropped. Date-less items are always emitted (ingest dedup absorbs repeats) so a
+  date-less feed doesn't go dark.
+- **Encounter inflation fixed at the signal (P2).** The relevance encounter factor
+  now counts **distinct sources** (`DistinctSourceCountForArtifact`), so re-polling
+  one feed can't masquerade as "seen from N sources" — making the inclusive cursor
+  and any re-emission inert for relevance by construction.
+- **Content-bearing items aren't dropped (P2).** `toItem` falls back to a note when
+  the URL is missing/uncanonicalizable; the connector resolves relative `<link>`s
+  against the feed URL.
+- **Hardening (P3):** reject non-http(s) feed URLs early; capture Atom
+  `type="xhtml"` content via innerxml; bound the health `Detail` string.
+
 **Deferred:** more connectors (HN, GitHub, email…); `storage_budget` enforcement;
-a `source_weight` yield feedback loop; surfacing source health via the API.
+a `source_weight` yield feedback loop; surfacing source health via the API; the
+failed-poll-delays-retry-by-a-full-TTL trade-off (a separate error-retry floor).
