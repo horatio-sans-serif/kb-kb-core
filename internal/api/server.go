@@ -595,11 +595,11 @@ func (s *Server) handleSurface(w http.ResponseWriter, r *http.Request) {
 	limit := 20
 	if ls := q.Get("limit"); ls != "" {
 		n, err := strconv.Atoi(ls)
-		if err != nil || n < 1 {
-			http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+		if err != nil || n < 1 || n > maxSurfaceLimit {
+			http.Error(w, "limit must be between 1 and 200", http.StatusBadRequest)
 			return
 		}
-		limit = min(n, maxSurfaceLimit)
+		limit = n
 	}
 
 	var minScore float64
@@ -614,11 +614,12 @@ func (s *Server) handleSurface(w http.ResponseWriter, r *http.Request) {
 
 	var since string
 	if ss := q.Get("since"); ss != "" {
-		if !validTimestamp(ss) {
-			http.Error(w, "since must be an RFC3339 timestamp", http.StatusBadRequest)
+		norm, ok := normalizeTimestamp(ss)
+		if !ok {
+			http.Error(w, "since must be a valid timestamp", http.StatusBadRequest)
 			return
 		}
-		since = ss
+		since = norm
 	}
 
 	ceiling := q.Get("privacy_ceiling")
@@ -701,9 +702,16 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 	case len(req.Title) > maxTitleBytes:
 		http.Error(w, "title too long", http.StatusBadRequest)
 		return
-	case req.Since != "" && !validTimestamp(req.Since):
-		http.Error(w, "since must be an RFC3339 timestamp", http.StatusBadRequest)
-		return
+	}
+
+	since := req.Since
+	if since != "" {
+		norm, ok := normalizeTimestamp(since)
+		if !ok {
+			http.Error(w, "since must be a valid timestamp", http.StatusBadRequest)
+			return
+		}
+		since = norm
 	}
 
 	ceiling := req.PrivacyCeiling
@@ -717,7 +725,7 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	arts, err := s.deps.Surface.Surface(ctx, surface.Options{
 		Limit:          req.Limit,
-		Since:          req.Since,
+		Since:          since,
 		MinScore:       req.MinScore,
 		PrivacyCeiling: kb.PrivacyTier(ceiling),
 	})
@@ -751,17 +759,22 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
 }
 
-// validTimestamp reports whether s parses as one of the timestamp formats the
-// system mints (the fixed-width store format) or accepts (RFC3339).
-func validTimestamp(s string) bool {
+// normalizeTimestamp parses s as a store-format or RFC3339 timestamp and returns
+// it re-encoded in store.TimeFormat UTC. This is required before any SQL
+// comparison: the stored timestamps are fixed-width UTC and only byte-compare
+// (lexicographic == chronological) within that one encoding, so an RFC3339 input
+// with a different offset, fractional width, or 'Z'-vs-'+00:00' must be canonical-
+// ized first or the comparison is silently wrong. ok is false if s does not parse.
+func normalizeTimestamp(s string) (string, bool) {
 	if len(s) > 64 {
-		return false
+		return "", false
 	}
-	if _, err := time.Parse(store.TimeFormat, s); err == nil {
-		return true
+	for _, layout := range []string{store.TimeFormat, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return store.FormatTime(t), true
+		}
 	}
-	_, err := time.Parse(time.RFC3339, s)
-	return err == nil
+	return "", false
 }
 
 type searchResultJSON struct {

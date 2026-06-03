@@ -90,6 +90,49 @@ func TestSurface_InvalidCeilingIs400(t *testing.T) {
 	}
 }
 
+func TestSurface_SinceRFC3339IsNormalized(t *testing.T) {
+	// A 'since' in RFC3339 (no fractional seconds, 'Z') must be normalized to the
+	// fixed-width stored format before the SQL comparison, or the boundary and
+	// offset forms compare wrong lexicographically.
+	st, h := surfaceTestServer(t)
+	ctx := context.Background()
+	// Stored instant: 2025-06-03T12:00:00.000000000Z.
+	a := &kb.Artifact{Type: "note", Title: "Boundary", BodyMarkdown: "b", ContentHash: strPtr("hb"),
+		PrivacyTier: kb.Public, FirstSeenAt: "2025-06-03T12:00:00.000000000Z"}
+	got, err := st.Artifacts.UpsertByContentHash(ctx, a)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	score := 0.9
+	rdy := kb.StatusReady
+	_ = st.Artifacts.Patch(ctx, got.ID, kb.ArtifactPatch{Status: &rdy, RelevanceScore: &score})
+
+	// Inclusive boundary: since == the same instant in RFC3339 must still include it.
+	rec := doGet(h, "/surface?since=2025-06-03T12:00:00Z", "tok")
+	var out struct {
+		Surface []struct {
+			ArtifactID string `json:"artifact_id"`
+		} `json:"surface"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if len(out.Surface) != 1 || out.Surface[0].ArtifactID != got.ID {
+		t.Errorf("RFC3339 boundary since dropped the artifact: %+v", out.Surface)
+	}
+
+	// An offset form of a later instant (13:00+02:00 == 11:00Z) is before the
+	// artifact, so it must still be included.
+	rec2 := doGet(h, "/surface?since=2025-06-03T13:00:00%2B02:00", "tok")
+	var out2 struct {
+		Surface []json.RawMessage `json:"surface"`
+	}
+	_ = json.Unmarshal(rec2.Body.Bytes(), &out2)
+	if len(out2.Surface) != 1 {
+		t.Errorf("offset since wrongly excluded a newer artifact: %d items", len(out2.Surface))
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
 func TestSurface_InvalidSinceIs400(t *testing.T) {
 	_, h := surfaceTestServer(t)
 	if rec := doGet(h, "/surface?since=not-a-time", "tok"); rec.Code != http.StatusBadRequest {
