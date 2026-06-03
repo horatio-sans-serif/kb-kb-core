@@ -125,6 +125,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /digest", s.requireAuth(http.HandlerFunc(s.handleDigest)))
 	mux.Handle("POST /review", s.requireAuth(http.HandlerFunc(s.handleReview)))
 	mux.Handle("GET /review/due", s.requireAuth(http.HandlerFunc(s.handleReviewDue)))
+	mux.Handle("GET /graph/{id}", s.requireAuth(http.HandlerFunc(s.handleGraph)))
 	return mux
 }
 
@@ -768,6 +769,93 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
+}
+
+type entityJSON struct {
+	Kind    string   `json:"kind"`
+	Name    string   `json:"name"`
+	Aliases []string `json:"aliases,omitempty"`
+}
+
+type graphNodeJSON struct {
+	ArtifactID string `json:"artifact_id"`
+	Title      string `json:"title,omitempty"`
+	URL        string `json:"url,omitempty"`
+}
+
+type graphJSON struct {
+	ArtifactID string          `json:"artifact_id"`
+	Title      string          `json:"title,omitempty"`
+	Entities   []entityJSON    `json:"entities"`
+	Connected  []graphNodeJSON `json:"connected"`
+}
+
+// maxGraphHops bounds a graph traversal so one request cannot walk the whole
+// graph (the store also caps the node count).
+const maxGraphHops = 5
+
+// handleGraph returns the knowledge-graph view of an artifact (§8.7): the
+// entities it mentions and the artifacts connected to it within ?hops edges
+// (undirected, default 1).
+func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid artifact id", http.StatusBadRequest)
+		return
+	}
+	hops := 1
+	if hs := r.URL.Query().Get("hops"); hs != "" {
+		n, err := strconv.Atoi(hs)
+		if err != nil || n < 1 || n > maxGraphHops {
+			http.Error(w, "hops must be between 1 and 5", http.StatusBadRequest)
+			return
+		}
+		hops = n
+	}
+
+	ctx := r.Context()
+	start, err := s.deps.Store.Artifacts.GetLive(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown artifact", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "graph artifact", err)
+		return
+	}
+
+	ents, err := s.deps.Store.Graph.EntitiesForArtifact(ctx, id)
+	if err != nil {
+		s.serverError(w, "graph entities", err)
+		return
+	}
+	connectedIDs, err := s.deps.Store.Graph.ConnectedWithin(ctx, id, hops)
+	if err != nil {
+		s.serverError(w, "graph connected", err)
+		return
+	}
+
+	out := graphJSON{
+		ArtifactID: id,
+		Title:      start.Title,
+		Entities:   make([]entityJSON, 0, len(ents)),
+		Connected:  make([]graphNodeJSON, 0, len(connectedIDs)),
+	}
+	for _, e := range ents {
+		out.Entities = append(out.Entities, entityJSON{Kind: e.Kind, Name: e.Name, Aliases: e.Aliases})
+	}
+	for _, cid := range connectedIDs {
+		a, err := s.deps.Store.Artifacts.GetLive(ctx, cid)
+		if err != nil {
+			continue // tombstoned between traversal and load — drop
+		}
+		node := graphNodeJSON{ArtifactID: cid, Title: a.Title}
+		if a.CanonicalURL != nil {
+			node.URL = *a.CanonicalURL
+		}
+		out.Connected = append(out.Connected, node)
+	}
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 type reviewRequest struct {

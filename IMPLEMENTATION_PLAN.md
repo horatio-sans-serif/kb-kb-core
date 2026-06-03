@@ -1243,5 +1243,18 @@ idempotent, so the stage is safe to re-run; it records completion with an
 `entities` enrichment row and writes the graph via the narrow `GraphWriter`
 interface (satisfied by `*store.GraphRepo`). Wired into the daemon pipeline.
 
-**Next:** Stage 3 — graph query API (`GET /graph/{id}?hops=N` connected subgraph;
-backlinks).
+## Stage 3: Graph query API
+
+**Status: Complete.** `GET /graph/{id}?hops=N` returns the knowledge-graph view
+of an artifact: the entities it mentions and the artifacts connected to it within
+`hops` edges (undirected, default 1, capped at 5 + the store's node budget). 404
+for an unknown/tombstoned artifact; connected artifacts tombstoned between
+traversal and load are dropped. The query reads the store directly (no new Deps
+interface — the graph is always queryable once populated).
+
+This completes Phase 8 (knowledge graph): store layer + traversal, the
+entity-extraction enricher that auto-builds it, and the query API.
+
+**Deferred:** topic clustering over embeddings (`topics`/`artifact_topics`);
+directed backlinks view (incoming `references`); `shares_topic`/`same_as`/
+`derived_from` edge builders; the mindmapper spatial graph UI.
