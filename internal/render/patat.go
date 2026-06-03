@@ -78,25 +78,32 @@ func slide(a *kb.Artifact) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// neutralizeRules replaces any line that is a Markdown thematic break (3+ of -, _,
-// or * with optional spaces) with a visual em-dash rule that is not a thematic
-// break, so a body's own horizontal rule does not register as a patat slide
-// separator. The visual intent (a rule) is preserved; the slide-splitting effect
-// is removed.
+// neutralizeRules replaces any line that is a Markdown thematic break with a
+// visual em-dash rule that is not a break, so a body's own horizontal rule does
+// not register as a patat slide separator. A break is only neutralized when the
+// preceding line is blank (or it is the first line) — that is the only position a
+// rule can be a thematic break / slide separator; a `---` directly under a text
+// line is a setext heading underline and must be left intact.
 func neutralizeRules(body string) string {
 	lines := strings.Split(body, "\n")
 	for i, line := range lines {
-		if isThematicBreak(line) {
+		precededByBlank := i == 0 || strings.TrimSpace(lines[i-1]) == ""
+		if precededByBlank && isThematicBreak(line) {
 			lines[i] = "———"
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-// isThematicBreak reports whether line is a CommonMark thematic break: after
-// removing spaces and tabs, three or more of a single character among -, _, *.
+// isThematicBreak reports whether line is a CommonMark thematic break: at most 3
+// leading spaces (4+ or a leading tab is indented code, not a break), then three
+// or more of a single character among -, _, * with optional internal spaces/tabs.
 func isThematicBreak(line string) bool {
-	stripped := strings.NewReplacer(" ", "", "\t", "").Replace(strings.TrimSpace(line))
+	body := strings.TrimLeft(line, " ")
+	if len(line)-len(body) > 3 || strings.HasPrefix(line, "\t") {
+		return false
+	}
+	stripped := strings.NewReplacer(" ", "", "\t", "").Replace(strings.TrimRight(body, " \t"))
 	if len(stripped) < 3 {
 		return false
 	}
@@ -107,8 +114,33 @@ func isThematicBreak(line string) bool {
 	return strings.Count(stripped, string(c)) == len(stripped)
 }
 
-// yamlString renders s as a double-quoted YAML scalar, escaping backslashes and
-// quotes so a title containing ':' or '"' cannot break the metadata block.
+// yamlString renders s as a double-quoted YAML scalar. It is self-sufficient: it
+// escapes backslashes and quotes, encodes newlines/tabs/CR as their YAML escapes
+// (keeping the scalar on one line), and drops other control characters — so any
+// title is safe in the single-line metadata header regardless of the caller.
 func yamlString(s string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if r < 0x20 {
+				b.WriteByte(' ') // drop other control chars
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

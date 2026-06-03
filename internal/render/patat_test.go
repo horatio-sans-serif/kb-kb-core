@@ -67,6 +67,86 @@ func TestPatat_BodyThematicBreakDoesNotSplitSlides(t *testing.T) {
 	}
 }
 
+func TestPatat_SetextUnderlineNotNeutralized(t *testing.T) {
+	// A '---' directly under a text line is a setext H2 underline, not a break.
+	// Neutralizing it would silently demote a heading to plain text.
+	dir := t.TempDir()
+	out, err := NewPatat(dir).Render(context.Background(),
+		[]*kb.Artifact{{Title: "T", BodyMarkdown: "My Heading\n---\n\nbody", PrivacyTier: kb.Public}},
+		kb.RenderOpts{Options: map[string]string{"name": "r"}})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	deck, _ := os.ReadFile(out.OutputPath)
+	if !strings.Contains(string(deck), "My Heading\n---") {
+		t.Errorf("setext underline was wrongly neutralized:\n%s", deck)
+	}
+}
+
+func TestPatat_ThematicBreakVariantsNeutralized(t *testing.T) {
+	cases := map[string]string{
+		"stars":         "para\n\n***\n\nmore",
+		"underscores":   "para\n\n___\n\nmore",
+		"spaced dashes": "para\n\n- - -\n\nmore",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, err := NewPatat(t.TempDir()).Render(context.Background(),
+				[]*kb.Artifact{{Title: "T", BodyMarkdown: body, PrivacyTier: kb.Public}},
+				kb.RenderOpts{Options: map[string]string{"name": "r"}})
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			deck, _ := os.ReadFile(out.OutputPath)
+			if n := strings.Count(string(deck), "\n\n---\n\n"); n != 0 {
+				t.Errorf("a body break (%s) leaked a slide separator:\n%s", name, deck)
+			}
+		})
+	}
+}
+
+func TestPatat_IndentedRuleIsCodeNotBreak(t *testing.T) {
+	// Four-space-indented content is a code block; the line must be left as-is.
+	out, err := NewPatat(t.TempDir()).Render(context.Background(),
+		[]*kb.Artifact{{Title: "T", BodyMarkdown: "para\n\n    ---\n\nmore", PrivacyTier: kb.Public}},
+		kb.RenderOpts{Options: map[string]string{"name": "r"}})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	deck, _ := os.ReadFile(out.OutputPath)
+	if !strings.Contains(string(deck), "    ---") {
+		t.Errorf("indented code line was wrongly neutralized:\n%s", deck)
+	}
+}
+
+func TestPatat_EmptyDeckIsHeaderOnly(t *testing.T) {
+	out, err := NewPatat(t.TempDir()).Render(context.Background(), nil,
+		kb.RenderOpts{Options: map[string]string{"name": "r", "title": "Empty"}})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	deck, _ := os.ReadFile(out.OutputPath)
+	if strings.Contains(string(deck), "\n\n---\n\n") || strings.Contains(string(deck), "##") {
+		t.Errorf("empty deck should be the metadata header only:\n%s", deck)
+	}
+	if !strings.Contains(string(deck), `title: "Empty"`) {
+		t.Errorf("empty deck missing title:\n%s", deck)
+	}
+}
+
+func TestPatat_SlideHasSourceLink(t *testing.T) {
+	out, err := NewPatat(t.TempDir()).Render(context.Background(),
+		[]*kb.Artifact{{Title: "Linked", CanonicalURL: ptr("https://ex.com/x"), BodyMarkdown: "b", PrivacyTier: kb.Public}},
+		kb.RenderOpts{Options: map[string]string{"name": "r"}})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	deck, _ := os.ReadFile(out.OutputPath)
+	if !strings.Contains(string(deck), "<https://ex.com/x>") {
+		t.Errorf("slide missing source link:\n%s", deck)
+	}
+}
+
 func TestPatat_TitleIsYAMLQuoted(t *testing.T) {
 	// A title with a colon/quote would break the YAML header if not quoted/escaped.
 	dir := t.TempDir()
