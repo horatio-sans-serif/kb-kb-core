@@ -11,7 +11,8 @@ import (
 type SourceRepo struct{ q, rq Querier } // q: write pool; rq: read pool
 
 const sourceCols = `id, kind, connector, config, schedule, auth_state,
-	default_privacy, storage_budget, source_weight, enabled, created_at`
+	default_privacy, storage_budget, source_weight, enabled, created_at,
+	cursor, last_fetched_at, health`
 
 // Create inserts a source, assigning a ULID if none is set and defaulting the
 // privacy tier to "personal". source_weight and enabled take their schema
@@ -96,12 +97,45 @@ func (r *SourceRepo) SetEnabled(ctx context.Context, id string, enabled bool) er
 	return nil
 }
 
+// ListEnabledByKind returns enabled sources of one kind (e.g. "PULL"), ordered by
+// creation — the scheduler's work list.
+func (r *SourceRepo) ListEnabledByKind(ctx context.Context, kind string) ([]*Source, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT `+sourceCols+` FROM sources WHERE enabled = 1 AND kind = ? ORDER BY created_at, id`, kind)
+	if err != nil {
+		return nil, fmt.Errorf("list enabled %s sources: %w", kind, err)
+	}
+	defer rows.Close()
+
+	var out []*Source
+	for rows.Next() {
+		s, err := scanSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// UpdateFetchState records the outcome of a poll: the new cursor, the time it ran,
+// and the health snapshot. Narrow update of the fetch-state columns only.
+func (r *SourceRepo) UpdateFetchState(ctx context.Context, id string, cursor, lastFetchedAt, health *string) error {
+	if _, err := r.q.ExecContext(ctx,
+		`UPDATE sources SET cursor = ?, last_fetched_at = ?, health = ? WHERE id = ?`,
+		cursor, lastFetchedAt, health, id); err != nil {
+		return fmt.Errorf("update fetch state for source %q: %w", id, err)
+	}
+	return nil
+}
+
 func scanSource(sc scanner) (*Source, error) {
 	var s Source
 	var enabled int
 	if err := sc.Scan(
 		&s.ID, &s.Kind, &s.Connector, &s.Config, &s.Schedule, &s.AuthState,
 		&s.DefaultPrivacy, &s.StorageBudget, &s.SourceWeight, &enabled, &s.CreatedAt,
+		&s.Cursor, &s.LastFetchedAt, &s.Health,
 	); err != nil {
 		return nil, err
 	}

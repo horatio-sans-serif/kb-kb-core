@@ -10,10 +10,34 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"syscall"
+	"time"
 )
+
+// HTTPClient returns an http.Client whose dialer refuses internal destination IPs
+// (via Control, defeating DNS rebinding at dial time) and which caps redirects and
+// the given total timeout. Use it for any fetch of an operator/user-supplied URL
+// (e.g. a source feed). Callers that also know the URL up front should CheckURL it
+// first.
+func HTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: Control}
+	return &http.Client{
+		Transport: &http.Transport{DialContext: dialer.DialContext},
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("ssrf: too many redirects")
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("ssrf: redirect to non-http scheme %q", req.URL.Scheme)
+			}
+			return nil
+		},
+	}
+}
 
 // tailscaleCGNAT is the 100.64.0.0/10 range Tailscale assigns to peers.
 var tailscaleCGNAT = netip.MustParsePrefix("100.64.0.0/10")

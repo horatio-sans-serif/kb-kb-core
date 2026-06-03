@@ -9,12 +9,12 @@ import (
 
 type fakeConnector struct{ id string }
 
-func (f fakeConnector) ID() string          { return f.id }
+func (f fakeConnector) Name() string        { return f.id }
 func (f fakeConnector) Kind() kb.SourceKind { return kb.Pull }
-func (f fakeConnector) Fetch(context.Context, kb.Cursor) ([]kb.RawItem, kb.Cursor, error) {
+func (f fakeConnector) Fetch(context.Context, *kb.Source, kb.Cursor) ([]kb.RawItem, kb.Cursor, error) {
 	return nil, "", nil
 }
-func (f fakeConnector) HealthCheck(context.Context) (kb.Health, error) {
+func (f fakeConnector) HealthCheck(context.Context, *kb.Source) (kb.Health, error) {
 	return kb.Health{OK: true}, nil
 }
 
@@ -27,7 +27,7 @@ func TestRegistry(t *testing.T) {
 	if !r.Has("rss") {
 		t.Error("rss should be registered")
 	}
-	if c, ok := r.Get("rss"); !ok || c.ID() != "rss-1" {
+	if c, ok := r.Get("rss"); !ok || c.Name() != "rss-1" {
 		t.Errorf("Get(rss) = %v, %v; want the registered connector", c, ok)
 	}
 	r.Register("hn", fakeConnector{id: "hn-1"})

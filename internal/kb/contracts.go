@@ -89,19 +89,25 @@ type RawItem struct {
 	Context string // JSON: source-specific provenance
 }
 
-// Health is a source's health snapshot (design §8.15).
+// Health is a source's health snapshot (design §8.15). It is persisted as JSON
+// (the source scheduler) and surfaced by the health endpoint, so the keys are
+// stable lowercase.
 type Health struct {
-	OK        bool
-	Detail    string
-	AuthValid bool
+	OK        bool   `json:"ok"`
+	Detail    string `json:"detail,omitempty"`
+	AuthValid bool   `json:"auth_valid,omitempty"`
 }
 
-// SourceConnector is the behavioral contract a source implements (the stored
-// configuration is the Source struct in types.go); the registry maps a
-// connector string to one (design §7 / §8.1).
+// SourceConnector is the behavioral contract a connector implements (design §7 /
+// §8.1). One connector instance serves every Source that uses it (the registry
+// maps a connector name to one), so the per-source configuration — feed URL,
+// auth, cursor — is passed in via *Source on each call rather than baked into the
+// connector.
 type SourceConnector interface {
-	ID() string
-	Kind() SourceKind
-	Fetch(ctx context.Context, since Cursor) ([]RawItem, Cursor, error) // PULL only
-	HealthCheck(ctx context.Context) (Health, error)
+	Name() string     // the connector type, e.g. "rss"
+	Kind() SourceKind // PULL | PUSH | AMBIENT
+	// Fetch returns the source's new items since the cursor, plus an updated
+	// cursor to persist. PULL only.
+	Fetch(ctx context.Context, src *Source, since Cursor) ([]RawItem, Cursor, error)
+	HealthCheck(ctx context.Context, src *Source) (Health, error)
 }

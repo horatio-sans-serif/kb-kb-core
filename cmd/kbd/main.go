@@ -22,6 +22,7 @@ import (
 	"kb/internal/enrich"
 	"kb/internal/events"
 	"kb/internal/fetch"
+	"kb/internal/ingest"
 	"kb/internal/jobs"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
@@ -29,6 +30,9 @@ import (
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
 	"kb/internal/search"
+	"kb/internal/sources"
+	"kb/internal/sources/rss"
+	"kb/internal/ssrf"
 	"kb/internal/store"
 )
 
@@ -40,6 +44,10 @@ const jobRetention = 7 * 24 * time.Hour
 
 // decayInterval is how often the relevance decay sweep re-scores all artifacts.
 const decayInterval = 6 * time.Hour
+
+// sourcePollInterval is how often the scheduler checks for PULL sources due to
+// refresh (each source's own schedule decides whether it actually fetches).
+const sourcePollInterval = time.Minute
 
 func main() {
 	syscall.Umask(0o077) // daemon-created files (DB, WAL, SHM) are owner-only
@@ -205,6 +213,26 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		}
 	}()
 
+	// Re-score = re-run the relevance stage standalone (no deps; the embedding
+	// already exists). Triggered by a fresh encounter or an engagement (§9).
+	// Coalesce: skip if a re-score for this artifact is already queued.
+	rescore := func(ctx context.Context, tx *store.Store, artifactID string) error {
+		has, err := tx.Jobs.HasUnfinishedType(ctx, artifactID, pipeline.RescoreJobType)
+		if err != nil || has {
+			return err
+		}
+		_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: pipeline.RescoreJobType, ArtifactID: &artifactID})
+		return err
+	}
+
+	// PULL sources: register connectors and poll due sources on a ticker, ingesting
+	// new items through the same shared path as push ingest.
+	registry := sources.NewRegistry()
+	registry.Register("rss", rss.New(ssrf.HTTPClient(30*time.Second)))
+	ingester := ingest.New(st, enrichment, rescore, bus)
+	scheduler := sources.NewScheduler(st, registry, ingester, logger)
+	go scheduler.Run(ctx, sourcePollInterval)
+
 	// Retrieval: hybrid search, and RAG question-answering grounded on it. Both
 	// take the daemon's locality so the privacy gate extends to query embedding
 	// (search) and answer synthesis (rag).
@@ -219,17 +247,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Enqueue:        enrichment,
 		Search:         searcher,
 		Ask:            rag.NewEngine(searcher, st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal),
-		// Re-score = re-run the relevance stage standalone (no deps; the embedding
-		// already exists). Triggered by a fresh encounter or an engagement (§9).
-		// Coalesce: skip if a re-score for this artifact is already queued.
-		Rescore: func(ctx context.Context, tx *store.Store, artifactID string) error {
-			has, err := tx.Jobs.HasUnfinishedType(ctx, artifactID, pipeline.RescoreJobType)
-			if err != nil || has {
-				return err
-			}
-			_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: pipeline.RescoreJobType, ArtifactID: &artifactID})
-			return err
-		},
+		Rescore:        rescore,
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

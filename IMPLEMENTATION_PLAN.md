@@ -992,3 +992,32 @@ content-hash dedup).
 source due for refresh, calls the registered connector's `Fetch(since cursor)`,
 ingests each `RawItem` via the shared path, and persists the new cursor + health.
 Plus one concrete connector (RSS/Atom) and a cursor column.
+
+### Stage 2: Scheduler + RSS connector
+
+**Status: Complete.**
+
+- **Contract.** `SourceConnector` now takes the per-source `*Source` in `Fetch`/
+  `HealthCheck` (one connector instance serves many sources — feed URL/auth/cursor
+  come per-call), and `ID()` → `Name()`.
+- **Fetch state (migration 0005).** `sources.cursor`, `last_fetched_at`, `health`
+  columns; `SourceRepo.ListEnabledByKind` (the work list) and `UpdateFetchState`.
+  `kb.Health` gained stable lowercase JSON tags.
+- **`sources.Scheduler`.** `Run` ticks every `sourcePollInterval` (1m); `Tick`
+  polls each enabled PULL source whose schedule TTL (`{"every_seconds":N}`,
+  default 1h) has elapsed, calls the registered connector's `Fetch(src, cursor)`,
+  ingests each item through the **shared `ingest.Ingester`** (so pull == push),
+  and persists the new cursor + time + health. A per-source error is collected and
+  the rest still run; an unknown connector is skipped, not fatal; a fetch error
+  keeps the old cursor and records unhealthy.
+- **`sources/rss`.** RSS 2.0 + Atom parser over an SSRF-guarded client
+  (`ssrf.HTTPClient`). Returns items newer than the cursor (advancing it to the
+  newest item's time); items carry the article link so the fetch stage retrieves
+  full content; date-less items only on the first poll (so later polls don't
+  re-encounter them).
+- **`cmd/kbd`** registers the `rss` connector and runs the scheduler.
+
+This closes the biggest functional gap: the daemon now fetches on its own.
+
+**Deferred:** more connectors (HN, GitHub, email…); `storage_budget` enforcement;
+a `source_weight` yield feedback loop; surfacing source health via the API.

@@ -160,4 +160,8 @@ type Source struct {
 	SourceWeight   float64
 	Enabled        bool
 	CreatedAt      string
+	// PULL fetch state (§8.1 / §8.15), updated by the scheduler.
+	Cursor        *string // opaque incremental-fetch position
+	LastFetchedAt *string // last successful (or attempted) poll
+	Health        *string // JSON Health snapshot from the last poll
 }
