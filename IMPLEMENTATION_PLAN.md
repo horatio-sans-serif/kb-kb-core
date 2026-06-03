@@ -1100,6 +1100,25 @@ plus a registration. Every render is privacy-filtered and recorded.
   it has no foreign keys in either direction). `artifact_ids` round-trips as a
   JSON array.
 
-**Next:** Stage 2 — pandoc-backed renderers (pdf/html/docx/epub) + patat
-(terminal slides). Stage 3 — `POST /render` + `GET /renders` API, daemon wiring,
+## Stage 2: pandoc + patat renderers
+
+**Status: Complete.** The format renderers over the same assembled document:
+
+- **`render.Pandoc`** (html/pdf/docx/epub): pipes assembled Markdown through the
+  `pandoc` subprocess. One instance per format (the Renderer contract is
+  single-format); `pandocFormats` maps each to its `-t` writer/extension/`-s`
+  flag (pdf has no writer — the `.pdf` extension selects it). Security: content
+  travels on **stdin**, never argv, so no body/title can inject a flag; a missing
+  binary maps to `ErrRendererUnavailable` (→ 503, not 500); output is chmod'd
+  owner-only after pandoc writes it. The `run` field is the exec seam — unit
+  tests inject a fake; `TestPandoc_RealRoundTrip` exercises real pandoc when
+  present (it is, in this env). `PandocAvailable()` lets the daemon warn at start.
+- **`render.Patat`** (terminal slides): pure assembly (patat is an interactive
+  presenter, not a converter — the artifact is the deck file). YAML metadata
+  header (title + `wrap: true`), one slide per artifact separated by horizontal
+  rules. A body's own thematic break (`---`) is neutralized to an em-dash rule so
+  it can't fracture an artifact across slides; the title is YAML-quoted so a
+  `:`/`"` can't break the header.
+
+**Next:** Stage 3 — `POST /render` + `GET /renders` API, daemon wiring,
 `KB_RENDER_DIR` config.
