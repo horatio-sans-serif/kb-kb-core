@@ -13,6 +13,8 @@ type (
 	Source         = kb.Source
 	RenderRecord   = kb.RenderRecord
 	ReviewState    = kb.ReviewState
+	Entity         = kb.Entity
+	Link           = kb.Link
 	ArtifactPatch  = kb.ArtifactPatch
 	PrivacyTier    = kb.PrivacyTier
 	SourceKind     = kb.SourceKind

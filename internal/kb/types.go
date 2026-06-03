@@ -199,6 +199,27 @@ type RenderRecord struct {
 	CreatedAt   string
 }
 
+// Entity is a node in the knowledge graph (design §6.6 / §8.7): a person, org,
+// technology, concept, or place mentioned across artifacts. Deduped by (Kind,
+// Name); artifacts link to it via artifact_entities.
+type Entity struct {
+	ID      string
+	Kind    string // person|org|technology|concept|place
+	Name    string
+	Aliases []string
+}
+
+// Link is a directed edge between two artifacts in the knowledge graph (§6.6).
+// Relation is one of references|shares_entity|shares_topic|same_as|derived_from.
+// Backlinks are the reverse-direction query.
+type Link struct {
+	ID       string
+	SrcID    string
+	DstID    string
+	Relation string
+	Weight   float64
+}
+
 // ReviewState is an artifact's spaced-repetition schedule (design §6.9): an
 // SM-2 record of when it is next due, the current interval and ease factor, and
 // how many successful reviews it has had. One row per artifact (artifact_id PK).

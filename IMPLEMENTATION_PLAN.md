@@ -1208,3 +1208,28 @@ due-for-review items into the digest.
 This completes Phase 7 (surfacing): surface selector, digest rendering, and
 spaced repetition — the cyclic loop's delivery half over Phase 4 relevance and
 Phase 6 render.
+
+---
+
+# Phase 8 — Knowledge graph (§8.7)
+
+Entities and typed edges across artifacts, with N-hop traversal. The graph tables
+(entities, artifact_entities, links, topics) exist from Phase 0; this phase fills
+them.
+
+## Stage 1: Graph store layer
+
+**Status: Complete.** The pure persistence + traversal layer (no LLM):
+
+- **`store.GraphRepo`**: `UpsertEntity` (dedup keystone — `ON CONFLICT(kind,name)`
+  returns the canonical id, merges aliases without wiping); `LinkArtifactEntity`
+  (idempotent artifact↔entity); `EntitiesForArtifact` / `ArtifactsForEntity`
+  (live artifacts only); `AddLink` (directed edge, deduped on (src,dst,relation)
+  via migration `0007`'s unique index + INSERT OR IGNORE); `NeighborIDs`
+  (undirected adjacency over a frontier, live only); `ConnectedWithin(start,
+hops)` (bounded BFS with a visited set, excludes the start).
+- **`kb.Entity` / `kb.Link`** domain types.
+
+**Next:** Stage 2 — entity-extraction enricher (LLM → entities + shares_entity
+edges) in the pipeline. Stage 3 — graph query API (`GET /graph/{id}?hops=N`,
+backlinks).
