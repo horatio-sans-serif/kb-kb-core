@@ -16,19 +16,15 @@ const (
 	// maxEntitiesInputBytes caps the body sent to the model (~6k tokens).
 	maxEntitiesInputBytes = 24000
 	maxEntities           = 32  // a chatty model can't flood the graph
-	maxEntityNameLen      = 120 // an entity name is short; reject sentences
+	maxEntityNameLen      = 120 // an entity name is short (bytes); reject sentences
 	maxAliases            = 8
+	// maxSharesEntityFanout caps how many co-mentioning artifacts an entity may
+	// connect to. Past it the entity is a hub/stop-word ("AI", "Go") that carries
+	// no discriminating signal, so creating O(N) pairwise edges per new mention
+	// would only add O(N^2) noise: beyond the cap, the pairwise edges are skipped
+	// (the artifact_entities membership is still recorded).
+	maxSharesEntityFanout = 50
 )
-
-// GraphWriter is the slice of the graph store the entities stage needs. The
-// store's *GraphRepo satisfies it; the narrow interface keeps the enricher
-// testable and decoupled.
-type GraphWriter interface {
-	UpsertEntity(ctx context.Context, e *kb.Entity) (string, error)
-	LinkArtifactEntity(ctx context.Context, artifactID, entityID string) error
-	ArtifactsForEntity(ctx context.Context, entityID string) ([]string, error)
-	AddLink(ctx context.Context, src, dst, relation string, weight float64) error
-}
 
 var entitiesSchema = json.RawMessage(`{
   "type": "object",
@@ -65,20 +61,22 @@ type entitiesOutput struct {
 // Artifacts sharing an entity gain a shares_entity edge — the graph builds itself
 // during enrichment.
 //
-// The graph writes are idempotent (entity upsert by (kind,name); INSERT OR IGNORE
-// links/edges), so this stage is safe to re-run: the pipeline records completion
-// with an "entities" enrichment row, and a crash that re-runs Enrich re-derives
-// the same graph. local governs the privacy gate exactly as the summarize stage.
+// The LLM call (slow, non-deterministic) happens in Enrich, but the graph WRITES
+// are returned as an ApplyGraph hook the pipeline runs inside the effect
+// transaction — so they are atomic with the stage's completion (a rolled-back or
+// abandoned attempt writes no graph rows, and only the committing attempt's
+// entities land). local governs the privacy gate exactly as the summarize stage.
 type Entities struct {
 	client llm.Client
 	model  string
 	local  bool
-	graph  GraphWriter
 }
 
-// NewEntities wraps an LLM client and a graph writer as the "entities" stage.
-func NewEntities(client llm.Client, model string, local bool, graph GraphWriter) *Entities {
-	return &Entities{client: client, model: model, local: local, graph: graph}
+// NewEntities wraps an LLM client as the "entities" stage. The graph store is not
+// injected here — the pipeline passes the transaction-scoped graph repo to the
+// ApplyGraph hook this stage returns.
+func NewEntities(client llm.Client, model string, local bool) *Entities {
+	return &Entities{client: client, model: model, local: local}
 }
 
 func (*Entities) Name() string        { return "entities" }
@@ -101,56 +99,83 @@ func (e *Entities) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult,
 		return kb.EnrichResult{}, err
 	}
 
+	// Sanitize and de-duplicate within this response before any graph write.
+	seen := make(map[string]bool, len(out.Entities))
 	kept := make([]extractedEntity, 0, len(out.Entities))
 	for _, ex := range out.Entities {
 		ex.Name = strings.TrimSpace(ex.Name)
-		if ex.Name == "" || len(ex.Name) > maxEntityNameLen || !kb.ValidEntityKind(ex.Kind) {
-			continue // drop blank names, over-long names, out-of-vocabulary kinds
+		key := ex.Kind + "\x00" + ex.Name
+		if ex.Name == "" || len(ex.Name) > maxEntityNameLen || !kb.ValidEntityKind(ex.Kind) || seen[key] {
+			continue // drop blank/over-long names, out-of-vocabulary kinds, and dupes
 		}
-		if err := e.materialize(ctx, a.ID, ex); err != nil {
-			return kb.EnrichResult{}, err
-		}
-		kept = append(kept, extractedEntity{Name: ex.Name, Kind: ex.Kind})
+		seen[key] = true
+		kept = append(kept, extractedEntity{Name: ex.Name, Kind: ex.Kind, Aliases: normalizeAliases(ex.Aliases)})
 		if len(kept) >= maxEntities {
 			break
 		}
 	}
 
-	return kb.EnrichResult{Enrichments: []kb.Enrichment{{
-		ArtifactID:    a.ID,
-		Kind:          "entities",
-		Payload:       jsonString(entitiesOutput{Entities: kept}),
-		Model:         e.model,
-		PromptVersion: entitiesPromptVersion,
-	}}}, nil
+	artifactID := a.ID
+	return kb.EnrichResult{
+		Enrichments: []kb.Enrichment{{
+			ArtifactID:    artifactID,
+			Kind:          "entities",
+			Payload:       jsonString(entitiesOutput{Entities: payloadEntities(kept)}),
+			Model:         e.model,
+			PromptVersion: entitiesPromptVersion,
+		}},
+		ApplyGraph: func(ctx context.Context, g kb.GraphTx) error {
+			for _, ex := range kept {
+				if err := materialize(ctx, g, artifactID, ex); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}, nil
 }
 
 // materialize upserts one entity, links it to the artifact, and connects the
 // artifact to every other live artifact that already mentions the entity via a
-// canonical (deduped) shares_entity edge.
-func (e *Entities) materialize(ctx context.Context, artifactID string, ex extractedEntity) error {
-	entityID, err := e.graph.UpsertEntity(ctx, &kb.Entity{Kind: ex.Kind, Name: ex.Name, Aliases: normalizeAliases(ex.Aliases)})
+// canonical (deduped) shares_entity edge — unless the entity is a hub (mentioned
+// by more than maxSharesEntityFanout artifacts), in which case the pairwise edges
+// are skipped as noise but the membership link is still recorded.
+func materialize(ctx context.Context, g kb.GraphTx, artifactID string, ex extractedEntity) error {
+	entityID, err := g.UpsertEntity(ctx, &kb.Entity{Kind: ex.Kind, Name: ex.Name, Aliases: ex.Aliases})
 	if err != nil {
 		return err
 	}
 	// Co-mentioning artifacts BEFORE we add this one, so we don't self-edge.
-	others, err := e.graph.ArtifactsForEntity(ctx, entityID)
+	others, err := g.ArtifactsForEntity(ctx, entityID)
 	if err != nil {
 		return err
 	}
-	if err := e.graph.LinkArtifactEntity(ctx, artifactID, entityID); err != nil {
+	if err := g.LinkArtifactEntity(ctx, artifactID, entityID); err != nil {
 		return err
+	}
+	if len(others) > maxSharesEntityFanout {
+		return nil // hub entity: skip pairwise edges (Finding 2 — no signal, O(N^2) noise)
 	}
 	for _, other := range others {
 		if other == artifactID {
 			continue
 		}
 		src, dst := canonicalPair(artifactID, other)
-		if err := e.graph.AddLink(ctx, src, dst, "shares_entity", 1.0); err != nil {
+		if err := g.AddLink(ctx, src, dst, "shares_entity", 1.0); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// payloadEntities strips aliases from the recorded payload (the kinds/names are
+// the audit signal; aliases live on the entity rows).
+func payloadEntities(kept []extractedEntity) []extractedEntity {
+	out := make([]extractedEntity, len(kept))
+	for i, ex := range kept {
+		out[i] = extractedEntity{Name: ex.Name, Kind: ex.Kind}
+	}
+	return out
 }
 
 func (e *Entities) extract(ctx context.Context, title, body string) (entitiesOutput, error) {

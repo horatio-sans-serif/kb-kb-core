@@ -143,7 +143,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	enrichment.Register(enrich.NewFetch(fetch.New()))
 	enrichment.Register(enrich.NewSummarize(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewEmbed(llmClient, cfg.EmbedModel, cfg.OllamaIsLocal))
-	enrichment.Register(enrich.NewEntities(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal, st.Graph))
+	enrichment.Register(enrich.NewEntities(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	enrichment.SetRescoreStage(enrich.RelevanceStage) // re-scores re-run the relevance stage
 	enrichment.RegisterHandlers(st, runner, bus)

@@ -41,11 +41,27 @@ type ArtifactPatch struct {
 	RelevanceScore *float64
 }
 
-// EnrichResult is one enricher's output: zero or more enrichment rows plus an
-// optional patch to the artifact itself.
+// GraphTx is the subset of knowledge-graph writes an enricher applies inside the
+// pipeline's effect transaction (store.GraphRepo satisfies it). It lives here so
+// the kb domain package stays free of the storage layer; the pipeline passes the
+// transaction-scoped graph repo to EnrichResult.ApplyGraph.
+type GraphTx interface {
+	UpsertEntity(ctx context.Context, e *Entity) (string, error)
+	LinkArtifactEntity(ctx context.Context, artifactID, entityID string) error
+	ArtifactsForEntity(ctx context.Context, entityID string) ([]string, error)
+	AddLink(ctx context.Context, src, dst, relation string, weight float64) error
+}
+
+// EnrichResult is one enricher's output: zero or more enrichment rows, an optional
+// patch to the artifact itself, and an optional graph mutation. ApplyGraph (when
+// set) runs inside the same transaction that writes the enrichment rows and marks
+// the job done, so graph effects are exactly-once with the stage's completion — a
+// failed/abandoned attempt writes nothing, unlike a side effect performed during
+// the (non-transactional) Enrich call.
 type EnrichResult struct {
 	Enrichments []Enrichment
 	Patch       *ArtifactPatch
+	ApplyGraph  func(ctx context.Context, g GraphTx) error
 }
 
 // Enricher is one stage of the enrichment pipeline DAG (design §7 / §5).

@@ -242,6 +242,14 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 					return err
 				}
 			}
+			// Graph mutations (entity links, edges) run in the same tx so they are
+			// atomic with the stage's completion: a rolled-back attempt leaves no
+			// graph rows, and only the committing attempt's effects ever land.
+			if res.ApplyGraph != nil {
+				if err := res.ApplyGraph(ctx, tx.Graph); err != nil {
+					return err
+				}
+			}
 			return tx.Jobs.MarkDone(ctx, job.ID)
 		})
 	}

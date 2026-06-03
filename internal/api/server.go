@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -807,7 +808,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	if hs := r.URL.Query().Get("hops"); hs != "" {
 		n, err := strconv.Atoi(hs)
 		if err != nil || n < 1 || n > maxGraphHops {
-			http.Error(w, "hops must be between 1 and 5", http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("hops must be between 1 and %d", maxGraphHops), http.StatusBadRequest)
 			return
 		}
 		hops = n
