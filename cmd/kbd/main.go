@@ -248,6 +248,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Search:         searcher,
 		Ask:            rag.NewEngine(searcher, st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal),
 		Rescore:        rescore,
+		Connectors:     registry,
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

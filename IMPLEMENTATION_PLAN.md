@@ -1036,6 +1036,24 @@ This closes the biggest functional gap: the daemon now fetches on its own.
 - **Hardening (P3):** reject non-http(s) feed URLs early; capture Atom
   `type="xhtml"` content via innerxml; bound the health `Detail` string.
 
-**Deferred:** more connectors (HN, GitHub, email…); `storage_budget` enforcement;
-a `source_weight` yield feedback loop; surfacing source health via the API; the
-failed-poll-delays-retry-by-a-full-TTL trade-off (a separate error-retry floor).
+### Stage 3: Source management API
+
+**Status: Complete.** PULL sources could only be created programmatically, making
+the feature unusable end to end. Added:
+
+- **`POST /sources`** (bearer-auth): create a source `{kind, connector, config,
+schedule?, default_privacy?}`. Validates the kind, that the connector is one the
+  daemon registered (`api.ConnectorRegistry`, satisfied by `*sources.Registry` —
+  an unusable source can't be created; the error lists available connectors), and
+  that config/schedule are valid JSON. Returns the persisted source (201).
+- **`GET /sources`**: list configured sources with `enabled`, `last_fetched_at`,
+  and the `health` snapshot from the last poll — the operator can see what's
+  running and whether it's healthy.
+
+You can now add an RSS feed and watch it: `POST /sources {connector:"rss",
+config:{url:...}}` → the scheduler polls it → `GET /sources` shows health.
+
+**Deferred:** more connectors (HN, GitHub, email…); source update/delete
+endpoints; `storage_budget` enforcement; a `source_weight` yield feedback loop;
+the failed-poll-delays-retry-by-a-full-TTL trade-off (a separate error-retry
+floor).

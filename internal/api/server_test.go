@@ -799,6 +799,82 @@ func TestEngage_MissingArtifactIDIs400(t *testing.T) {
 	}
 }
 
+type fakeRegistry struct{ have map[string]bool }
+
+func (f fakeRegistry) Has(n string) bool { return f.have[n] }
+func (f fakeRegistry) Names() []string {
+	var out []string
+	for n := range f.have {
+		out = append(out, n)
+	}
+	return out
+}
+
+func TestSources_CreateAndList(t *testing.T) {
+	st := newStore(t)
+	reg := fakeRegistry{have: map[string]bool{"rss": true}}
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Connectors: reg}).Handler()
+
+	rec := doPost(h, "/sources", `{"kind":"PULL","connector":"rss","config":{"url":"https://e.com/feed"},"schedule":{"every_seconds":1800}}`, "tok")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID        string `json:"id"`
+		Connector string `json:"connector"`
+		Enabled   bool   `json:"enabled"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if created.ID == "" || created.Connector != "rss" || !created.Enabled {
+		t.Errorf("created = %+v, want a registered enabled rss source", created)
+	}
+
+	lrec := doGet(h, "/sources", "tok")
+	if lrec.Code != http.StatusOK {
+		t.Fatalf("list status = %d", lrec.Code)
+	}
+	var list struct {
+		Sources []struct {
+			ID        string `json:"id"`
+			Connector string `json:"connector"`
+		} `json:"sources"`
+	}
+	if err := json.Unmarshal(lrec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.Sources) != 1 || list.Sources[0].ID != created.ID {
+		t.Errorf("list = %+v, want the created source", list.Sources)
+	}
+}
+
+func TestSources_UnknownConnectorIs400(t *testing.T) {
+	st := newStore(t)
+	reg := fakeRegistry{have: map[string]bool{"rss": true}}
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Connectors: reg}).Handler()
+	if rec := doPost(h, "/sources", `{"kind":"PULL","connector":"nope"}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an unknown connector", rec.Code)
+	}
+}
+
+func TestSources_InvalidKindIs400(t *testing.T) {
+	st := newStore(t)
+	reg := fakeRegistry{have: map[string]bool{"rss": true}}
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Connectors: reg}).Handler()
+	if rec := doPost(h, "/sources", `{"kind":"BOGUS","connector":"rss"}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an invalid kind", rec.Code)
+	}
+}
+
+func TestSources_NotConfiguredIs503(t *testing.T) {
+	st := newStore(t)
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()}).Handler() // no Connectors
+	if rec := doPost(h, "/sources", `{"kind":"PULL","connector":"rss"}`, "tok"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when source management is not configured", rec.Code)
+	}
+}
+
 func doGet(h http.Handler, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	if token != "" {

@@ -39,6 +39,14 @@ type Asker interface {
 	Answer(ctx context.Context, query string, k int) (rag.Answer, error)
 }
 
+// ConnectorRegistry reports which source connectors are available (satisfied by
+// *sources.Registry); /sources uses it to reject an unknown connector at create
+// time. When nil, source creation is not offered (503).
+type ConnectorRegistry interface {
+	Has(name string) bool
+	Names() []string
+}
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -51,6 +59,7 @@ type Deps struct {
 	Search         Searcher
 	Ask            Asker
 	Rescore        ingest.RescoreFunc
+	Connectors     ConnectorRegistry
 }
 
 // Server wires the HTTP handlers.
@@ -80,6 +89,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /engage", s.requireAuth(http.HandlerFunc(s.handleEngage)))
 	mux.Handle("GET /search", s.requireAuth(http.HandlerFunc(s.handleSearch)))
 	mux.Handle("GET /ask", s.requireAuth(http.HandlerFunc(s.handleAsk)))
+	mux.Handle("POST /sources", s.requireAuth(http.HandlerFunc(s.handleCreateSource)))
+	mux.Handle("GET /sources", s.requireAuth(http.HandlerFunc(s.handleListSources)))
 	return mux
 }
 
@@ -265,6 +276,119 @@ func (s *Server) handleEngage(w http.ResponseWriter, r *http.Request) {
 // errNoSuchArtifact rolls back the engage transaction for an unknown/tombstoned
 // artifact so the handler can return 404 (a sentinel, not a store error).
 var errNoSuchArtifact = errors.New("api: no such artifact")
+
+type createSourceRequest struct {
+	Kind           string          `json:"kind"` // PULL | PUSH | AMBIENT
+	Connector      string          `json:"connector"`
+	Config         json.RawMessage `json:"config,omitempty"`          // connector config object, e.g. {"url":"..."}
+	Schedule       json.RawMessage `json:"schedule,omitempty"`        // e.g. {"every_seconds":1800}
+	DefaultPrivacy string          `json:"default_privacy,omitempty"` // default personal
+}
+
+type sourceJSON struct {
+	ID             string          `json:"id"`
+	Kind           string          `json:"kind"`
+	Connector      string          `json:"connector"`
+	Enabled        bool            `json:"enabled"`
+	DefaultPrivacy string          `json:"default_privacy"`
+	LastFetchedAt  string          `json:"last_fetched_at,omitempty"`
+	Health         json.RawMessage `json:"health,omitempty"`
+}
+
+func validKind(k string) bool {
+	switch k {
+	case "PULL", "PUSH", "AMBIENT":
+		return true
+	}
+	return false
+}
+
+// handleCreateSource registers a source (e.g. an RSS feed). The connector must be
+// one the daemon has registered, so an unusable source can't be created.
+func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Connectors == nil {
+		http.Error(w, "source management not configured", http.StatusServiceUnavailable)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var req createSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	switch {
+	case !validKind(req.Kind):
+		http.Error(w, "kind must be PULL, PUSH, or AMBIENT", http.StatusBadRequest)
+		return
+	case req.Connector == "" || !s.deps.Connectors.Has(req.Connector):
+		http.Error(w, "unknown connector (available: "+strings.Join(s.deps.Connectors.Names(), ", ")+")", http.StatusBadRequest)
+		return
+	case req.DefaultPrivacy != "" && !validPrivacy(req.DefaultPrivacy):
+		http.Error(w, "invalid default_privacy", http.StatusBadRequest)
+		return
+	case len(req.Config) > 0 && !json.Valid(req.Config):
+		http.Error(w, "config must be a JSON object", http.StatusBadRequest)
+		return
+	case len(req.Schedule) > 0 && !json.Valid(req.Schedule):
+		http.Error(w, "schedule must be a JSON object", http.StatusBadRequest)
+		return
+	}
+
+	src := &store.Source{Kind: kb.SourceKind(req.Kind), Connector: req.Connector}
+	if len(req.Config) > 0 {
+		src.Config = string(req.Config)
+	}
+	if len(req.Schedule) > 0 {
+		sc := string(req.Schedule)
+		src.Schedule = &sc
+	}
+	if req.DefaultPrivacy != "" {
+		src.DefaultPrivacy = kb.PrivacyTier(req.DefaultPrivacy)
+	}
+	if err := s.deps.Store.Sources.Create(r.Context(), src); err != nil {
+		s.serverError(w, "create source", err)
+		return
+	}
+	// Re-read so the response reflects the persisted row (schema defaults like
+	// enabled/source_weight that Create does not write back into the struct).
+	created, err := s.deps.Store.Sources.Get(r.Context(), src.ID)
+	if err != nil {
+		s.serverError(w, "load created source", err)
+		return
+	}
+	s.writeJSON(w, http.StatusCreated, toSourceJSON(created))
+}
+
+// handleListSources lists configured sources with their last poll time and health.
+func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request) {
+	srcs, err := s.deps.Store.Sources.List(r.Context())
+	if err != nil {
+		s.serverError(w, "list sources", err)
+		return
+	}
+	out := make([]sourceJSON, 0, len(srcs))
+	for _, src := range srcs {
+		out = append(out, toSourceJSON(src))
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"sources": out})
+}
+
+func toSourceJSON(src *store.Source) sourceJSON {
+	j := sourceJSON{
+		ID:             src.ID,
+		Kind:           string(src.Kind),
+		Connector:      src.Connector,
+		Enabled:        src.Enabled,
+		DefaultPrivacy: string(src.DefaultPrivacy),
+	}
+	if src.LastFetchedAt != nil {
+		j.LastFetchedAt = *src.LastFetchedAt
+	}
+	if src.Health != nil {
+		j.Health = json.RawMessage(*src.Health)
+	}
+	return j
+}
 
 type searchResultJSON struct {
 	ArtifactID string  `json:"artifact_id"`
