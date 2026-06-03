@@ -199,6 +199,17 @@ type RenderRecord struct {
 	CreatedAt   string
 }
 
+// ReviewState is an artifact's spaced-repetition schedule (design §6.9): an
+// SM-2 record of when it is next due, the current interval and ease factor, and
+// how many successful reviews it has had. One row per artifact (artifact_id PK).
+type ReviewState struct {
+	ArtifactID   string
+	NextReviewAt string
+	IntervalDays float64
+	Ease         float64
+	Reviews      int
+}
+
 // Source is a registered origin of artifacts (design §6.1). Behavioral source
 // connectors implement the Source interface in contracts.go; this is the stored
 // configuration row.

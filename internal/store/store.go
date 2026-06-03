@@ -41,6 +41,7 @@ type Store struct {
 	Enrichments *EnrichmentRepo
 	Jobs        *JobRepo
 	Renders     *RenderRepo
+	Reviews     *ReviewRepo
 }
 
 // New wires the repositories to a single pool for both reads and writes (used in
@@ -66,6 +67,7 @@ func newStore(db *sql.DB, q, rq Querier) *Store {
 		Enrichments: &EnrichmentRepo{q: q, rq: rq},
 		Jobs:        &JobRepo{q: q, rq: rq},
 		Renders:     &RenderRepo{q: q, rq: rq},
+		Reviews:     &ReviewRepo{q: q, rq: rq},
 	}
 }
 

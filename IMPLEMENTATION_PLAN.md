@@ -1184,5 +1184,27 @@ and defaults to `personal`. An empty surface → 422; render errors map via the
 shared `writeRenderError` (also refactored out of `/render`). `source_query` is
 recorded as `digest` so `GET /renders` distinguishes digest outputs.
 
-**Next:** Stage 3 — spaced repetition (`review_schedule`, SM-2) + a
-due-for-review queue.
+## Stage 3: Spaced repetition (SM-2) + review queue
+
+**Status: Complete.** The `review_schedule` table goes live:
+
+- **`review.Schedule`** (pure SM-2): a recall grade 0..5 advances the schedule —
+  ease adjusted per grade and floored at 1.3; a grade <3 lapses (reps/interval
+  reset, ease still decays); 3+ gives 1 day, then 6, then `round(interval ×
+ease)`. Grades are clamped.
+- **`store.ReviewRepo`** (Upsert/Get/Due) over `review_schedule`; `Due(now,
+limit)` returns schedules with `next_review_at <= now`, soonest first.
+- **`review.Service`**: loads the prior schedule (default if new), applies SM-2,
+  sets `next_review_at = now + interval`, persists; `Due` joins with the artifact
+  for display, dropping tombstoned ones. Clock is injectable (tested).
+- **`POST /review`** `{artifact_id, grade}` → updated schedule (404 for an
+  unknown artifact, 400 for a grade outside 0..5). **`GET /review/due`** → the
+  queue. Wired in the daemon.
+
+**Deferred:** auto-seed a schedule on first engagement (engage → review-soon); a
+daily-queue cap (5–10) and serendipity/trend signals (§8.11); surfacing
+due-for-review items into the digest.
+
+This completes Phase 7 (surfacing): surface selector, digest rendering, and
+spaced repetition — the cyclic loop's delivery half over Phase 4 relevance and
+Phase 6 render.

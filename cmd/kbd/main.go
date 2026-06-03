@@ -30,6 +30,7 @@ import (
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
 	"kb/internal/render"
+	"kb/internal/review"
 	"kb/internal/search"
 	"kb/internal/sources"
 	"kb/internal/sources/rss"
@@ -282,6 +283,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Connectors:     registry,
 		Render:         renderSvc,
 		Surface:        surface.New(st),
+		Review:         review.New(st),
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

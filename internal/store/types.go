@@ -12,6 +12,7 @@ type (
 	Enrichment     = kb.Enrichment
 	Source         = kb.Source
 	RenderRecord   = kb.RenderRecord
+	ReviewState    = kb.ReviewState
 	ArtifactPatch  = kb.ArtifactPatch
 	PrivacyTier    = kb.PrivacyTier
 	SourceKind     = kb.SourceKind

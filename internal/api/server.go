@@ -17,6 +17,7 @@ import (
 	"kb/internal/kb"
 	"kb/internal/rag"
 	"kb/internal/render"
+	"kb/internal/review"
 	"kb/internal/search"
 	"kb/internal/store"
 	"kb/internal/surface"
@@ -64,6 +65,13 @@ type Surfacer interface {
 	Surface(ctx context.Context, opts surface.Options) ([]*kb.Artifact, error)
 }
 
+// ReviewService records spaced-repetition reviews and lists what's due (satisfied
+// by *review.Service). When nil, the /review routes report 503.
+type ReviewService interface {
+	Record(ctx context.Context, artifactID string, grade int) (*kb.ReviewState, error)
+	Due(ctx context.Context, limit int) ([]review.DueItem, error)
+}
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -79,6 +87,7 @@ type Deps struct {
 	Connectors     ConnectorRegistry
 	Render         RenderService
 	Surface        Surfacer
+	Review         ReviewService
 }
 
 // Server wires the HTTP handlers.
@@ -114,6 +123,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /renders", s.requireAuth(http.HandlerFunc(s.handleListRenders)))
 	mux.Handle("GET /surface", s.requireAuth(http.HandlerFunc(s.handleSurface)))
 	mux.Handle("POST /digest", s.requireAuth(http.HandlerFunc(s.handleDigest)))
+	mux.Handle("POST /review", s.requireAuth(http.HandlerFunc(s.handleReview)))
+	mux.Handle("GET /review/due", s.requireAuth(http.HandlerFunc(s.handleReviewDue)))
 	return mux
 }
 
@@ -757,6 +768,109 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
+}
+
+type reviewRequest struct {
+	ArtifactID string `json:"artifact_id"`
+	Grade      *int   `json:"grade"` // 0..5; pointer so a missing grade is distinguishable from 0
+}
+
+type reviewJSON struct {
+	ArtifactID   string  `json:"artifact_id"`
+	NextReviewAt string  `json:"next_review_at"`
+	IntervalDays float64 `json:"interval_days"`
+	Ease         float64 `json:"ease"`
+	Reviews      int     `json:"reviews"`
+}
+
+type dueItemJSON struct {
+	ArtifactID   string  `json:"artifact_id"`
+	Title        string  `json:"title,omitempty"`
+	URL          string  `json:"url,omitempty"`
+	NextReviewAt string  `json:"next_review_at"`
+	IntervalDays float64 `json:"interval_days"`
+	Reviews      int     `json:"reviews"`
+}
+
+// handleReview records a spaced-repetition recall grade (0..5) for an artifact and
+// returns the updated schedule (§8.11). A grade <3 lapses the item; 3+ lengthens
+// the interval.
+func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Review == nil {
+		http.Error(w, "review not configured", http.StatusServiceUnavailable)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req reviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	switch {
+	case req.ArtifactID == "" || len(req.ArtifactID) > maxSourceIDBytes || !ingest.ValidText(req.ArtifactID, false):
+		http.Error(w, "valid artifact_id is required", http.StatusBadRequest)
+		return
+	case req.Grade == nil || *req.Grade < 0 || *req.Grade > 5:
+		http.Error(w, "grade must be an integer 0..5", http.StatusBadRequest)
+		return
+	}
+
+	rs, err := s.deps.Review.Record(r.Context(), req.ArtifactID, *req.Grade)
+	if errors.Is(err, review.ErrArtifactNotFound) {
+		http.Error(w, "unknown artifact_id", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.serverError(w, "review", err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, reviewJSON{
+		ArtifactID:   rs.ArtifactID,
+		NextReviewAt: rs.NextReviewAt,
+		IntervalDays: rs.IntervalDays,
+		Ease:         rs.Ease,
+		Reviews:      rs.Reviews,
+	})
+}
+
+// handleReviewDue lists the artifacts due for review now, soonest first.
+func (s *Server) handleReviewDue(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Review == nil {
+		http.Error(w, "review not configured", http.StatusServiceUnavailable)
+		return
+	}
+	limit := 20
+	if ls := r.URL.Query().Get("limit"); ls != "" {
+		n, err := strconv.Atoi(ls)
+		if err != nil || n < 1 || n > maxSurfaceLimit {
+			http.Error(w, "limit must be between 1 and 200", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+
+	items, err := s.deps.Review.Due(r.Context(), limit)
+	if err != nil {
+		s.serverError(w, "review due", err)
+		return
+	}
+	out := make([]dueItemJSON, 0, len(items))
+	for _, it := range items {
+		out = append(out, dueItemJSON{
+			ArtifactID:   it.ArtifactID,
+			Title:        it.Title,
+			URL:          it.URL,
+			NextReviewAt: it.NextReviewAt,
+			IntervalDays: it.IntervalDays,
+			Reviews:      it.Reviews,
+		})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"due": out})
 }
 
 // normalizeTimestamp parses s as a store-format or RFC3339 timestamp and returns
