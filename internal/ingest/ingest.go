@@ -6,6 +6,7 @@ package ingest
 
 import (
 	"context"
+	"fmt"
 	"unicode/utf8"
 
 	"kb/internal/events"
@@ -47,7 +48,8 @@ type Ingester struct {
 	bus     *events.Bus
 }
 
-// New builds an Ingester. enqueue/rescore may be nil.
+// New builds an Ingester. enqueue, rescore, and bus may each be nil (no pipeline,
+// no re-score, no event published, respectively).
 func New(st *store.Store, enqueue Enqueuer, rescore RescoreFunc, bus *events.Bus) *Ingester {
 	return &Ingester{st: st, enqueue: enqueue, rescore: rescore, bus: bus}
 }
@@ -57,6 +59,14 @@ func New(st *store.Store, enqueue Enqueuer, rescore RescoreFunc, bus *events.Bus
 // artifact.ingested only after the transaction commits (a rolled-back ingest
 // emits no event). Returns the artifact id.
 func (i *Ingester) Ingest(ctx context.Context, item Item) (string, error) {
+	// The dedup key is the artifact's identity. Without one, the note path would
+	// insert content_hash="" — a live value under the partial unique index — so
+	// unrelated empty-keyed items would silently collapse into one artifact. Make
+	// the "exactly one key" invariant real for every caller of this shared seam.
+	if item.CanonicalURL == "" && item.ContentHash == "" {
+		return "", fmt.Errorf("ingest: item has neither a canonical URL nor a content hash")
+	}
+
 	var artifactID string
 	err := i.st.Tx(ctx, func(tx *store.Store) error {
 		a := &store.Artifact{Type: item.Type, Title: item.Title, PrivacyTier: item.Tier}
@@ -101,8 +111,10 @@ func (i *Ingester) Ingest(ctx context.Context, item Item) (string, error) {
 		return "", err
 	}
 
-	i.bus.Publish(events.New(events.ArtifactIngested,
-		map[string]string{"artifact_id": artifactID, "source_id": item.SourceID}))
+	if i.bus != nil {
+		i.bus.Publish(events.New(events.ArtifactIngested,
+			map[string]string{"artifact_id": artifactID, "source_id": item.SourceID}))
+	}
 	return artifactID, nil
 }
 

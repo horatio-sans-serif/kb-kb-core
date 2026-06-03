@@ -86,6 +86,16 @@ func TestIngest_ReEncounterRescoresNotReenqueues(t *testing.T) {
 	}
 }
 
+func TestIngest_RejectsItemWithoutKey(t *testing.T) {
+	st := storetest.New(t)
+	ing := New(st, &countingEnqueuer{}, nil, events.NewBus())
+	src := newSource(t, st)
+	// Neither CanonicalURL nor ContentHash — must fail, not insert content_hash="".
+	if _, err := ing.Ingest(context.Background(), Item{SourceID: src, Type: kb.Note, Body: "x", Tier: kb.Personal}); err == nil {
+		t.Error("an item with no dedup key must be rejected (would corrupt content-hash dedup)")
+	}
+}
+
 func TestIngest_NoteDedupByContentHash(t *testing.T) {
 	st := storetest.New(t)
 	ctx := context.Background()
