@@ -183,7 +183,16 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// recency decay takes effect (the score otherwise only recomputes on
 	// ingest/engage/re-encounter). Best-effort and patch-only (no enrichment rows).
 	sweeper := decay.NewSweeper(st, profile)
+	runSweep := func() {
+		switch n, err := sweeper.Sweep(ctx); {
+		case err != nil && ctx.Err() == nil:
+			logger.Warn("relevance decay sweep", "err", err)
+		case n > 0:
+			logger.Info("relevance decay sweep", "rescored", n)
+		}
+	}
 	go func() {
+		runSweep() // once at startup: fix scores that went stale across downtime
 		t := time.NewTicker(decayInterval)
 		defer t.Stop()
 		for {
@@ -191,12 +200,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				switch n, err := sweeper.Sweep(ctx); {
-				case err != nil && ctx.Err() == nil:
-					logger.Warn("relevance decay sweep", "err", err)
-				case n > 0:
-					logger.Info("relevance decay sweep", "rescored", n)
-				}
+				runSweep()
 			}
 		}
 	}()

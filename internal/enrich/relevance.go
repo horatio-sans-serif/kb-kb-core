@@ -72,7 +72,7 @@ func (r *Relevance) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 
 	bd := relevance.Score(relevance.Inputs{
 		Match:        r.profile.MatchWith(sig.Embedding, engaged),
-		AgeHours:     relevance.AgeHours(a.LastSeenAt, r.now()),
+		AgeHours:     relevance.AgeHours(a.RecencyAnchor(), r.now()),
 		Encounters:   sig.Encounters,
 		Engaged:      a.LastEngagedAt != nil,
 		SourceWeight: sig.SourceWeight,

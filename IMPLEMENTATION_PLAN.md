@@ -951,6 +951,21 @@ This completes the §9 living-profile arc: relevance is now fully alive — prof
 match (static + engaged), recency (with a decay sweep), engagement, encounter, and
 source weight, recomputed on events and on a schedule.
 
+**Review fixes applied (Stage 3):**
+
+- **Right decay clock.** The recency factor now decays from `RecencyAnchor()` =
+  `last_engaged_at` (or `first_seen_at` if never engaged), not `last_seen_at`. A
+  re-sighting from a feed bumps `last_seen_at` and previously reset decay, so a
+  stale-but-still-sighted, unengaged artifact never faded — defeating the feature.
+  Recency now tracks user-staleness; re-sighting stays the encounter factor's job.
+  Applied to BOTH the enricher and the sweep so they agree.
+- **Skip-and-continue.** A per-artifact error (corrupt embedding, failed patch) is
+  collected (`errors.Join`) and the sweep continues — one poison row can't wedge
+  the whole corpus. Only ctx cancellation aborts. Dim-mismatched embeddings are
+  skipped rather than scored to ~0.
+- **Startup sweep.** Runs once at startup (then every 6h) to fix scores that went
+  stale across downtime.
+
 **Deferred:** enrichment-row retention; rerank + citation validation; chunk-level
 embeddings; a partial `last_engaged_at` index if the engaged query gets hot;
 cr-sqlite peer sync (Phase 10).

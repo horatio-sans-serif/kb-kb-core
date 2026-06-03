@@ -98,6 +98,18 @@ type Artifact struct {
 	UpdatedAt      string
 }
 
+// RecencyAnchor is the timestamp the relevance recency factor decays from: the
+// last engagement if any, else when the artifact first entered the KB. It is
+// deliberately NOT last_seen_at — a re-sighting from a feed must not reset
+// user-staleness (that is the encounter factor's signal, §8.9), so a stale,
+// unengaged artifact keeps decaying even while it is still being re-sighted.
+func (a *Artifact) RecencyAnchor() string {
+	if a.LastEngagedAt != nil {
+		return *a.LastEngagedAt
+	}
+	return a.FirstSeenAt
+}
+
 // Encounter records one sighting of an artifact from one source (design §6.3).
 // Encounters accumulate; their count is itself a relevance signal (§8.9).
 type Encounter struct {
