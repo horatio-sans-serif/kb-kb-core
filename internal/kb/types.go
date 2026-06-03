@@ -30,6 +30,43 @@ func (t PrivacyTier) AllowsCloud() bool {
 	return t == Public || t == Personal
 }
 
+// Rank orders tiers by sensitivity (public 0 < personal 1 < sensitive 2 <
+// restricted 3). The export/render filter (§8.14) and privacy_max are defined in
+// terms of this order. An unknown tier ranks above everything, so it is excluded
+// by any ceiling and never silently treated as public.
+func (t PrivacyTier) Rank() int {
+	switch t {
+	case Public:
+		return 0
+	case Personal:
+		return 1
+	case Sensitive:
+		return 2
+	case Restricted:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// AtMost reports whether t is no more sensitive than ceiling — the per-artifact
+// predicate the render export filter applies before an artifact is included.
+func (t PrivacyTier) AtMost(ceiling PrivacyTier) bool {
+	return t.Rank() <= ceiling.Rank()
+}
+
+// MaxTier returns the most sensitive of the given tiers, or Public for none — the
+// privacy_max a render records (the highest tier of any included artifact, §8.14).
+func MaxTier(tiers ...PrivacyTier) PrivacyTier {
+	max := Public
+	for _, t := range tiers {
+		if t.Rank() > max.Rank() {
+			max = t
+		}
+	}
+	return max
+}
+
 // SourceKind is how a source delivers content (design §7).
 type SourceKind string
 
@@ -143,6 +180,23 @@ type EmbeddingPayload struct {
 	Model  string    `json:"model"`
 	Dim    int       `json:"dim"`
 	Vector []float32 `json:"vector"`
+}
+
+// RenderRecord is a persisted record of one output the render layer produced
+// (design §6.11 / §8.14). It is a provenance/audit row, not the bytes
+// themselves: OutputPath points at the rendered file on disk. PrivacyMax is the
+// most sensitive tier of any included artifact — the export-filter ceiling
+// actually realized, recorded so a later reader can reason about where the file
+// may go. (The "render" ArtifactType is a distinct concept: a rendered output
+// re-ingested as a knowledge artifact in the cyclic model, §2.)
+type RenderRecord struct {
+	ID          string
+	Format      string
+	SourceQuery string   // the query/description that selected the artifacts (optional)
+	ArtifactIDs []string // the included artifacts, in render order
+	OutputPath  string
+	PrivacyMax  PrivacyTier
+	CreatedAt   string
 }
 
 // Source is a registered origin of artifacts (design §6.1). Behavioral source

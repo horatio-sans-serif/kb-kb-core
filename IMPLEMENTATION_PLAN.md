@@ -1065,3 +1065,41 @@ re-read (removing the 500-after-success window); 413 on an over-limit body
 endpoints; `storage_budget` enforcement; a `source_weight` yield feedback loop;
 the failed-poll-delays-retry-by-a-full-TTL trade-off (a separate error-retry
 floor).
+
+---
+
+# Phase 6 — Output / Render layer (§8.14)
+
+The cyclic model's output half: a set of artifacts becomes a single assembled
+Markdown document, then a `Renderer` turns that document into a target format.
+Because bodies are already Markdown, the whole layer rides one contract —
+`artifact(s) -> assembled Markdown -> format` — so a new format is a new Renderer
+plus a registration. Every render is privacy-filtered and recorded.
+
+## Stage 1: Render core (assembly + Markdown renderer + dispatch)
+
+**Status: Complete.** The in-process foundation, no subprocess:
+
+- **Privacy ordering** (`kb.PrivacyTier.Rank/AtMost`, `kb.MaxTier`): the
+  sensitivity order the export filter and `privacy_max` are defined in. An
+  unknown tier ranks above everything, so it is excluded by any ceiling rather
+  than silently treated as public.
+- **`render.Assemble`** (pure): artifacts → one Markdown document (H1 title, then
+  per artifact an H2, the source URL as a CommonMark autolink, the body). Heading
+  whitespace is collapsed so a multi-line title can't break the document.
+- **`render.Markdown`** renderer (implements `kb.Renderer`): writes the assembled
+  document to `<dir>/<name>.md`, owner-only (a render may hold restricted
+  content), with a basename-traversal guard on the caller-supplied name.
+- **`render.Registry`**: format → Renderer (mirrors the connector registry).
+- **`render.Service`**: resolves artifact ids (dropping tombstoned ones, like
+  retrieval), applies the privacy ceiling, dispatches to the renderer, and
+  persists a `RenderRecord`. The render id names the output file, so file and
+  provenance row share one identity.
+- **`kb.RenderRecord` + `store.RenderRepo`** over the existing `renders` table;
+  migration `0006` extends the `format` CHECK with `markdown` (the table rebuilt,
+  it has no foreign keys in either direction). `artifact_ids` round-trips as a
+  JSON array.
+
+**Next:** Stage 2 — pandoc-backed renderers (pdf/html/docx/epub) + patat
+(terminal slides). Stage 3 — `POST /render` + `GET /renders` API, daemon wiring,
+`KB_RENDER_DIR` config.

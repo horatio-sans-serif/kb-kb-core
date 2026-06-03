@@ -11,6 +11,7 @@ type (
 	Encounter      = kb.Encounter
 	Enrichment     = kb.Enrichment
 	Source         = kb.Source
+	RenderRecord   = kb.RenderRecord
 	ArtifactPatch  = kb.ArtifactPatch
 	PrivacyTier    = kb.PrivacyTier
 	SourceKind     = kb.SourceKind
