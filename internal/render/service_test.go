@@ -66,6 +66,36 @@ func TestService_RenderEndToEnd(t *testing.T) {
 	}
 }
 
+// errRenderer is a Renderer that always fails, for the no-orphan-row test.
+type errRenderer struct{}
+
+func (errRenderer) Format() string { return "boom" }
+func (errRenderer) Render(context.Context, []*kb.Artifact, kb.RenderOpts) (kb.Rendered, error) {
+	return kb.Rendered{}, errors.New("render exploded")
+}
+
+func TestService_RendererFailure_NoRow(t *testing.T) {
+	// The "file and provenance row share one identity" invariant depends on the
+	// row being written only after a successful render. A renderer failure must
+	// leave no orphan row.
+	ctx := context.Background()
+	st := storetest.New(t)
+	reg := NewRegistry()
+	reg.Register(errRenderer{})
+	svc := NewService(st, reg)
+
+	_, err := svc.Render(ctx, Request{Format: "boom"})
+	if err == nil {
+		t.Fatal("expected the renderer error to propagate")
+	}
+	if !strings.Contains(err.Error(), "render exploded") {
+		t.Errorf("renderer error not wrapped through: %v", err)
+	}
+	if list, _ := st.Renders.List(ctx); len(list) != 0 {
+		t.Errorf("a failed render must not persist a row, got %d", len(list))
+	}
+}
+
 func TestService_UnknownFormat(t *testing.T) {
 	svc := NewService(storetest.New(t), NewRegistry())
 	_, err := svc.Render(context.Background(), Request{Format: "wat"})
@@ -109,6 +139,30 @@ func TestService_PrivacyCeilingExcludes(t *testing.T) {
 	b, _ := os.ReadFile(rec.OutputPath)
 	if strings.Contains(string(b), "classified") {
 		t.Error("filtered-out restricted content leaked into the render")
+	}
+}
+
+func TestService_InvalidCeilingIsRejected(t *testing.T) {
+	// A non-empty but invalid ceiling must fail closed: silently including every
+	// tier because the string didn't parse would be a fail-open privacy hole.
+	ctx := context.Background()
+	st := storetest.New(t)
+	reg := NewRegistry()
+	reg.Register(NewMarkdown(t.TempDir()))
+	svc := NewService(st, reg)
+
+	h := "h"
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &kb.Artifact{Type: "note", Title: "x", BodyMarkdown: "y", ContentHash: &h, PrivacyTier: kb.Restricted})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	_, err = svc.Render(ctx, Request{Format: "markdown", ArtifactIDs: []string{a.ID}, PrivacyCeiling: "bogus"})
+	if !errors.Is(err, ErrInvalidCeiling) {
+		t.Errorf("Render(invalid ceiling) = %v, want ErrInvalidCeiling", err)
+	}
+	// And nothing was written for the rejected request.
+	if list, _ := st.Renders.List(ctx); len(list) != 0 {
+		t.Errorf("a rejected render must not persist a row, got %d", len(list))
 	}
 }
 

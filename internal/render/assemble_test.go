@@ -49,6 +49,29 @@ func TestAssemble_TitleNewlinesCollapsed(t *testing.T) {
 	}
 }
 
+func TestAssemble_URLWithSpaceIsNotABrokenAutolink(t *testing.T) {
+	// A bare CommonMark autolink <...> may not contain spaces; a URL with one
+	// must fall back to an inline link so the document still parses.
+	got := Assemble([]*kb.Artifact{{Title: "T", CanonicalURL: ptr("https://ex.com/a b")}}, AssembleOpts{Title: "D"})
+	if strings.Contains(got, "\n<https://ex.com/a b>\n") {
+		t.Errorf("emitted an invalid space-bearing autolink on its own line: %q", got)
+	}
+	if !strings.Contains(got, "[https://ex.com/a b](<https://ex.com/a b>)") {
+		t.Errorf("expected an inline link for a space-bearing URL: %q", got)
+	}
+}
+
+func TestAssemble_URLWithAngleBracketIsEscaped(t *testing.T) {
+	// A '>' would close an autolink early and spill the rest into body text.
+	got := Assemble([]*kb.Artifact{{Title: "T", CanonicalURL: ptr("https://ex.com/a>b")}}, AssembleOpts{Title: "D"})
+	if strings.Contains(got, "<https://ex.com/a>b>") {
+		t.Errorf("'>' in URL left the autolink unescaped: %q", got)
+	}
+	if !strings.Contains(got, `\>`) {
+		t.Errorf("expected the '>' in the link destination to be escaped: %q", got)
+	}
+}
+
 func TestAssemble_NoURLNoBody(t *testing.T) {
 	got := Assemble([]*kb.Artifact{{Title: "Just a heading"}}, AssembleOpts{Title: "Doc"})
 	want := "# Doc\n\n## Just a heading\n"

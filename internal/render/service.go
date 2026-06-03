@@ -13,14 +13,21 @@ import (
 // registered renderer handles.
 var ErrUnknownFormat = errors.New("render: unknown format")
 
+// ErrInvalidCeiling is returned when PrivacyCeiling is non-empty but not a valid
+// tier. The export filter fails closed: an unparseable ceiling is rejected rather
+// than silently including every tier.
+var ErrInvalidCeiling = errors.New("render: invalid privacy ceiling")
+
 // Request describes one render: which artifacts, in which format, with an
 // optional document title, a provenance label, and an export privacy ceiling.
+// ArtifactIDs is used as given — the caller owns the order, and duplicates are
+// preserved (the layer does not dedup, §8.14: the caller decides the set).
 type Request struct {
 	Format         string
 	ArtifactIDs    []string       // the artifacts to include, in order
 	Title          string         // document H1; renderer-specific default if empty
 	SourceQuery    string         // provenance label recorded on the render row
-	PrivacyCeiling kb.PrivacyTier // export filter: drop artifacts above this tier; empty = include all
+	PrivacyCeiling kb.PrivacyTier // export filter: drop artifacts above this tier; empty = include all, invalid = error
 }
 
 // Service is the render dispatcher: it resolves the artifacts, applies the
@@ -47,6 +54,9 @@ func (s *Service) Render(ctx context.Context, req Request) (*kb.RenderRecord, er
 	renderer, ok := s.reg.Get(req.Format)
 	if !ok {
 		return nil, fmt.Errorf("%w %q (have: %v)", ErrUnknownFormat, req.Format, s.reg.Formats())
+	}
+	if req.PrivacyCeiling != "" && !req.PrivacyCeiling.Valid() {
+		return nil, fmt.Errorf("%w %q", ErrInvalidCeiling, req.PrivacyCeiling)
 	}
 
 	arts, ids, err := s.resolve(ctx, req.ArtifactIDs, req.PrivacyCeiling)
