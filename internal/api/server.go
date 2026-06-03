@@ -45,6 +45,7 @@ type Asker interface {
 type ConnectorRegistry interface {
 	Has(name string) bool
 	Names() []string
+	Kind(name string) (kb.SourceKind, bool)
 }
 
 // Deps are the server's collaborators and settings.
@@ -313,23 +314,32 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var req createSourceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
+	connKind, known := s.deps.Connectors.Kind(req.Connector)
 	switch {
 	case !validKind(req.Kind):
 		http.Error(w, "kind must be PULL, PUSH, or AMBIENT", http.StatusBadRequest)
 		return
-	case req.Connector == "" || !s.deps.Connectors.Has(req.Connector):
+	case req.Connector == "" || !known:
 		http.Error(w, "unknown connector (available: "+strings.Join(s.deps.Connectors.Names(), ", ")+")", http.StatusBadRequest)
+		return
+	case req.Kind != string(connKind):
+		http.Error(w, "kind "+req.Kind+" does not match connector kind "+string(connKind), http.StatusBadRequest)
 		return
 	case req.DefaultPrivacy != "" && !validPrivacy(req.DefaultPrivacy):
 		http.Error(w, "invalid default_privacy", http.StatusBadRequest)
 		return
-	case len(req.Config) > 0 && !json.Valid(req.Config):
+	case len(req.Config) > 0 && !isJSONObject(req.Config):
 		http.Error(w, "config must be a JSON object", http.StatusBadRequest)
 		return
-	case len(req.Schedule) > 0 && !json.Valid(req.Schedule):
+	case len(req.Schedule) > 0 && !isJSONObject(req.Schedule):
 		http.Error(w, "schedule must be a JSON object", http.StatusBadRequest)
 		return
 	}
@@ -349,14 +359,15 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "create source", err)
 		return
 	}
-	// Re-read so the response reflects the persisted row (schema defaults like
-	// enabled/source_weight that Create does not write back into the struct).
-	created, err := s.deps.Store.Sources.Get(r.Context(), src.ID)
-	if err != nil {
-		s.serverError(w, "load created source", err)
-		return
-	}
-	s.writeJSON(w, http.StatusCreated, toSourceJSON(created))
+	// Create populates the schema defaults (enabled, source_weight, …) into src,
+	// so it reflects the persisted row without a re-read.
+	s.writeJSON(w, http.StatusCreated, toSourceJSON(src))
+}
+
+// isJSONObject reports whether b is a JSON object (not a scalar/array/null).
+func isJSONObject(b []byte) bool {
+	var m map[string]json.RawMessage
+	return json.Unmarshal(b, &m) == nil
 }
 
 // handleListSources lists configured sources with their last poll time and health.

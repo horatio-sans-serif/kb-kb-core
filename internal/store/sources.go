@@ -14,9 +14,10 @@ const sourceCols = `id, kind, connector, config, schedule, auth_state,
 	default_privacy, storage_budget, source_weight, enabled, created_at,
 	cursor, last_fetched_at, health`
 
-// Create inserts a source, assigning a ULID if none is set and defaulting the
-// privacy tier to "personal". source_weight and enabled take their schema
-// defaults (1.0, enabled).
+// Create inserts a source, assigning a ULID if none is set and applying the
+// schema defaults (config "{}", privacy "personal", source_weight 1.0, enabled)
+// into the struct as well, so the caller sees the persisted state without a
+// re-read.
 func (r *SourceRepo) Create(ctx context.Context, s *Source) error {
 	if s.ID == "" {
 		s.ID = NewID()
@@ -27,12 +28,16 @@ func (r *SourceRepo) Create(ctx context.Context, s *Source) error {
 	if s.DefaultPrivacy == "" {
 		s.DefaultPrivacy = "personal"
 	}
+	if s.SourceWeight == 0 {
+		s.SourceWeight = 1.0
+	}
+	s.Enabled = true
 	_, err := r.q.ExecContext(ctx,
 		`INSERT INTO sources(id, kind, connector, config, schedule, auth_state,
-			default_privacy, storage_budget, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			default_privacy, storage_budget, source_weight, enabled, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
 		s.ID, s.Kind, s.Connector, s.Config, s.Schedule, s.AuthState,
-		s.DefaultPrivacy, s.StorageBudget, now())
+		s.DefaultPrivacy, s.StorageBudget, s.SourceWeight, now())
 	if err != nil {
 		return fmt.Errorf("create source %q: %w", s.ID, err)
 	}

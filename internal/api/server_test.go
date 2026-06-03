@@ -16,6 +16,7 @@ import (
 	"kb/internal/events"
 	"kb/internal/fetch"
 	"kb/internal/jobs"
+	"kb/internal/kb"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
 	"kb/internal/rag"
@@ -799,6 +800,7 @@ func TestEngage_MissingArtifactIDIs400(t *testing.T) {
 	}
 }
 
+// fakeRegistry maps connector name → kind (all PULL here).
 type fakeRegistry struct{ have map[string]bool }
 
 func (f fakeRegistry) Has(n string) bool { return f.have[n] }
@@ -808,6 +810,12 @@ func (f fakeRegistry) Names() []string {
 		out = append(out, n)
 	}
 	return out
+}
+func (f fakeRegistry) Kind(n string) (kb.SourceKind, bool) {
+	if f.have[n] {
+		return kb.Pull, true
+	}
+	return "", false
 }
 
 func TestSources_CreateAndList(t *testing.T) {
@@ -864,6 +872,26 @@ func TestSources_InvalidKindIs400(t *testing.T) {
 	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Connectors: reg}).Handler()
 	if rec := doPost(h, "/sources", `{"kind":"BOGUS","connector":"rss"}`, "tok"); rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for an invalid kind", rec.Code)
+	}
+}
+
+func TestSources_KindConnectorMismatchIs400(t *testing.T) {
+	st := newStore(t)
+	reg := fakeRegistry{have: map[string]bool{"rss": true}} // rss is PULL
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Connectors: reg}).Handler()
+	// PUSH kind with a PULL connector → 400 (would otherwise be an inert dead row).
+	if rec := doPost(h, "/sources", `{"kind":"PUSH","connector":"rss"}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a kind/connector mismatch", rec.Code)
+	}
+}
+
+func TestSources_NonObjectConfigIs400(t *testing.T) {
+	st := newStore(t)
+	reg := fakeRegistry{have: map[string]bool{"rss": true}}
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Connectors: reg}).Handler()
+	// config is valid JSON but not an object → 400 (would create a permanently-unhealthy source).
+	if rec := doPost(h, "/sources", `{"kind":"PULL","connector":"rss","config":"https://e.com/feed"}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a non-object config", rec.Code)
 	}
 }
 

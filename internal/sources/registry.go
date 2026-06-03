@@ -52,3 +52,13 @@ func (r *Registry) Names() []string {
 	sort.Strings(names)
 	return names
 }
+
+// Kind returns the kind (PULL/PUSH/AMBIENT) of the named connector, so a source's
+// declared kind can be validated against its connector at create time.
+func (r *Registry) Kind(name string) (kb.SourceKind, bool) {
+	c, ok := r.m[name]
+	if !ok {
+		return "", false
+	}
+	return c.Kind(), true
+}

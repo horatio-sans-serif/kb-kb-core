@@ -1053,6 +1053,14 @@ schedule?, default_privacy?}`. Validates the kind, that the connector is one the
 You can now add an RSS feed and watch it: `POST /sources {connector:"rss",
 config:{url:...}}` → the scheduler polls it → `GET /sources` shows health.
 
+**Review fixes applied:** config must be a JSON _object_ (not just valid JSON, so
+a connector can't be handed a scalar config and become permanently unhealthy);
+the source's declared kind must match its connector's kind (`Registry.Kind`),
+rejecting an inert dead row; `Sources.Create` now writes back the schema defaults
+(`enabled`, `source_weight`) so the handler returns the persisted source without a
+re-read (removing the 500-after-success window); 413 on an over-limit body
+(parity with ingest).
+
 **Deferred:** more connectors (HN, GitHub, email…); source update/delete
 endpoints; `storage_budget` enforcement; a `source_weight` yield feedback loop;
 the failed-poll-delays-retry-by-a-full-TTL trade-off (a separate error-retry
