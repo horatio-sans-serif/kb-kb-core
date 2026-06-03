@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"kb/internal/canon"
 	"kb/internal/events"
+	"kb/internal/ingest"
 	"kb/internal/kb"
 	"kb/internal/rag"
 	"kb/internal/search"
@@ -22,13 +22,6 @@ import (
 // BuildInfo is reported by the health endpoint.
 type BuildInfo struct {
 	Version string `json:"version"`
-}
-
-// Enqueuer expands an ingested artifact into its enrichment-pipeline jobs within
-// the caller's transaction (satisfied by *pipeline.Pipeline). When nil, ingest
-// records the artifact and its encounter but starts no pipeline.
-type Enqueuer interface {
-	EnqueueTx(ctx context.Context, tx *store.Store, artifactID string) error
 }
 
 // Searcher ranks artifacts for a query (satisfied by *search.Searcher). When nil,
@@ -46,13 +39,6 @@ type Asker interface {
 	Answer(ctx context.Context, query string, k int) (rag.Answer, error)
 }
 
-// RescoreFunc re-enqueues an artifact's relevance scoring within the caller's
-// transaction — invoked when a fresh encounter or an engagement changes the
-// artifact's relevance inputs (§9). The composition root supplies it (it enqueues
-// the relevance stage standalone). When nil, those events update the record but
-// do not trigger a re-score.
-type RescoreFunc func(ctx context.Context, tx *store.Store, artifactID string) error
-
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -61,22 +47,23 @@ type Deps struct {
 	DefaultPrivacy string
 	Build          BuildInfo
 	Logger         *slog.Logger
-	Enqueue        Enqueuer
+	Enqueue        ingest.Enqueuer
 	Search         Searcher
 	Ask            Asker
-	Rescore        RescoreFunc
+	Rescore        ingest.RescoreFunc
 }
 
 // Server wires the HTTP handlers.
 type Server struct {
-	deps Deps
+	deps     Deps
+	ingester *ingest.Ingester
 }
 
 func NewServer(d Deps) *Server {
 	if d.Logger == nil {
 		d.Logger = slog.Default()
 	}
-	return &Server{deps: d}
+	return &Server{deps: d, ingester: ingest.New(d.Store, d.Enqueue, d.Rescore, d.Bus)}
 }
 
 // Handler builds the routed, auth-wrapped HTTP handler. /healthz is public; all
@@ -146,29 +133,9 @@ func validPrivacy(t string) bool {
 	return false
 }
 
-// validText rejects invalid UTF-8 and control characters (a stored-injection
-// guard for the future renderers). Tab is always allowed; newlines/CR only when
-// allowNewlines (the Markdown body, not the title).
-func validText(s string, allowNewlines bool) bool {
-	if !utf8.ValidString(s) {
-		return false
-	}
-	for _, r := range s {
-		switch {
-		case r == '\t', allowNewlines && (r == '\n' || r == '\r'):
-			continue
-		case r < 0x20 || r == 0x7f:
-			return false
-		}
-	}
-	return true
-}
-
-// handleIngest is the walking skeleton: it writes the artifact, its encounter,
-// and an enrichment job atomically, then publishes artifact.ingested (only after
-// the transaction commits, so a rolled-back ingest emits no event). The artifact
-// privacy tier comes from an explicit request override, else the source's
-// default, else the daemon default (design §8.17).
+// handleIngest validates and canonicalizes a push, resolves the privacy tier,
+// and delegates to the shared ingest path. The tier comes from an explicit
+// request override, else the source's default, else the daemon default (§8.17).
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxIngestBytes)
 	var req ingestRequest
@@ -194,7 +161,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	case req.Privacy != "" && !validPrivacy(req.Privacy):
 		http.Error(w, "invalid privacy tier", http.StatusBadRequest)
 		return
-	case !validText(req.Title, false) || !validText(req.Body, true):
+	case !ingest.ValidText(req.Title, false) || !ingest.ValidText(req.Body, true):
 		http.Error(w, "title/body contains invalid UTF-8 or control characters", http.StatusBadRequest)
 		return
 	}
@@ -229,58 +196,18 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		tier = kb.PrivacyTier(req.Privacy)
 	}
 
-	var artifactID string
-	err = s.deps.Store.Tx(ctx, func(tx *store.Store) error {
-		a := &store.Artifact{Title: req.Title, PrivacyTier: tier}
-		var art *store.Artifact
-		var err error
-		if req.URL != "" {
-			a.Type = "webpage"
-			a.CanonicalURL = &canonicalURL // dedup by canonical URL
-			art, err = tx.Artifacts.UpsertByCanonical(ctx, a)
-		} else {
-			a.Type = "note"
-			a.BodyMarkdown = req.Body
-			h := canon.Content(req.Body)
-			a.ContentHash = &h // dedup by content fingerprint
-			art, err = tx.Artifacts.UpsertByContentHash(ctx, a)
-		}
-		if err != nil {
-			return err
-		}
-		artifactID = art.ID
+	item := ingest.Item{SourceID: req.SourceID, Title: req.Title, Tier: tier}
+	if req.URL != "" {
+		item.Type, item.CanonicalURL, item.RawURL = "webpage", canonicalURL, req.URL
+	} else {
+		item.Type, item.Body, item.ContentHash = "note", req.Body, canon.Content(req.Body)
+	}
 
-		var rawURL *string
-		if req.URL != "" {
-			rawURL = &req.URL // preserve the as-seen URL on the encounter
-		}
-		if err := tx.Encounters.Record(ctx, &store.Encounter{
-			ArtifactID: art.ID, SourceID: req.SourceID, RawURL: rawURL,
-		}); err != nil {
-			return err
-		}
-		// Only a fresh INSERT starts the full pipeline. Re-ingesting a known
-		// artifact records another encounter (a relevance signal, §8.9) on
-		// unchanged content — so it re-scores (the encounter factor changed)
-		// rather than re-enriching. The upsert leaves created_at==updated_at only
-		// on insert; a re-sighting bumps updated_at.
-		inserted := art.CreatedAt == art.UpdatedAt
-		switch {
-		case inserted && s.deps.Enqueue != nil:
-			return s.deps.Enqueue.EnqueueTx(ctx, tx, art.ID)
-		case !inserted && s.deps.Rescore != nil:
-			return s.deps.Rescore(ctx, tx, art.ID)
-		}
-		return nil
-	})
+	artifactID, err := s.ingester.Ingest(ctx, item)
 	if err != nil {
 		s.serverError(w, "ingest", err)
 		return
 	}
-
-	s.deps.Bus.Publish(events.New(events.ArtifactIngested,
-		map[string]string{"artifact_id": artifactID, "source_id": req.SourceID}))
-
 	s.writeJSON(w, http.StatusOK, ingestResponse{ArtifactID: artifactID})
 }
 
@@ -303,7 +230,7 @@ func (s *Server) handleEngage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	if req.ArtifactID == "" || len(req.ArtifactID) > maxSourceIDBytes || !validText(req.ArtifactID, false) {
+	if req.ArtifactID == "" || len(req.ArtifactID) > maxSourceIDBytes || !ingest.ValidText(req.ArtifactID, false) {
 		http.Error(w, "valid artifact_id is required", http.StatusBadRequest)
 		return
 	}

@@ -969,3 +969,26 @@ source weight, recomputed on events and on a schedule.
 **Deferred:** enrichment-row retention; rerank + citation validation; chunk-level
 embeddings; a partial `last_engaged_at` index if the engaged query gets hot;
 cr-sqlite peer sync (Phase 10).
+
+## Phase 5 — Source connectors (PULL)
+
+The daemon could only receive **pushed** content (`POST /ingest`). Source
+connectors let it **pull** on a schedule (§8.1). The `sources.Registry` (connector
+name → `kb.SourceConnector`) was already the seam.
+
+### Stage 1: Shared ingest path
+
+**Status: Complete.** Extracted the write core out of the HTTP handler into
+`internal/ingest`: an `Ingester.Ingest(Item)` that upserts (URL or content-hash
+dedup), records the encounter, and atomically starts the pipeline (fresh insert)
+or re-scores (re-encounter), publishing `artifact.ingested` post-commit. The
+`Enqueuer`/`RescoreFunc` types and the `ValidText` guard moved here too, so push
+and pull sources land **identically** (Principle 1) — the API handler now just
+validates/canonicalizes and delegates. Behavior-preserving (all existing API
+tests pass) plus direct tests of the seam (insert→enqueue, re-encounter→re-score,
+content-hash dedup).
+
+**Next (Stage 2):** the scheduler — a background loop that, per enabled PULL
+source due for refresh, calls the registered connector's `Fetch(since cursor)`,
+ingests each `RawItem` via the shared path, and persists the new cursor + health.
+Plus one concrete connector (RSS/Atom) and a cursor column.
