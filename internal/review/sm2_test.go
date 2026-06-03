@@ -58,6 +58,35 @@ func TestSchedule_EaseFloor(t *testing.T) {
 	}
 }
 
+func TestSchedule_IntervalCappedNoOverflow(t *testing.T) {
+	// Sustained perfect recall must saturate the interval, not grow without bound
+	// (which would overflow the day→Duration conversion and wrap next_review_at
+	// negative). The interval must stay positive and <= the cap throughout.
+	s := Default()
+	for range 50 {
+		s = Schedule(s, 5)
+		if s.IntervalDays <= 0 {
+			t.Fatalf("interval went non-positive: %v", s)
+		}
+		if s.IntervalDays > maxIntervalDays {
+			t.Fatalf("interval exceeded the cap: %v", s.IntervalDays)
+		}
+	}
+	if s.IntervalDays != maxIntervalDays {
+		t.Errorf("after long perfect recall interval = %v, want the cap %d", s.IntervalDays, maxIntervalDays)
+	}
+}
+
+func TestSchedule_GrowsPastEaseFloor(t *testing.T) {
+	// At the ease floor with a 1-day interval, round(1 * 1.3) == 1 would stick; the
+	// min-growth rule must still stretch it.
+	s := State{IntervalDays: 1, Ease: minEase, Reviews: 3}
+	got := Schedule(s, 3)
+	if got.IntervalDays <= 1 {
+		t.Errorf("interval stuck at the floor: %v, want > 1", got.IntervalDays)
+	}
+}
+
 func TestSchedule_GradeClamped(t *testing.T) {
 	// Out-of-range grades are clamped, not treated as huge eases.
 	hi := Schedule(Default(), 99)

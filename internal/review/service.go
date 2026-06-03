@@ -72,9 +72,17 @@ func (s *Service) Record(ctx context.Context, artifactID string, grade int) (*kb
 	return rs, nil
 }
 
+// defaultDueLimit bounds Due when the caller passes a non-positive limit, so a
+// direct caller (e.g. a future digest job) gets a sane page rather than the
+// repo's surface-borrowed fallback.
+const defaultDueLimit = 20
+
 // Due returns the artifacts due for review now, soonest first, joined with their
 // title/url. A schedule whose artifact has been tombstoned is skipped.
 func (s *Service) Due(ctx context.Context, limit int) ([]DueItem, error) {
+	if limit <= 0 {
+		limit = defaultDueLimit
+	}
 	now := store.FormatTime(s.now())
 	states, err := s.st.Reviews.Due(ctx, now, limit)
 	if err != nil {
@@ -104,7 +112,9 @@ func (s *Service) Due(ctx context.Context, limit int) ([]DueItem, error) {
 	return out, nil
 }
 
-// daysToDuration converts a whole-day interval to a Duration.
+// daysToDuration converts an interval in days (always a whole number in practice,
+// and bounded by maxIntervalDays so the multiplication stays inside int64) to a
+// Duration.
 func daysToDuration(days float64) time.Duration {
 	return time.Duration(days * 24 * float64(time.Hour))
 }

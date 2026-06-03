@@ -10,6 +10,14 @@ import "math"
 // to be useful, so the algorithm clamps here.
 const minEase = 1.3
 
+// maxIntervalDays caps the review interval. Canonical SM-2 leaves the interval
+// unbounded, but here it is converted to an int64-nanosecond Duration
+// (next_review_at = now + interval), which overflows and wraps NEGATIVE past
+// ~292 years — making an item that was recalled perfectly suddenly, permanently
+// due. 100 years is far past any real review horizon and leaves the duration math
+// well inside int64.
+const maxIntervalDays = 36500
+
 // State is an artifact's spaced-repetition schedule, mirroring the persisted
 // review_schedule row minus the next_review_at timestamp (the service derives
 // that from a clock).
@@ -47,7 +55,17 @@ func Schedule(prev State, grade int) State {
 	case 2:
 		next.IntervalDays = 6
 	default:
-		next.IntervalDays = math.Round(prev.IntervalDays * next.Ease)
+		// max(round(prev*ease), prev+1): guarantee the interval strictly grows even
+		// at the ease floor, where round(1 * 1.3) == 1 would otherwise pin a
+		// recovered item at a 1-day interval forever.
+		grown := math.Round(prev.IntervalDays * next.Ease)
+		if grown < prev.IntervalDays+1 {
+			grown = prev.IntervalDays + 1
+		}
+		next.IntervalDays = grown
+	}
+	if next.IntervalDays > maxIntervalDays {
+		next.IntervalDays = maxIntervalDays
 	}
 	return next
 }

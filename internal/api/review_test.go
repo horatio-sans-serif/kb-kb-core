@@ -92,6 +92,15 @@ func TestReview_DueListsScheduled(t *testing.T) {
 	}
 }
 
+func TestReview_DueLimitValidation(t *testing.T) {
+	_, h := reviewTestServer(t)
+	for _, bad := range []string{"0", "-1", "201", "abc"} {
+		if rec := doGet(h, "/review/due?limit="+bad, "tok"); rec.Code != http.StatusBadRequest {
+			t.Errorf("limit=%s = %d, want 400", bad, rec.Code)
+		}
+	}
+}
+
 func TestReview_NotConfiguredIs503(t *testing.T) {
 	st := newStore(t)
 	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()}).Handler()
