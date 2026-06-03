@@ -113,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /render", s.requireAuth(http.HandlerFunc(s.handleRender)))
 	mux.Handle("GET /renders", s.requireAuth(http.HandlerFunc(s.handleListRenders)))
 	mux.Handle("GET /surface", s.requireAuth(http.HandlerFunc(s.handleSurface)))
+	mux.Handle("POST /digest", s.requireAuth(http.HandlerFunc(s.handleDigest)))
 	return mux
 }
 
@@ -510,28 +511,33 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
 		SourceQuery:    req.SourceQuery,
 		PrivacyCeiling: kb.PrivacyTier(ceiling),
 	})
-	switch {
-	case errors.Is(err, render.ErrUnknownFormat):
-		http.Error(w, "unknown format (have: "+strings.Join(s.deps.Render.Formats(), ", ")+")", http.StatusBadRequest)
-		return
-	case errors.Is(err, render.ErrInvalidCeiling):
-		http.Error(w, "invalid privacy_ceiling", http.StatusBadRequest)
-		return
-	case errors.Is(err, render.ErrNoEligibleArtifacts):
-		http.Error(w, "no eligible artifacts (all missing or above the privacy ceiling)", http.StatusUnprocessableEntity)
-		return
-	case errors.Is(err, render.ErrRendererUnavailable):
-		http.Error(w, "the converter for this format is not installed", http.StatusServiceUnavailable)
-		return
-	case errors.Is(err, render.ErrBusy):
-		w.Header().Set("Retry-After", "2")
-		http.Error(w, "too many concurrent renders, retry shortly", http.StatusServiceUnavailable)
-		return
-	case err != nil:
-		s.serverError(w, "render", err)
+	if s.writeRenderError(w, err) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
+}
+
+// writeRenderError maps a render.Service error to the right HTTP response and
+// reports whether it wrote one (err != nil). Shared by /render and /digest.
+func (s *Server) writeRenderError(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, render.ErrUnknownFormat):
+		http.Error(w, "unknown format (have: "+strings.Join(s.deps.Render.Formats(), ", ")+")", http.StatusBadRequest)
+	case errors.Is(err, render.ErrInvalidCeiling):
+		http.Error(w, "invalid privacy_ceiling", http.StatusBadRequest)
+	case errors.Is(err, render.ErrNoEligibleArtifacts):
+		http.Error(w, "no eligible artifacts (all missing or above the privacy ceiling)", http.StatusUnprocessableEntity)
+	case errors.Is(err, render.ErrRendererUnavailable):
+		http.Error(w, "the converter for this format is not installed", http.StatusServiceUnavailable)
+	case errors.Is(err, render.ErrBusy):
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "too many concurrent renders, retry shortly", http.StatusServiceUnavailable)
+	default:
+		s.serverError(w, "render", err)
+	}
+	return true
 }
 
 // handleListRenders lists the render history (newest first).
@@ -651,6 +657,98 @@ func (s *Server) handleSurface(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item)
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"surface": out})
+}
+
+type digestRequest struct {
+	Format         string  `json:"format"`
+	Title          string  `json:"title,omitempty"`
+	Limit          int     `json:"limit,omitempty"`
+	Since          string  `json:"since,omitempty"`
+	MinScore       float64 `json:"min_score,omitempty"`
+	PrivacyCeiling string  `json:"privacy_ceiling,omitempty"`
+}
+
+// handleDigest surfaces the top-ranked artifacts and renders them into one
+// document — the cyclic loop's delivery step (§8.11), built on the §8.14 "digests
+// are render inputs" contract. The same privacy ceiling gates both the surfacing
+// and the render (defense in depth), and defaults conservatively to personal.
+func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Surface == nil || s.deps.Render == nil {
+		http.Error(w, "digests not configured", http.StatusServiceUnavailable)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var req digestRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	switch {
+	case req.Format == "":
+		http.Error(w, "format is required", http.StatusBadRequest)
+		return
+	case req.Limit < 0 || req.Limit > maxSurfaceLimit:
+		http.Error(w, "limit out of range", http.StatusBadRequest)
+		return
+	case req.MinScore < 0:
+		http.Error(w, "min_score must be non-negative", http.StatusBadRequest)
+		return
+	case len(req.Title) > maxTitleBytes:
+		http.Error(w, "title too long", http.StatusBadRequest)
+		return
+	case req.Since != "" && !validTimestamp(req.Since):
+		http.Error(w, "since must be an RFC3339 timestamp", http.StatusBadRequest)
+		return
+	}
+
+	ceiling := req.PrivacyCeiling
+	if ceiling == "" {
+		ceiling = defaultExportCeiling
+	} else if !validPrivacy(ceiling) {
+		http.Error(w, "invalid privacy_ceiling", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	arts, err := s.deps.Surface.Surface(ctx, surface.Options{
+		Limit:          req.Limit,
+		Since:          req.Since,
+		MinScore:       req.MinScore,
+		PrivacyCeiling: kb.PrivacyTier(ceiling),
+	})
+	if err != nil {
+		s.serverError(w, "digest surface", err)
+		return
+	}
+	if len(arts) == 0 {
+		http.Error(w, "nothing to digest (no eligible artifacts)", http.StatusUnprocessableEntity)
+		return
+	}
+	ids := make([]string, len(arts))
+	for i, a := range arts {
+		ids[i] = a.ID // preserve the relevance rank order
+	}
+
+	title := req.Title
+	if title == "" {
+		title = "Digest"
+	}
+	rec, err := s.deps.Render.Render(ctx, render.Request{
+		Format:         req.Format,
+		ArtifactIDs:    ids,
+		Title:          title,
+		SourceQuery:    "digest",
+		PrivacyCeiling: kb.PrivacyTier(ceiling),
+	})
+	if s.writeRenderError(w, err) {
+		return
+	}
+	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
 }
 
 // validTimestamp reports whether s parses as one of the timestamp formats the

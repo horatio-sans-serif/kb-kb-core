@@ -1173,6 +1173,16 @@ scored corpus, so it can be reviewed or rendered into a digest. Composes Phase 4
   conservatively to `personal` (same fail-safe as the render export), so an
   omitted filter never surfaces sensitive/restricted content. Wired in the daemon.
 
-**Next:** Stage 2 — digest rendering (`POST /digest`: surface → render via the
-Phase 6 layer). Stage 3 — spaced repetition (`review_schedule`, SM-2) + a
+## Stage 2: Digest rendering
+
+**Status: Complete.** `POST /digest` `{format, title?, limit?, since?, min_score?,
+privacy_ceiling?}` surfaces the top-ranked artifacts and renders them into one
+document — the cyclic loop's delivery step, built on §8.14 ("digests are render
+inputs"). The relevance rank order is preserved into the assembled document. The
+same privacy ceiling gates both the surfacing and the render (defense in depth)
+and defaults to `personal`. An empty surface → 422; render errors map via the
+shared `writeRenderError` (also refactored out of `/render`). `source_query` is
+recorded as `digest` so `GET /renders` distinguishes digest outputs.
+
+**Next:** Stage 3 — spaced repetition (`review_schedule`, SM-2) + a
 due-for-review queue.
