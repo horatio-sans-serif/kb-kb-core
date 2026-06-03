@@ -1230,6 +1230,18 @@ them.
 hops)` (bounded BFS with a visited set, excludes the start).
 - **`kb.Entity` / `kb.Link`** domain types.
 
-**Next:** Stage 2 — entity-extraction enricher (LLM → entities + shares_entity
-edges) in the pipeline. Stage 3 — graph query API (`GET /graph/{id}?hops=N`,
+## Stage 2: Entity-extraction enricher
+
+**Status: Complete.** `enrich.Entities` is a pipeline stage (DependsOn fetch,
+privacy-gated like summarize): one local-model call extracts
+person/org/technology/concept/place entities, which are deduped into the graph
+and linked to the artifact; artifacts sharing an entity gain a canonical
+(direction-deduped) `shares_entity` edge — the graph builds itself during
+enrichment. The model output is sanitized (blank/over-long names and
+out-of-vocabulary kinds dropped, entity/alias counts capped). Graph writes are
+idempotent, so the stage is safe to re-run; it records completion with an
+`entities` enrichment row and writes the graph via the narrow `GraphWriter`
+interface (satisfied by `*store.GraphRepo`). Wired into the daemon pipeline.
+
+**Next:** Stage 3 — graph query API (`GET /graph/{id}?hops=N` connected subgraph;
 backlinks).
