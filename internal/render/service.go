@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 
 	"kb/internal/kb"
 	"kb/internal/store"
@@ -17,6 +18,17 @@ var ErrUnknownFormat = errors.New("render: unknown format")
 // tier. The export filter fails closed: an unparseable ceiling is rejected rather
 // than silently including every tier.
 var ErrInvalidCeiling = errors.New("render: invalid privacy ceiling")
+
+// ErrBusy is returned when the concurrent-render limit is saturated. A pandoc/TeX
+// render is CPU- and memory-bound, so the dispatcher caps how many run at once;
+// callers should retry (the API answers 503 + Retry-After).
+var ErrBusy = errors.New("render: too many concurrent renders")
+
+// ErrNoEligibleArtifacts is returned when a request named artifacts but none
+// survived resolution — all were missing/tombstoned or excluded by the privacy
+// ceiling. Signalled rather than silently producing an empty document, so the
+// caller learns nothing was eligible (the API answers 422).
+var ErrNoEligibleArtifacts = errors.New("render: no eligible artifacts")
 
 // Request describes one render: which artifacts, in which format, with an
 // optional document title, a provenance label, and an export privacy ceiling.
@@ -35,11 +47,23 @@ type Request struct {
 type Service struct {
 	st  *store.Store
 	reg *Registry
+	sem chan struct{} // bounds concurrent renders; nil means unbounded
 }
 
-// NewService wires the dispatcher to the store and renderer registry.
+// NewService wires the dispatcher to the store and renderer registry, bounding
+// concurrent renders to the CPU count (a pandoc/TeX render is CPU/memory-bound).
 func NewService(st *store.Store, reg *Registry) *Service {
-	return &Service{st: st, reg: reg}
+	return NewServiceWithConcurrency(st, reg, runtime.NumCPU())
+}
+
+// NewServiceWithConcurrency is NewService with an explicit concurrency limit
+// (n <= 0 means unbounded). Used by tests to force saturation.
+func NewServiceWithConcurrency(st *store.Store, reg *Registry, n int) *Service {
+	s := &Service{st: st, reg: reg}
+	if n > 0 {
+		s.sem = make(chan struct{}, n)
+	}
+	return s
 }
 
 // Formats lists the registered output formats (for the API to advertise).
@@ -59,9 +83,26 @@ func (s *Service) Render(ctx context.Context, req Request) (*kb.RenderRecord, er
 		return nil, fmt.Errorf("%w %q", ErrInvalidCeiling, req.PrivacyCeiling)
 	}
 
+	// Cap concurrent renders so a burst of pandoc/TeX subprocesses can't exhaust
+	// CPU/memory. Fail fast rather than queue: holding the connection for an
+	// unbounded wait is worse than a retryable 503.
+	if s.sem != nil {
+		select {
+		case s.sem <- struct{}{}:
+			defer func() { <-s.sem }()
+		default:
+			return nil, ErrBusy
+		}
+	}
+
 	arts, ids, err := s.resolve(ctx, req.ArtifactIDs, req.PrivacyCeiling)
 	if err != nil {
 		return nil, err
+	}
+	// A request that named artifacts but resolved to none (all missing/tombstoned
+	// or filtered by the ceiling) is a "nothing eligible" signal, not an empty doc.
+	if len(req.ArtifactIDs) > 0 && len(arts) == 0 {
+		return nil, ErrNoEligibleArtifacts
 	}
 
 	id := store.NewID()

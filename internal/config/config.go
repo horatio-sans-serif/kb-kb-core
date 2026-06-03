@@ -42,7 +42,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		RenderDir:       getenv("KB_RENDER_DIR"),
 	}
 	// Renders default to a directory beside the database so output files live with
-	// the data they derive from (and inherit the daemon's owner-only umask).
+	// the data they derive from. Use an absolute KB_DB in production: a relative
+	// path makes this dir relative to the daemon's working directory.
 	if cfg.RenderDir == "" && cfg.DBPath != "" {
 		cfg.RenderDir = filepath.Join(filepath.Dir(cfg.DBPath), "renders")
 	}

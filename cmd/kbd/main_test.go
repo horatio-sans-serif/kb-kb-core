@@ -47,11 +47,13 @@ func TestServe_HealthzThenGracefulShutdown(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 
+	dir := t.TempDir()
 	cfg := &config.Config{
-		DBPath:         filepath.Join(t.TempDir(), "kb.db"),
+		DBPath:         filepath.Join(dir, "kb.db"),
 		ListenAddr:     addr,
 		APIToken:       "tok",
 		DefaultPrivacy: "personal",
+		RenderDir:      filepath.Join(dir, "renders"),
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

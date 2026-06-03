@@ -433,6 +433,12 @@ type renderJSON struct {
 // maxRenderArtifacts bounds the artifact set a single render may name.
 const maxRenderArtifacts = 1000
 
+// defaultExportCeiling is the privacy ceiling applied when a render request omits
+// one. An export writes tier-bearing content to a file, so the default fails safe:
+// it includes public/personal but excludes the deliberately-elevated sensitive and
+// restricted tiers, which must be requested explicitly via privacy_ceiling.
+const defaultExportCeiling = "personal"
+
 // handleRender renders a set of artifacts to a file in the requested format. The
 // render is synchronous (a pandoc-backed format runs the converter under the
 // request context, bounded by the renderer's own timeout). On success it returns
@@ -480,12 +486,19 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Apply the fail-safe export ceiling when the caller names none, so an omitted
+	// field cannot silently export sensitive/restricted content.
+	ceiling := req.PrivacyCeiling
+	if ceiling == "" {
+		ceiling = defaultExportCeiling
+	}
+
 	rec, err := s.deps.Render.Render(r.Context(), render.Request{
 		Format:         req.Format,
 		ArtifactIDs:    req.ArtifactIDs,
 		Title:          req.Title,
 		SourceQuery:    req.SourceQuery,
-		PrivacyCeiling: kb.PrivacyTier(req.PrivacyCeiling),
+		PrivacyCeiling: kb.PrivacyTier(ceiling),
 	})
 	switch {
 	case errors.Is(err, render.ErrUnknownFormat):
@@ -494,8 +507,15 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, render.ErrInvalidCeiling):
 		http.Error(w, "invalid privacy_ceiling", http.StatusBadRequest)
 		return
+	case errors.Is(err, render.ErrNoEligibleArtifacts):
+		http.Error(w, "no eligible artifacts (all missing or above the privacy ceiling)", http.StatusUnprocessableEntity)
+		return
 	case errors.Is(err, render.ErrRendererUnavailable):
 		http.Error(w, "the converter for this format is not installed", http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, render.ErrBusy):
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "too many concurrent renders, retry shortly", http.StatusServiceUnavailable)
 		return
 	case err != nil:
 		s.serverError(w, "render", err)

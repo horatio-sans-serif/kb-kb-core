@@ -166,6 +166,63 @@ func TestService_InvalidCeilingIsRejected(t *testing.T) {
 	}
 }
 
+func TestService_NoEligibleArtifacts(t *testing.T) {
+	// A request that names artifacts but resolves to none (all missing) is a
+	// distinct error, not a silent empty render.
+	ctx := context.Background()
+	st := storetest.New(t)
+	reg := NewRegistry()
+	reg.Register(NewMarkdown(t.TempDir()))
+	svc := NewService(st, reg)
+
+	_, err := svc.Render(ctx, Request{Format: "markdown", ArtifactIDs: []string{"01HGONE", "01HVANISHED"}})
+	if !errors.Is(err, ErrNoEligibleArtifacts) {
+		t.Errorf("Render(all-missing) = %v, want ErrNoEligibleArtifacts", err)
+	}
+	if list, _ := st.Renders.List(ctx); len(list) != 0 {
+		t.Errorf("no render row should be written when nothing is eligible, got %d", len(list))
+	}
+}
+
+// blockingRenderer occupies its render slot until released, for the concurrency test.
+type blockingRenderer struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingRenderer) Format() string { return "markdown" }
+func (b *blockingRenderer) Render(context.Context, []*kb.Artifact, kb.RenderOpts) (kb.Rendered, error) {
+	b.entered <- struct{}{}
+	<-b.release
+	return kb.Rendered{Format: "markdown", OutputPath: "/dev/null"}, nil
+}
+
+func TestService_ConcurrencyLimitReturnsBusy(t *testing.T) {
+	ctx := context.Background()
+	st := storetest.New(t)
+	br := &blockingRenderer{entered: make(chan struct{}), release: make(chan struct{})}
+	reg := NewRegistry()
+	reg.Register(br)
+	svc := NewServiceWithConcurrency(st, reg, 1)
+
+	h := "h"
+	a, err := st.Artifacts.UpsertByContentHash(ctx, &kb.Artifact{Type: "note", Title: "x", BodyMarkdown: "y", ContentHash: &h, PrivacyTier: kb.Public})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Occupy the single slot.
+	go func() { _, _ = svc.Render(ctx, Request{Format: "markdown", ArtifactIDs: []string{a.ID}}) }()
+	<-br.entered // the first render now holds the slot
+
+	// A second render must fail fast with ErrBusy.
+	_, err = svc.Render(ctx, Request{Format: "markdown", ArtifactIDs: []string{a.ID}})
+	if !errors.Is(err, ErrBusy) {
+		t.Errorf("second concurrent render = %v, want ErrBusy", err)
+	}
+	close(br.release) // let the first finish
+}
+
 func TestService_SkipsMissingArtifacts(t *testing.T) {
 	ctx := context.Background()
 	st := storetest.New(t)

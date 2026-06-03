@@ -243,6 +243,15 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// Markdown. The Markdown renderer is dependency-free; the pandoc-backed formats
 	// need the pandoc binary (warn if absent — the route then answers 503), and
 	// patat decks are presented with the patat binary the user runs separately.
+	// Create the render output directory up front (owner-only) so a misconfigured
+	// path fails at boot, not as a 500 on the first render. config.Load always sets
+	// RenderDir; the empty guard is for a directly-constructed Config (tests), where
+	// rendering is simply unused.
+	if cfg.RenderDir != "" {
+		if err := os.MkdirAll(cfg.RenderDir, 0o700); err != nil {
+			return fmt.Errorf("create render dir %q: %w", cfg.RenderDir, err)
+		}
+	}
 	renderReg := render.NewRegistry()
 	renderReg.Register(render.NewMarkdown(cfg.RenderDir))
 	renderReg.Register(render.NewPatat(cfg.RenderDir))

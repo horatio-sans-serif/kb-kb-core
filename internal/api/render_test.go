@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"kb/internal/events"
@@ -102,6 +103,80 @@ func TestRender_EmptyArtifactsIs400(t *testing.T) {
 	rec := doPost(h, "/render", `{"format":"markdown","artifact_ids":[]}`, "tok")
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for no artifacts", rec.Code)
+	}
+}
+
+func TestRender_DefaultCeilingExcludesSensitive(t *testing.T) {
+	// With no privacy_ceiling, the export must fail safe: public/personal in,
+	// sensitive/restricted out.
+	st, h := renderTestServer(t)
+	pub := seedArtifact(t, st, "hp", "Public", "open", kb.Public)
+	sens := seedArtifact(t, st, "hs", "Secret", "classified", kb.Sensitive)
+
+	rec := doPost(h, "/render", `{"format":"markdown","artifact_ids":["`+pub+`","`+sens+`"]}`, "tok")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		ArtifactIDs []string `json:"artifact_ids"`
+		PrivacyMax  string   `json:"privacy_max"`
+		OutputPath  string   `json:"output_path"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if len(got.ArtifactIDs) != 1 || got.ArtifactIDs[0] != pub || got.PrivacyMax != "public" {
+		t.Errorf("default ceiling should keep only the public artifact, got %+v", got)
+	}
+	if b, _ := os.ReadFile(got.OutputPath); strings.Contains(string(b), "classified") {
+		t.Error("sensitive content leaked into a default-ceiling export")
+	}
+}
+
+func TestRender_NoEligibleArtifactsIs422(t *testing.T) {
+	st, h := renderTestServer(t)
+	sens := seedArtifact(t, st, "hs", "Secret", "x", kb.Sensitive)
+	// Only a sensitive artifact, default (personal) ceiling => nothing eligible.
+	rec := doPost(h, "/render", `{"format":"markdown","artifact_ids":["`+sens+`"]}`, "tok")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422 when nothing is eligible: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRender_BusyIs503(t *testing.T) {
+	st := newStore(t)
+	id := seedArtifact(t, st, "h", "T", "b", kb.Public)
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(),
+		Render: fakeRenderSvc{err: render.ErrBusy}}).Handler()
+	rec := doPost(h, "/render", `{"format":"markdown","artifact_ids":["`+id+`"]}`, "tok")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Errorf("busy render = %d (Retry-After %q), want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+}
+
+func TestRender_RoutesRequireAuth(t *testing.T) {
+	_, h := renderTestServer(t)
+	if rec := doPost(h, "/render", `{"format":"markdown","artifact_ids":["x"]}`, ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("POST /render without token = %d, want 401", rec.Code)
+	}
+	if rec := doGet(h, "/renders", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /renders without token = %d, want 401", rec.Code)
+	}
+}
+
+func TestRender_ListWorksWithoutRenderService(t *testing.T) {
+	// Render history is independent of a configured renderer (it reads the store).
+	st := newStore(t)
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger()}).Handler()
+	rec := doGet(h, "/renders", "tok")
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /renders with no Render service = %d, want 200", rec.Code)
+	}
+}
+
+func TestRender_OversizeBodyIs413(t *testing.T) {
+	_, h := renderTestServer(t)
+	big := `{"format":"markdown","title":"` + strings.Repeat("a", 70<<10) + `","artifact_ids":["x"]}`
+	if rec := doPost(h, "/render", big, "tok"); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversize body = %d, want 413", rec.Code)
 	}
 }
 
