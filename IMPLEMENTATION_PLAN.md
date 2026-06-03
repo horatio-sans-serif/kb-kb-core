@@ -1147,3 +1147,32 @@ a 68 KiB `%PDF-1.7` via pandoc+TeX — all files `0600`, all listed by `GET
 slow conversions; serving render bytes over HTTP (`GET /renders/{id}/content`);
 render inputs from a saved search/digest rather than explicit ids; audio
 (radio_hn TTS+ffmpeg) renderer.
+
+---
+
+# Phase 7 — Surfacing engine (§8.11)
+
+The output half of the cyclic loop (§5): select "what should I see now" from the
+scored corpus, so it can be reviewed or rendered into a digest. Composes Phase 4
+(relevance) with Phase 6 (render): §8.14 names digests a render input.
+
+## Stage 1: Surface selector + endpoint
+
+**Status: Complete.**
+
+- **`store.ArtifactRepo.Surface(SurfaceQuery)`**: live, **scored** artifacts
+  (`relevance_score IS NOT NULL`) ranked by relevance desc, then recency
+  (first_seen_at desc), then id. Filters: status, a `Since` lower bound on
+  first_seen_at (new arrivals), a `MinScore` floor, a privacy-tier whitelist, and
+  a `Limit` (default cap 50).
+- **`surface.Surfacer`**: wraps the query — always `status=ready` (only enriched,
+  scored artifacts surface) and translates a privacy ceiling into the tier
+  whitelist (empty/invalid ceiling = all tiers).
+- **`GET /surface`** (`limit`, `since`, `min_score`, `privacy_ceiling`): ranked
+  items (id, title, url, score, tier, first_seen_at). The ceiling defaults
+  conservatively to `personal` (same fail-safe as the render export), so an
+  omitted filter never surfaces sensitive/restricted content. Wired in the daemon.
+
+**Next:** Stage 2 — digest rendering (`POST /digest`: surface → render via the
+Phase 6 layer). Stage 3 — spaced repetition (`review_schedule`, SM-2) + a
+due-for-review queue.

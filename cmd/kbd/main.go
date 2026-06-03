@@ -35,6 +35,7 @@ import (
 	"kb/internal/sources/rss"
 	"kb/internal/ssrf"
 	"kb/internal/store"
+	"kb/internal/surface"
 )
 
 // Version is the build version reported by /healthz (override with -ldflags).
@@ -280,6 +281,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Rescore:        rescore,
 		Connectors:     registry,
 		Render:         renderSvc,
+		Surface:        surface.New(st),
 	})
 	httpSrv := &http.Server{
 		Handler:           srv.Handler(),

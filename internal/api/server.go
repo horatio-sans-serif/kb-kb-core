@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"kb/internal/canon"
 	"kb/internal/events"
@@ -18,6 +19,7 @@ import (
 	"kb/internal/render"
 	"kb/internal/search"
 	"kb/internal/store"
+	"kb/internal/surface"
 )
 
 // BuildInfo is reported by the health endpoint.
@@ -56,6 +58,12 @@ type RenderService interface {
 	Formats() []string
 }
 
+// Surfacer ranks artifacts for surfacing (satisfied by *surface.Surfacer). When
+// nil, the /surface route reports 503.
+type Surfacer interface {
+	Surface(ctx context.Context, opts surface.Options) ([]*kb.Artifact, error)
+}
+
 // Deps are the server's collaborators and settings.
 type Deps struct {
 	Store          *store.Store
@@ -70,6 +78,7 @@ type Deps struct {
 	Rescore        ingest.RescoreFunc
 	Connectors     ConnectorRegistry
 	Render         RenderService
+	Surface        Surfacer
 }
 
 // Server wires the HTTP handlers.
@@ -103,6 +112,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /sources", s.requireAuth(http.HandlerFunc(s.handleListSources)))
 	mux.Handle("POST /render", s.requireAuth(http.HandlerFunc(s.handleRender)))
 	mux.Handle("GET /renders", s.requireAuth(http.HandlerFunc(s.handleListRenders)))
+	mux.Handle("GET /surface", s.requireAuth(http.HandlerFunc(s.handleSurface)))
 	return mux
 }
 
@@ -552,6 +562,108 @@ func toRenderJSON(rec *kb.RenderRecord) renderJSON {
 		SourceQuery: rec.SourceQuery,
 		CreatedAt:   rec.CreatedAt,
 	}
+}
+
+type surfaceItemJSON struct {
+	ArtifactID  string  `json:"artifact_id"`
+	Title       string  `json:"title,omitempty"`
+	URL         string  `json:"url,omitempty"`
+	Score       float64 `json:"score"`
+	PrivacyTier string  `json:"privacy_tier"`
+	FirstSeenAt string  `json:"first_seen_at"`
+}
+
+// maxSurfaceLimit caps how many items one /surface call may return.
+const maxSurfaceLimit = 200
+
+// handleSurface returns the ready, scored artifacts ranked by relevance — "what
+// should I see now" (§8.11). Like the render export, the privacy ceiling defaults
+// conservatively so an omitted filter cannot surface sensitive/restricted content.
+func (s *Server) handleSurface(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Surface == nil {
+		http.Error(w, "surfacing not configured", http.StatusServiceUnavailable)
+		return
+	}
+	q := r.URL.Query()
+
+	limit := 20
+	if ls := q.Get("limit"); ls != "" {
+		n, err := strconv.Atoi(ls)
+		if err != nil || n < 1 {
+			http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		limit = min(n, maxSurfaceLimit)
+	}
+
+	var minScore float64
+	if ms := q.Get("min_score"); ms != "" {
+		f, err := strconv.ParseFloat(ms, 64)
+		if err != nil || f < 0 {
+			http.Error(w, "min_score must be a non-negative number", http.StatusBadRequest)
+			return
+		}
+		minScore = f
+	}
+
+	var since string
+	if ss := q.Get("since"); ss != "" {
+		if !validTimestamp(ss) {
+			http.Error(w, "since must be an RFC3339 timestamp", http.StatusBadRequest)
+			return
+		}
+		since = ss
+	}
+
+	ceiling := q.Get("privacy_ceiling")
+	if ceiling == "" {
+		ceiling = defaultExportCeiling
+	} else if !validPrivacy(ceiling) {
+		http.Error(w, "invalid privacy_ceiling", http.StatusBadRequest)
+		return
+	}
+
+	arts, err := s.deps.Surface.Surface(r.Context(), surface.Options{
+		Limit:          limit,
+		Since:          since,
+		MinScore:       minScore,
+		PrivacyCeiling: kb.PrivacyTier(ceiling),
+	})
+	if err != nil {
+		s.serverError(w, "surface", err)
+		return
+	}
+
+	out := make([]surfaceItemJSON, 0, len(arts))
+	for _, a := range arts {
+		item := surfaceItemJSON{
+			ArtifactID:  a.ID,
+			Title:       a.Title,
+			PrivacyTier: string(a.PrivacyTier),
+			FirstSeenAt: a.FirstSeenAt,
+		}
+		if a.RelevanceScore != nil {
+			item.Score = *a.RelevanceScore
+		}
+		if a.CanonicalURL != nil {
+			item.URL = *a.CanonicalURL
+		}
+		out = append(out, item)
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"surface": out})
+}
+
+// validTimestamp reports whether s parses as one of the timestamp formats the
+// system mints (the fixed-width store format) or accepts (RFC3339).
+func validTimestamp(s string) bool {
+	if len(s) > 64 {
+		return false
+	}
+	if _, err := time.Parse(store.TimeFormat, s); err == nil {
+		return true
+	}
+	_, err := time.Parse(time.RFC3339, s)
+	return err == nil
 }
 
 type searchResultJSON struct {

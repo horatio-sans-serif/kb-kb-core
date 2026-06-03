@@ -193,6 +193,69 @@ func (r *ArtifactRepo) ListIncludingDeleted(ctx context.Context) ([]*Artifact, e
 	return r.list(ctx, ` ORDER BY id`)
 }
 
+// SurfaceQuery selects and ranks artifacts for the surfacing engine (§8.11):
+// live, scored artifacts ordered by relevance (then recency), with optional
+// filters. Tiers is a privacy whitelist (empty = all); Since bounds first_seen_at
+// (new arrivals); Status filters the pipeline state ("" = any); MinScore floors
+// the relevance score; Limit caps the result (<=0 applies a default cap).
+type SurfaceQuery struct {
+	Status   string
+	Since    string
+	MinScore float64
+	Tiers    []string
+	Limit    int
+}
+
+const surfaceDefaultLimit = 50
+
+// Surface returns the ranked candidates for SurfaceQuery: live, scored artifacts
+// ordered by relevance_score (desc), then recency (first_seen_at desc), then id.
+// Only artifacts with a relevance score participate (an unscored, still-enriching
+// artifact is not surfaced).
+func (r *ArtifactRepo) Surface(ctx context.Context, q SurfaceQuery) ([]*Artifact, error) {
+	where := []string{"deleted_at IS NULL", "relevance_score IS NOT NULL", "relevance_score >= ?"}
+	args := []any{q.MinScore}
+	if q.Status != "" {
+		where = append(where, "status = ?")
+		args = append(args, q.Status)
+	}
+	if q.Since != "" {
+		where = append(where, "first_seen_at >= ?")
+		args = append(args, q.Since)
+	}
+	if len(q.Tiers) > 0 {
+		ph := make([]string, len(q.Tiers))
+		for i, t := range q.Tiers {
+			ph[i] = "?"
+			args = append(args, t)
+		}
+		where = append(where, "privacy_tier IN ("+strings.Join(ph, ", ")+")")
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = surfaceDefaultLimit
+	}
+	args = append(args, limit)
+
+	query := artifactSelect + " WHERE " + strings.Join(where, " AND ") +
+		" ORDER BY relevance_score DESC, first_seen_at DESC, id LIMIT ?"
+	rows, err := r.rq.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("surface artifacts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Artifact
+	for rows.Next() {
+		a, err := scanArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (r *ArtifactRepo) list(ctx context.Context, clause string) ([]*Artifact, error) {
 	rows, err := r.rq.QueryContext(ctx, artifactSelect+clause)
 	if err != nil {
