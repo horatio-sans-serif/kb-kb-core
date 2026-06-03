@@ -922,9 +922,20 @@ prune old versions) is deferred.
   contributes 0 (harmless). Combined with Stage 1's re-score triggers, engaging an
   artifact reshapes relevance for the whole corpus on the next score.
 
+**Review:** clean (no P1/P2). The `EngagedEmbeddings` SQL, the bounded/stable
+match math, the `Match`→`MatchWith(nil)` refactor, and the interface change were
+all confirmed sound; the privacy path is unreachable (`relevance_score` is never
+serialized). Realized: documented the tier-ceiling invariant on
+`EngagedEmbeddings` (sharper than search's — the influence is baked into the
+stored score). Noted below for the decay sweep.
+
 **Next:** recency-decay re-scoring (a periodic sweep so old unengaged artifacts
 fade) — the relevance factors are all live now, but only recompute on
-ingest/engage/re-encounter, so time-based decay needs a background pass.
+ingest/engage/re-encounter, so time-based decay needs a background pass. When it
+lands: (a) load the engaged set ONCE per sweep and thread it through, rather than
+calling `EngagedVectors` inside each per-artifact `Enrich` (N× redundant work);
+(b) add a partial index `artifacts(last_engaged_at) WHERE last_engaged_at IS NOT
+NULL AND deleted_at IS NULL` if the engaged query becomes hot.
 
 **Deferred:** that decay sweep; enrichment-row retention (above); rerank +
 citation validation; chunk-level embeddings; cr-sqlite peer sync (Phase 10).

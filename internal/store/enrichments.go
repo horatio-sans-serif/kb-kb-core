@@ -115,6 +115,14 @@ type EmbeddingRow struct {
 // capped at limit and excluding excludeID. These feed the living profile (§8.9):
 // recently-engaged content shapes what scores as relevant. excludeID keeps the
 // artifact currently being scored out of its own profile (no self-match).
+//
+// Privacy: like ForEachLatestEmbedding this does not filter by privacy_tier — and
+// the rule is sharper here. A sensitive/restricted engaged artifact's embedding
+// influences the stored relevance_score of OTHER (possibly public) artifacts, so
+// a future lower-trust read path (see KB_LISTEN_ADDR) cannot sanitize the leak by
+// filtering output alone; it must filter engaged rows by a tier ceiling, or
+// segregate scores per ceiling. Acceptable now (single owner, relevance_score is
+// never serialized out).
 func (r *EnrichmentRepo) EngagedEmbeddings(ctx context.Context, excludeID string, limit int) ([]EmbeddingRow, error) {
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT artifact_id, payload FROM (
