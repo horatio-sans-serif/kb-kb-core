@@ -220,6 +220,27 @@ type Link struct {
 	Weight   float64
 }
 
+// ValidEntityKind reports whether k is a known entity kind (matching the schema
+// CHECK), so the graph writer can reject out-of-vocabulary LLM output with a clear
+// error rather than a raw constraint failure.
+func ValidEntityKind(k string) bool {
+	switch k {
+	case "person", "org", "technology", "concept", "place":
+		return true
+	}
+	return false
+}
+
+// ValidRelation reports whether rel is a known link relation (matching the schema
+// CHECK).
+func ValidRelation(rel string) bool {
+	switch rel {
+	case "references", "shares_entity", "shares_topic", "same_as", "derived_from":
+		return true
+	}
+	return false
+}
+
 // ReviewState is an artifact's spaced-repetition schedule (design §6.9): an
 // SM-2 record of when it is next due, the current interval and ease factor, and
 // how many successful reviews it has had. One row per artifact (artifact_id PK).

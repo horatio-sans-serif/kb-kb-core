@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,11 +15,22 @@ import (
 // Entity and Link are defined in internal/kb (aliased in types.go).
 type GraphRepo struct{ q, rq Querier } // q: write pool; rq: read pool
 
+// ErrInvalidEntityKind / ErrInvalidRelation reject out-of-vocabulary graph writes
+// (e.g. an LLM extractor emitting a kind the schema doesn't allow) with a typed
+// error, before the raw CHECK constraint fires.
+var (
+	ErrInvalidEntityKind = errors.New("store: invalid entity kind")
+	ErrInvalidRelation   = errors.New("store: invalid link relation")
+)
+
 // UpsertEntity inserts the entity or returns the id of the existing one with the
 // same (kind, name) — the dedup keystone of the graph. Non-empty Aliases replace
 // the stored set; nil Aliases leave an existing set intact. Returns the canonical
 // entity id.
 func (r *GraphRepo) UpsertEntity(ctx context.Context, e *kb.Entity) (string, error) {
+	if !kb.ValidEntityKind(e.Kind) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidEntityKind, e.Kind)
+	}
 	if e.ID == "" {
 		e.ID = NewID()
 	}
@@ -90,6 +102,9 @@ func (r *GraphRepo) ArtifactsForEntity(ctx context.Context, entityID string) ([]
 
 // AddLink records a directed edge, deduped on (src, dst, relation). Idempotent.
 func (r *GraphRepo) AddLink(ctx context.Context, src, dst, relation string, weight float64) error {
+	if !kb.ValidRelation(relation) {
+		return fmt.Errorf("%w: %q", ErrInvalidRelation, relation)
+	}
 	if _, err := r.q.ExecContext(ctx,
 		`INSERT OR IGNORE INTO links(id, src_id, dst_id, relation, weight, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -99,22 +114,55 @@ func (r *GraphRepo) AddLink(ctx context.Context, src, dst, relation string, weig
 	return nil
 }
 
+// neighborChunk bounds how many frontier ids go into one query. Each query uses
+// 2× this many bind variables (src and dst IN lists), kept well under SQLite's
+// ~32k variable ceiling so a wide frontier (a hub node) cannot fail the query.
+const neighborChunk = 500
+
+// maxConnectedNodes bounds a single ConnectedWithin traversal so a pathological
+// (dense/huge) graph cannot make one query expand without limit.
+const maxConnectedNodes = 5000
+
 // NeighborIDs returns the distinct artifact ids adjacent to any id in the frontier,
 // treating edges as undirected (an edge in either direction is a neighbor). Live
-// artifacts only.
+// artifacts only. The frontier is chunked so an arbitrarily wide frontier never
+// exceeds the bind-variable ceiling.
 func (r *GraphRepo) NeighborIDs(ctx context.Context, frontier []string) ([]string, error) {
-	if len(frontier) == 0 {
+	seen := make(map[string]bool)
+	var out []string
+	for start := 0; start < len(frontier); start += neighborChunk {
+		end := start + neighborChunk
+		if end > len(frontier) {
+			end = len(frontier)
+		}
+		ids, err := r.neighborsOf(ctx, frontier[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// neighborsOf runs the adjacency query for one bounded chunk of the frontier.
+func (r *GraphRepo) neighborsOf(ctx context.Context, chunk []string) ([]string, error) {
+	if len(chunk) == 0 {
 		return nil, nil
 	}
-	ph := make([]string, len(frontier))
-	args := make([]any, 0, len(frontier)*2)
-	for i, id := range frontier {
+	ph := make([]string, len(chunk))
+	args := make([]any, 0, len(chunk)*2)
+	for i, id := range chunk {
 		ph[i] = "?"
 		args = append(args, id)
 	}
 	in := strings.Join(ph, ", ")
-	// The src-side and dst-side IN lists need the args twice.
-	args = append(args, args...)
+	args = append(args, args...) // src-side and dst-side IN lists bind the same ids
 	q := `SELECT DISTINCT n FROM (
 	        SELECT dst_id AS n FROM links WHERE src_id IN (` + in + `)
 	        UNION
@@ -131,11 +179,12 @@ func (r *GraphRepo) NeighborIDs(ctx context.Context, frontier []string) ([]strin
 
 // ConnectedWithin returns the artifact ids reachable from start within hops edges
 // (undirected), excluding start itself, sorted. A breadth-first expansion bounded
-// by hops; the visited set prevents cycles.
+// by hops; the visited set prevents cycles, and the traversal stops once
+// maxConnectedNodes have been reached so a hub node cannot expand without limit.
 func (r *GraphRepo) ConnectedWithin(ctx context.Context, start string, hops int) ([]string, error) {
 	visited := map[string]bool{start: true}
 	frontier := []string{start}
-	for h := 0; h < hops && len(frontier) > 0; h++ {
+	for h := 0; h < hops && len(frontier) > 0 && len(visited) < maxConnectedNodes; h++ {
 		nbrs, err := r.NeighborIDs(ctx, frontier)
 		if err != nil {
 			return nil, err
@@ -145,6 +194,9 @@ func (r *GraphRepo) ConnectedWithin(ctx context.Context, start string, hops int)
 			if !visited[n] {
 				visited[n] = true
 				next = append(next, n)
+				if len(visited) >= maxConnectedNodes {
+					break
+				}
 			}
 		}
 		frontier = next
