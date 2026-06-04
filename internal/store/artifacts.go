@@ -376,6 +376,29 @@ func (r *ArtifactRepo) Patch(ctx context.Context, id string, p ArtifactPatch) er
 	return nil
 }
 
+// LifecycleCounts is the artifact population by lifecycle state.
+type LifecycleCounts struct {
+	Active  int
+	Archive int
+	Purged  int // tombstoned (deleted_at set)
+}
+
+// LifecycleCounts returns the live active/archive counts and the tombstoned
+// (purged) count — the lifecycle status view.
+func (r *ArtifactRepo) LifecycleCounts(ctx context.Context) (LifecycleCounts, error) {
+	var c LifecycleCounts
+	err := r.rq.QueryRowContext(ctx,
+		`SELECT
+		   COALESCE(SUM(CASE WHEN deleted_at IS NULL AND lifecycle_tier = 'active' THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN deleted_at IS NULL AND lifecycle_tier = 'archive' THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+		 FROM artifacts`).Scan(&c.Active, &c.Archive, &c.Purged)
+	if err != nil {
+		return LifecycleCounts{}, fmt.Errorf("lifecycle counts: %w", err)
+	}
+	return c, nil
+}
+
 func scanArtifact(s scanner) (*Artifact, error) {
 	var a Artifact
 	var title, body sql.NullString // nullable in schema; read NULL as ""

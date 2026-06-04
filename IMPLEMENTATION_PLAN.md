@@ -1400,5 +1400,21 @@ once within budget. Backed by `SourceRepo.ListWithBudget`,
 `EncounterRepo.ActiveArtifactCountForSource` / `LowestRelevanceActiveForSource`.
 Run alongside the lifecycle sweep in the daemon.
 
-**Next:** Stage 3 — compaction (hard-delete tombstoned artifacts + cascade derived
-rows past a grace period) + a lifecycle status endpoint.
+## Stage 3: Lifecycle status endpoint
+
+**Status: Complete.** `GET /lifecycle` reports the artifact population by tier
+(active / archive live counts + tombstoned `purged` count, via
+`ArtifactRepo.LifecycleCounts`) and each budgeted source's active footprint
+against its budget. Operational visibility into the GC.
+
+Physical compaction (hard-deleting tombstoned artifacts + cascading derived rows
+to reclaim bytes) is deferred to the sync phase: under cr-sqlite a tombstone must
+propagate to every peer before its bytes can be reclaimed, so the safe-to-compact
+horizon is a sync property. `ClaimRepo.DeleteByArtifact` (Phase 9) is the cascade
+primitive that GC will build on.
+
+This completes Phase 11 (lifecycle & GC): tier transitions, per-source budgets,
+status endpoint. Relevance decay is Phase 4.3.
+
+**Deferred:** physical compaction past the sync horizon; review prompts for
+archive-tier items; byte-based (not count-based) storage budgets.

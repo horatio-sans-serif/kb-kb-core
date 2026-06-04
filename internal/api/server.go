@@ -131,6 +131,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /conflicts/{id}", s.requireAuth(http.HandlerFunc(s.handleResolveConflict)))
 	mux.Handle("GET /topics", s.requireAuth(http.HandlerFunc(s.handleListTopics)))
 	mux.Handle("GET /topics/{id}", s.requireAuth(http.HandlerFunc(s.handleGetTopic)))
+	mux.Handle("GET /lifecycle", s.requireAuth(http.HandlerFunc(s.handleLifecycle)))
 	return mux
 }
 
@@ -774,6 +775,56 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
+}
+
+type lifecycleSourceJSON struct {
+	ID          string `json:"id"`
+	Connector   string `json:"connector"`
+	Budget      int    `json:"budget"`
+	ActiveCount int    `json:"active_count"`
+}
+
+type lifecycleJSON struct {
+	Tiers struct {
+		Active  int `json:"active"`
+		Archive int `json:"archive"`
+		Purged  int `json:"purged"`
+	} `json:"tiers"`
+	Sources []lifecycleSourceJSON `json:"sources"`
+}
+
+// handleLifecycle reports the artifact population by lifecycle tier and the
+// active footprint of each budgeted source against its budget (§8.12).
+func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	counts, err := s.deps.Store.Artifacts.LifecycleCounts(ctx)
+	if err != nil {
+		s.serverError(w, "lifecycle counts", err)
+		return
+	}
+	srcs, err := s.deps.Store.Sources.ListWithBudget(ctx)
+	if err != nil {
+		s.serverError(w, "lifecycle sources", err)
+		return
+	}
+	var out lifecycleJSON
+	out.Tiers.Active, out.Tiers.Archive, out.Tiers.Purged = counts.Active, counts.Archive, counts.Purged
+	out.Sources = make([]lifecycleSourceJSON, 0, len(srcs))
+	for _, src := range srcs {
+		n, err := s.deps.Store.Encounters.ActiveArtifactCountForSource(ctx, src.ID)
+		if err != nil {
+			s.serverError(w, "lifecycle source count", err)
+			return
+		}
+		budget := 0
+		if src.StorageBudget != nil {
+			budget = *src.StorageBudget
+		}
+		out.Sources = append(out.Sources, lifecycleSourceJSON{
+			ID: src.ID, Connector: src.Connector, Budget: budget, ActiveCount: n,
+		})
+	}
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 type topicListItemJSON struct {
