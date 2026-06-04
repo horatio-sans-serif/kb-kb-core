@@ -826,21 +826,16 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "get topic", err)
 		return
 	}
-	members, err := s.deps.Store.Topics.Members(ctx, id)
+	members, err := s.deps.Store.Topics.Members(ctx, id, maxSurfaceLimit)
 	if err != nil {
 		s.serverError(w, "topic members", err)
 		return
 	}
 	out := topicJSON{ID: topic.ID, Label: topic.Label, Members: make([]topicMemberJSON, 0, len(members))}
 	for _, m := range members {
-		item := topicMemberJSON{ArtifactID: m.ArtifactID, Score: m.Score}
-		if a, err := s.deps.Store.Artifacts.GetLive(ctx, m.ArtifactID); err == nil {
-			item.Title = a.Title
-			if a.CanonicalURL != nil {
-				item.URL = *a.CanonicalURL
-			}
-		}
-		out.Members = append(out.Members, item)
+		out.Members = append(out.Members, topicMemberJSON{
+			ArtifactID: m.ArtifactID, Title: m.Title, URL: m.URL, Score: m.Score,
+		})
 	}
 	s.writeJSON(w, http.StatusOK, out)
 }

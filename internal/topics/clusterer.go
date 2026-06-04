@@ -2,7 +2,15 @@
 // into emergent topics by embedding similarity, using incremental leader
 // clustering — a new artifact joins the nearest existing topic if it is close
 // enough, otherwise it founds a new one. Run as a periodic sweep so centroid
-// running-means stay single-threaded (exactly-once per assignment).
+// running-means stay single-threaded.
+//
+// Leader clustering is order-dependent by design: the result depends on the order
+// artifacts are processed (oldest-first here, so the first of a similar group
+// founds the topic and shapes its label), and a topic's running-mean centroid
+// drifts as members accumulate, so an early member can end up cosine-distant from
+// the drifted centroid yet stays assigned (assignments are not re-evaluated). A
+// periodic full re-cluster is out of scope for now. The join threshold should be
+// in (0, 1]; at or below 0 a negative-cosine topic could be "joined".
 package topics
 
 import (
@@ -10,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"kb/internal/kb"
 	"kb/internal/relevance"
@@ -67,11 +76,19 @@ func (c *Clusterer) Sweep(ctx context.Context) (int, error) {
 }
 
 // assign places one candidate: it joins the nearest topic above the threshold
-// (updating that topic's running-mean centroid) or founds a new topic. The read of
-// the centroids and the write of the assignment happen in one transaction so the
-// running mean is consistent and the assignment is exactly-once.
+// (updating that topic's running-mean centroid) or founds a new topic. The
+// membership re-check, the centroid read, and the write all happen in one
+// transaction so the running mean is consistent and the whole operation is
+// idempotent — re-running it for an already-assigned artifact is a no-op, so a
+// candidate that somehow appears in two overlapping sweeps cannot double-count the
+// centroid (the INSERT-OR-IGNORE membership alone would not prevent that).
 func (c *Clusterer) assign(ctx context.Context, cand store.ClusterCandidate) error {
 	return c.st.Tx(ctx, func(tx *store.Store) error {
+		if existing, err := tx.Topics.TopicsForArtifact(ctx, cand.ArtifactID); err != nil {
+			return err
+		} else if len(existing) > 0 {
+			return nil // already clustered — do not fold its vector in again
+		}
 		topics, err := tx.Topics.ListWithCentroids(ctx)
 		if err != nil {
 			return err
@@ -127,7 +144,8 @@ func runningMean(centroid []float32, n int, vec []float32) []float32 {
 	return out
 }
 
-// label derives a topic label from a founding artifact's title.
+// label derives a topic label from a founding artifact's title, capped at
+// maxLabelLen bytes without splitting a UTF-8 rune.
 func label(title string) string {
 	t := strings.Join(strings.Fields(title), " ")
 	if t == "" {
@@ -135,6 +153,9 @@ func label(title string) string {
 	}
 	if len(t) > maxLabelLen {
 		t = t[:maxLabelLen]
+		for len(t) > 0 && !utf8.ValidString(t) {
+			t = t[:len(t)-1] // back off to the last whole rune
+		}
 	}
 	return t
 }

@@ -128,18 +128,25 @@ func (r *TopicRepo) Get(ctx context.Context, id string) (*Topic, error) {
 	return ts[0], nil
 }
 
-// TopicMember is one artifact's membership in a topic.
+// TopicMember is one artifact's membership in a topic, with its display fields
+// (joined here so the caller needs no per-member lookup).
 type TopicMember struct {
 	ArtifactID string
+	Title      string
+	URL        string
 	Score      float64
 }
 
-// Members returns a topic's live member artifacts, highest membership score first.
-func (r *TopicRepo) Members(ctx context.Context, topicID string) ([]TopicMember, error) {
+// Members returns up to limit of a topic's live member artifacts, highest
+// membership score first, with their title/url.
+func (r *TopicRepo) Members(ctx context.Context, topicID string, limit int) ([]TopicMember, error) {
+	if limit <= 0 {
+		limit = surfaceDefaultLimit
+	}
 	rows, err := r.rq.QueryContext(ctx,
-		`SELECT at.artifact_id, at.score FROM artifact_topics at
+		`SELECT at.artifact_id, a.title, a.canonical_url, at.score FROM artifact_topics at
 		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL
-		 WHERE at.topic_id = ? ORDER BY at.score DESC, at.artifact_id`, topicID)
+		 WHERE at.topic_id = ? ORDER BY at.score DESC, at.artifact_id LIMIT ?`, topicID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("members of topic %q: %w", topicID, err)
 	}
@@ -148,9 +155,11 @@ func (r *TopicRepo) Members(ctx context.Context, topicID string) ([]TopicMember,
 	var out []TopicMember
 	for rows.Next() {
 		var m TopicMember
-		if err := rows.Scan(&m.ArtifactID, &m.Score); err != nil {
+		var title, url sql.NullString
+		if err := rows.Scan(&m.ArtifactID, &title, &url, &m.Score); err != nil {
 			return nil, fmt.Errorf("scan topic member: %w", err)
 		}
+		m.Title, m.URL = title.String, url.String
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -212,8 +221,8 @@ func (r *TopicRepo) UnclusteredEmbeddings(ctx context.Context, limit int) ([]Clu
 		if err := json.Unmarshal([]byte(payload), &p); err != nil {
 			return nil, fmt.Errorf("unmarshal embedding for %q: %w", c.ArtifactID, err)
 		}
-		if len(p.Vector) == 0 {
-			continue // an empty embedding is not clusterable
+		if len(p.Vector) == 0 || isZeroVec(p.Vector) {
+			continue // an empty or zero-magnitude embedding is not clusterable
 		}
 		c.Title = title.String
 		c.Embedding = p.Vector
@@ -238,6 +247,17 @@ func scanTopics(rows *sql.Rows) ([]*Topic, error) {
 		out = append(out, &t)
 	}
 	return out, rows.Err()
+}
+
+// isZeroVec reports whether every component is zero — a degenerate embedding that
+// has no cosine direction, so it would found a permanent singleton topic.
+func isZeroVec(v []float32) bool {
+	for _, x := range v {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // marshalVec encodes a float vector as a JSON array, or nil (→ SQL NULL) when empty.

@@ -74,9 +74,12 @@ func TestClusterer_SecondSweepIsNoOp(t *testing.T) {
 func TestClusterer_CentroidIsRunningMean(t *testing.T) {
 	ctx := context.Background()
 	st := storetest.New(t)
-	seed(t, st, "ha", "A", []float32{2, 0})
-	seed(t, st, "hb", "B", []float32{0, 2}) // cosine 0 to A → but we force one topic via threshold 0
-	cl := NewWithThreshold(st, 0.0, 100)    // threshold 0 → everything joins the first topic
+	// Three members with an asymmetric mean, so an off-by-one in the member count
+	// (reading N after the assign) would give a different, detectable result.
+	seed(t, st, "ha", "A", []float32{6, 0})
+	seed(t, st, "hb", "B", []float32{3, 0})
+	seed(t, st, "hc", "C", []float32{0, 3})
+	cl := NewWithThreshold(st, 0.0, 100) // threshold 0 → all join the first topic
 	if _, err := cl.Sweep(ctx); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -84,9 +87,32 @@ func TestClusterer_CentroidIsRunningMean(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("threshold 0 should yield one topic, got %d", len(all))
 	}
-	// Centroid = mean of [2,0] and [0,2] = [1,1].
+	// Mean of [6,0],[3,0],[0,3] = [3,1].
 	cen := all[0].Centroid
-	if len(cen) != 2 || cen[0] != 1 || cen[1] != 1 {
-		t.Errorf("centroid = %v, want the running mean [1,1]", cen)
+	if len(cen) != 2 || cen[0] != 3 || cen[1] != 1 {
+		t.Errorf("centroid = %v, want the running mean [3,1]", cen)
+	}
+}
+
+func TestClusterer_AssignIsIdempotent(t *testing.T) {
+	// Re-running the clusterer must not re-fold an already-clustered artifact's
+	// vector into its topic centroid (the centroid update is not naturally
+	// idempotent; the in-tx membership re-check makes it so).
+	ctx := context.Background()
+	st := storetest.New(t)
+	a := seed(t, st, "ha", "A", []float32{2, 0})
+	cl := New(st)
+	if _, err := cl.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	before, _ := st.Topics.ListWithCentroids(ctx)
+
+	// Re-cluster the same already-assigned artifact directly.
+	if err := cl.assign(ctx, store.ClusterCandidate{ArtifactID: a, Embedding: []float32{2, 0}}); err != nil {
+		t.Fatalf("re-assign: %v", err)
+	}
+	after, _ := st.Topics.ListWithCentroids(ctx)
+	if len(after) != 1 || after[0].Centroid[0] != before[0].Centroid[0] {
+		t.Errorf("centroid changed on re-assign: before %v after %v", before[0].Centroid, after[0].Centroid)
 	}
 }

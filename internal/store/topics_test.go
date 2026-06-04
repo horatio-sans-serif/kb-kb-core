@@ -86,7 +86,7 @@ func TestTopicRepo_ListWithCountsGetMembers(t *testing.T) {
 	}
 
 	// Members: live members, highest score first; tombstoned excluded.
-	members, err := st.Topics.Members(ctx, big.ID)
+	members, err := st.Topics.Members(ctx, big.ID, 10)
 	if err != nil {
 		t.Fatalf("members: %v", err)
 	}
