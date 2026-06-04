@@ -130,6 +130,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /review", s.requireAuth(http.HandlerFunc(s.handleReview)))
 	mux.Handle("GET /review/due", s.requireAuth(http.HandlerFunc(s.handleReviewDue)))
 	mux.Handle("GET /graph/{id}", s.requireAuth(http.HandlerFunc(s.handleGraph)))
+	mux.Handle("GET /entities", s.requireAuth(http.HandlerFunc(s.handleListEntities)))
+	mux.Handle("GET /entities/{id}", s.requireAuth(http.HandlerFunc(s.handleGetEntity)))
+	mux.Handle("GET /artifacts/{id}/backlinks", s.requireAuth(http.HandlerFunc(s.handleBacklinks)))
 	mux.Handle("GET /conflicts", s.requireAuth(http.HandlerFunc(s.handleListConflicts)))
 	mux.Handle("POST /conflicts/{id}", s.requireAuth(http.HandlerFunc(s.handleResolveConflict)))
 	mux.Handle("GET /topics", s.requireAuth(http.HandlerFunc(s.handleListTopics)))
@@ -1153,6 +1156,117 @@ type entityJSON struct {
 	Kind    string   `json:"kind"`
 	Name    string   `json:"name"`
 	Aliases []string `json:"aliases,omitempty"`
+}
+
+type entityListItemJSON struct {
+	ID            string   `json:"id"`
+	Kind          string   `json:"kind"`
+	Name          string   `json:"name"`
+	Aliases       []string `json:"aliases,omitempty"`
+	ArtifactCount int      `json:"artifact_count"`
+}
+
+type entityDetailJSON struct {
+	ID        string          `json:"id"`
+	Kind      string          `json:"kind"`
+	Name      string          `json:"name"`
+	Aliases   []string        `json:"aliases,omitempty"`
+	Artifacts []graphNodeJSON `json:"artifacts"`
+}
+
+type backlinkJSON struct {
+	ArtifactID string `json:"artifact_id"`
+	Title      string `json:"title,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Relation   string `json:"relation"`
+}
+
+// handleListEntities lists the knowledge-graph entities by mention count (§8.7).
+func (s *Server) handleListEntities(w http.ResponseWriter, r *http.Request) {
+	ents, err := s.deps.Store.Graph.ListEntities(r.Context(), maxSurfaceLimit)
+	if err != nil {
+		s.serverError(w, "list entities", err)
+		return
+	}
+	out := make([]entityListItemJSON, 0, len(ents))
+	for _, e := range ents {
+		out = append(out, entityListItemJSON{
+			ID: e.Entity.ID, Kind: e.Entity.Kind, Name: e.Entity.Name,
+			Aliases: e.Entity.Aliases, ArtifactCount: e.ArtifactCount,
+		})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"entities": out})
+}
+
+// handleGetEntity returns an entity and the artifacts that mention it.
+func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid entity id", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	e, err := s.deps.Store.Graph.GetEntity(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown entity", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "get entity", err)
+		return
+	}
+	ids, err := s.deps.Store.Graph.ArtifactsForEntity(ctx, id)
+	if err != nil {
+		s.serverError(w, "entity artifacts", err)
+		return
+	}
+	out := entityDetailJSON{ID: e.ID, Kind: e.Kind, Name: e.Name, Aliases: e.Aliases, Artifacts: make([]graphNodeJSON, 0, len(ids))}
+	for _, aid := range ids {
+		out.Artifacts = append(out.Artifacts, s.graphNode(ctx, aid))
+	}
+	s.writeJSON(w, http.StatusOK, out)
+}
+
+// handleBacklinks returns the live artifacts that link to the given artifact.
+func (s *Server) handleBacklinks(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid artifact id", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	if _, err := s.deps.Store.Artifacts.GetLive(ctx, id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown artifact", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "backlinks artifact", err)
+		return
+	}
+	links, err := s.deps.Store.Graph.Backlinks(ctx, id)
+	if err != nil {
+		s.serverError(w, "backlinks", err)
+		return
+	}
+	out := make([]backlinkJSON, 0, len(links))
+	for _, l := range links {
+		n := s.graphNode(ctx, l.SrcID)
+		out = append(out, backlinkJSON{ArtifactID: n.ArtifactID, Title: n.Title, URL: n.URL, Relation: l.Relation})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"backlinks": out})
+}
+
+// graphNode loads an artifact's display fields; a tombstoned/missing one degrades
+// to just its id.
+func (s *Server) graphNode(ctx context.Context, id string) graphNodeJSON {
+	n := graphNodeJSON{ArtifactID: id}
+	if a, err := s.deps.Store.Artifacts.GetLive(ctx, id); err == nil {
+		n.Title = a.Title
+		if a.CanonicalURL != nil {
+			n.URL = *a.CanonicalURL
+		}
+	}
+	return n
 }
 
 type graphNodeJSON struct {

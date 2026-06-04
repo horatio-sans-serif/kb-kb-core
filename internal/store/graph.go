@@ -100,6 +100,87 @@ func (r *GraphRepo) ArtifactsForEntity(ctx context.Context, entityID string) ([]
 	return scanIDs(rows)
 }
 
+// EntityWithCount is an entity plus how many live artifacts mention it.
+type EntityWithCount struct {
+	Entity        *kb.Entity
+	ArtifactCount int
+}
+
+// ListEntities returns the entities mentioned by at least one live artifact, most-
+// mentioned first — the global entity index.
+func (r *GraphRepo) ListEntities(ctx context.Context, limit int) ([]EntityWithCount, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT e.id, e.kind, e.name, e.aliases, COUNT(*) AS n FROM entities e
+		 JOIN artifact_entities ae ON ae.entity_id = e.id
+		 JOIN artifacts a ON a.id = ae.artifact_id AND a.deleted_at IS NULL
+		 GROUP BY e.id, e.kind, e.name, e.aliases ORDER BY n DESC, e.name LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list entities: %w", err)
+	}
+	defer rows.Close()
+
+	var out []EntityWithCount
+	for rows.Next() {
+		var e kb.Entity
+		var aliases sql.NullString
+		var n int
+		if err := rows.Scan(&e.ID, &e.Kind, &e.Name, &aliases, &n); err != nil {
+			return nil, fmt.Errorf("scan entity count: %w", err)
+		}
+		if aliases.Valid && aliases.String != "" {
+			if err := json.Unmarshal([]byte(aliases.String), &e.Aliases); err != nil {
+				return nil, fmt.Errorf("unmarshal entity %q aliases: %w", e.ID, err)
+			}
+		}
+		out = append(out, EntityWithCount{Entity: &e, ArtifactCount: n})
+	}
+	return out, rows.Err()
+}
+
+// GetEntity returns an entity by id, or ErrNotFound.
+func (r *GraphRepo) GetEntity(ctx context.Context, id string) (*kb.Entity, error) {
+	e, err := scanEntity(r.rq.QueryRowContext(ctx, `SELECT id, kind, name, aliases FROM entities WHERE id = ?`, id))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("get entity %q: %w", id, ErrNotFound)
+		}
+		return nil, fmt.Errorf("get entity %q: %w", id, err)
+	}
+	return e, nil
+}
+
+// Backlink is one incoming edge: a live artifact that links TO the queried one.
+type Backlink struct {
+	SrcID    string
+	Relation string
+}
+
+// Backlinks returns the live artifacts that link to artifactID (incoming edges) —
+// the reverse-direction graph query (§8.7).
+func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string) ([]Backlink, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT DISTINCT l.src_id, l.relation FROM links l
+		 JOIN artifacts a ON a.id = l.src_id AND a.deleted_at IS NULL
+		 WHERE l.dst_id = ? ORDER BY l.src_id, l.relation`, artifactID)
+	if err != nil {
+		return nil, fmt.Errorf("backlinks for %q: %w", artifactID, err)
+	}
+	defer rows.Close()
+
+	var out []Backlink
+	for rows.Next() {
+		var b Backlink
+		if err := rows.Scan(&b.SrcID, &b.Relation); err != nil {
+			return nil, fmt.Errorf("scan backlink: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // AddLink records a directed edge, deduped on (src, dst, relation). Idempotent.
 func (r *GraphRepo) AddLink(ctx context.Context, src, dst, relation string, weight float64) error {
 	if !kb.ValidRelation(relation) {

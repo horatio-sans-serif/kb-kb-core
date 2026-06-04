@@ -1490,3 +1490,24 @@ AuthState expiry handling.
 
 Backed by the existing `SourceRepo.Update` / `SetEnabled`. Source management is now
 full CRUD.
+
+---
+
+# Phase 15 — Graph query completion (§8.7)
+
+**Status: Complete.** Surfaces the knowledge graph globally, beyond the per-artifact
+`GET /graph/{id}` view:
+
+- **`GET /entities`**: the entity index — entities mentioned by >=1 live artifact,
+  most-mentioned first, with `artifact_count` (`GraphRepo.ListEntities`).
+- **`GET /entities/{id}`**: an entity + the artifacts that mention it
+  (`GraphRepo.GetEntity` + `ArtifactsForEntity`); 404 unknown.
+- **`GET /artifacts/{id}/backlinks`**: the live artifacts that link TO this one
+  (incoming edges, with relation) — the reverse-direction graph query
+  (`GraphRepo.Backlinks`); 404 unknown artifact.
+
+All live-only (tombstoned artifacts/their mentions excluded). The shared
+`graphNode` helper loads display fields, degrading to id on a tombstone race.
+
+**Deferred:** entity merge/edit (alias curation); filtering entities by kind;
+shares_topic edges feeding the graph.
