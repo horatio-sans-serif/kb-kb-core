@@ -17,6 +17,7 @@ type (
 	Link           = kb.Link
 	Claim          = kb.Claim
 	Conflict       = kb.Conflict
+	Topic          = kb.Topic
 	ArtifactPatch  = kb.ArtifactPatch
 	PrivacyTier    = kb.PrivacyTier
 	SourceKind     = kb.SourceKind

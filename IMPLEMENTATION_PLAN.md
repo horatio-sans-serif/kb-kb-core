@@ -1321,3 +1321,26 @@ flows over the existing SSE event stream.
 **Deferred:** source-credibility signals from conflict-resolution outcomes;
 surfacing open conflicts into the digest; topic-cluster-scoped comparison (vs the
 current global vector pre-filter).
+
+---
+
+# Phase 10 — Topic clustering (§8.7)
+
+Group artifacts into emergent topics by embedding similarity (incremental leader
+clustering), completing the §8.7 knowledge-organization story alongside the graph.
+The topics/artifact_topics tables exist from Phase 0.
+
+## Stage 1: Topic store layer
+
+**Status: Complete.** Pure persistence:
+
+- **`store.TopicRepo`**: `Create` (centroid as a JSON float array, NULL when
+  absent); `ListWithCentroids` (the nearest-search set — topics with a centroid);
+  `SetCentroid` (the updated running mean); `Assign` (idempotent artifact↔topic
+  with a membership score); `MemberCount` (live members — the N a running-mean
+  update needs); `TopicsForArtifact`.
+- **`kb.Topic`** domain type.
+
+**Next:** Stage 2 — topic-assignment stage (incremental leader clustering: nearest
+centroid above a threshold, else a new topic; running-mean centroid update in the
+effect tx). Stage 3 — topic query API + shares_topic graph edges.

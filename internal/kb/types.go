@@ -199,6 +199,15 @@ type RenderRecord struct {
 	CreatedAt   string
 }
 
+// Topic is an emergent cluster of semantically-related artifacts (design §6.6 /
+// §8.7). Centroid is the running mean of its members' embeddings — the key the
+// clustering compares a new artifact against.
+type Topic struct {
+	ID       string
+	Label    string
+	Centroid []float32
+}
+
 // Claim is a single factual assertion extracted from an artifact (design §6.10 /
 // §8.13). Its embedding bounds the contradiction-comparison set (vector
 // pre-filter) before the LLM judges whether two claims conflict.
