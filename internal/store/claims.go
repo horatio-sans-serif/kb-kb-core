@@ -148,8 +148,10 @@ func (r *ClaimRepo) mergeInto(ctx context.Context, survivor, loser string) error
 }
 
 // DeleteByArtifact removes an artifact's claims and the conflict rows that
-// reference them (either side) — the cascade a re-enrich or lifecycle GC needs,
-// since conflicts have a FK to claims. Deletes conflicts first to satisfy the FK.
+// reference them (either side) — the cascade a re-enrich or lifecycle GC needs.
+// Synced tables no longer carry foreign keys (§8.16), so this cascade is now
+// application-enforced: it deletes conflicts first so no conflict is left dangling
+// against a deleted claim (which ListByStatus's JOINs would silently drop).
 func (r *ClaimRepo) DeleteByArtifact(ctx context.Context, artifactID string) error {
 	if _, err := r.q.ExecContext(ctx,
 		`DELETE FROM conflicts WHERE claim_a IN (SELECT id FROM claims WHERE artifact_id = ?)

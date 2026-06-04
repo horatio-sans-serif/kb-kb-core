@@ -1664,7 +1664,28 @@ Acceptance: `internal/crsync/ascrr_test.go` (crsqlite-tagged) asserts the real
 extension accepts crsql_as_crr on every synced table (and rejects the local-only
 ones). `TestMigration0013_PreservesData` (default build) seeds data after 0012, then
 applies 0013 and checks the rows + the CRR-shaped schema (no FK, NOT NULL PK, no
-non-PK unique index) survive.
+non-PK unique index) survive across all 16 synced tables.
+
+**Review (Stage 2c) fixes applied:** an independent review surfaced and these were
+realized —
+
+- C1 (critical): migration 0013 failed at COMMIT on any populated DB. The artifacts
+  rebuild DROPs a table that jobs/audit_log still reference; `defer_foreign_keys` was
+  insufficient (the parent DROP's deferred violation is not cleared by the
+  re-create). The migration runner now applies migrations on a dedicated connection
+  with `PRAGMA foreign_keys=OFF` (a no-op inside a tx, so set before BEGIN), restored
+  after — the standard SQLite schema-change practice. The preservation test now seeds
+  a jobs row referencing the artifact (the exact trigger).
+- H2: `renders.privacy_max` defaulted to the most-permissive `'public'` (fail-open);
+  changed to `'restricted'` (fail-closed) — it is the export tier ceiling.
+- H3: documented that the `''` default on first_seen_at/last_seen_at is a
+  never-materialized class-D formality (every write and replicated change sets them).
+- M1: withTx's unreachable `default` branch now errors instead of silently running a
+  find-then-insert non-atomically.
+- M2: corrected the now-stale "to satisfy the FK" comment on DeleteByArtifact.
+- M3: the sweep checks ctx cancellation between every reconcile step, not only after
+  artifacts.
+- L6: the schema-shape assertions loop over all 16 synced tables, not 3.
 
 **Next: Stage 3** — peer transport (changeset-exchange HTTP over Tailscale) + daemon
 wiring behind extension availability (config `KB_CRSQLITE_PATH`): on startup, when

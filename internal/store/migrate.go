@@ -2,6 +2,7 @@ package store
 
 import (
 	"cmp"
+	"context"
 	"database/sql"
 	"fmt"
 	"io/fs"
@@ -86,8 +87,19 @@ func Migrate(db *sql.DB) (int, error) {
 // database at the previous version and safely re-runnable. The runner is the
 // single source of truth for recorded versions (parsed from the filename);
 // migration files contain pure schema and must not touch schema_migrations.
+//
+// Migrations run on a single dedicated connection with foreign-key enforcement
+// disabled. A table rebuild (e.g. 0013) DROPs a parent table that local-only tables
+// (jobs, audit_log) still reference; with enforcement on — even deferred — the
+// parent DROP raises a deferred FK violation that the subsequent re-create does not
+// clear, so COMMIT fails although the final data is fully consistent. PRAGMA
+// foreign_keys is a no-op inside a transaction, so it must be set on the connection
+// before any migration tx begins; this is the standard SQLite practice for schema
+// changes. Enforcement is restored before the connection returns to the pool, so
+// normal operation keeps the jobs/audit_log -> artifacts foreign keys.
 func migrateFS(db *sql.DB, src fs.FS) (int, error) {
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version    INTEGER PRIMARY KEY,
 		applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 	)`); err != nil {
@@ -95,7 +107,7 @@ func migrateFS(db *sql.DB, src fs.FS) (int, error) {
 	}
 
 	var current int
-	if err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
 		return 0, fmt.Errorf("read current schema version: %w", err)
 	}
 
@@ -104,12 +116,22 @@ func migrateFS(db *sql.DB, src fs.FS) (int, error) {
 		return 0, err
 	}
 
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("migrate: acquire connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return 0, fmt.Errorf("migrate: disable foreign keys: %w", err)
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`) }()
+
 	applied := 0
 	for _, m := range all {
 		if m.version <= current {
 			continue
 		}
-		if err := applyMigration(db, src, m); err != nil {
+		if err := applyMigration(ctx, conn, src, m); err != nil {
 			return applied, err
 		}
 		applied++
@@ -118,15 +140,16 @@ func migrateFS(db *sql.DB, src fs.FS) (int, error) {
 }
 
 // applyMigration runs one migration body and records its version in a single
-// transaction. mattn/go-sqlite3 executes the multi-statement body sequentially
-// on the transaction's connection; any failure rolls the whole migration back.
-func applyMigration(db *sql.DB, src fs.FS, m migration) (err error) {
+// transaction on conn. mattn/go-sqlite3 executes the multi-statement body
+// sequentially on the transaction's connection; any failure rolls the whole
+// migration back.
+func applyMigration(ctx context.Context, conn *sql.Conn, src fs.FS, m migration) (err error) {
 	body, err := fs.ReadFile(src, m.name)
 	if err != nil {
 		return fmt.Errorf("read migration %s: %w", m.name, err)
 	}
 
-	tx, err := db.Begin()
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin %s: %w", m.name, err)
 	}
@@ -136,10 +159,10 @@ func applyMigration(db *sql.DB, src fs.FS, m migration) (err error) {
 		}
 	}()
 
-	if _, err = tx.Exec(string(body)); err != nil {
+	if _, err = tx.ExecContext(ctx, string(body)); err != nil {
 		return fmt.Errorf("apply %s: %w", m.name, err)
 	}
-	if _, err = tx.Exec(`INSERT INTO schema_migrations(version) VALUES (?)`, m.version); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES (?)`, m.version); err != nil {
 		return fmt.Errorf("record %s: %w", m.name, err)
 	}
 	if err = tx.Commit(); err != nil {

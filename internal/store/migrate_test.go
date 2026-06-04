@@ -196,10 +196,18 @@ func TestMigration0013_PreservesData(t *testing.T) {
 		`INSERT INTO encounters(id, artifact_id, source_id, seen_at, created_at) VALUES ('e1','a1','s1',?,?)`, ts, ts); err != nil {
 		t.Fatalf("seed encounter: %v", err)
 	}
+	// A jobs row referencing the artifact is the precondition that makes the
+	// artifacts rebuild fail at COMMIT if migrations run with foreign keys enforced
+	// (jobs keeps its FK to artifacts and is not rebuilt). This row guards the runner
+	// disabling FK enforcement during migration.
+	if _, err := db.Exec(
+		`INSERT INTO jobs(id, type, artifact_id, status, created_at) VALUES ('j1','fetch','a1','pending',?)`, ts); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
 
 	// Apply the rest (0013).
 	if _, err := Migrate(db); err != nil {
-		t.Fatalf("apply 0013: %v", err)
+		t.Fatalf("apply 0013 (must succeed with a jobs row referencing an artifact): %v", err)
 	}
 
 	// Data survived the rebuild, including the 0005 sources columns.
@@ -218,16 +226,25 @@ func TestMigration0013_PreservesData(t *testing.T) {
 		t.Errorf("encounter after rebuild = %d (err %v), want 1", n, err)
 	}
 
-	// The rebuilt schema is CRR-shaped: no foreign keys, NOT NULL primary key, and
-	// entities carries no UNIQUE index.
-	if fkCount(t, db, "encounters") != 0 {
-		t.Error("encounters still has a foreign key after 0013")
+	// Every synced table is CRR-shaped: no foreign keys, a NOT NULL primary key, and
+	// no non-PK unique index. This guards the whole set without the extension, so a
+	// future migration re-introducing any of these on any synced table is caught.
+	syncedTables := []string{
+		"sources", "artifacts", "encounters", "enrichments", "entities",
+		"artifact_entities", "links", "topics", "artifact_topics",
+		"profile_interests", "profile_history", "engagements", "review_schedule",
+		"claims", "conflicts", "renders",
 	}
-	if !pkNotNull(t, db, "artifacts") {
-		t.Error("artifacts primary key is still nullable after 0013")
-	}
-	if hasUniqueIndex(t, db, "entities") {
-		t.Error("entities still has a UNIQUE index after 0013")
+	for _, tbl := range syncedTables {
+		if n := fkCount(t, db, tbl); n != 0 {
+			t.Errorf("%s has %d foreign key(s) after 0013, want 0 (cr-sqlite forbids checked FKs)", tbl, n)
+		}
+		if !pkNotNull(t, db, tbl) {
+			t.Errorf("%s has a nullable primary key after 0013", tbl)
+		}
+		if hasUniqueIndex(t, db, tbl) {
+			t.Errorf("%s has a non-PK UNIQUE index after 0013", tbl)
+		}
 	}
 }
 

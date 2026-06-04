@@ -173,6 +173,10 @@ func withTx(ctx context.Context, q Querier, fn func(Querier) error) error {
 		}
 		return nil
 	default:
-		return fn(q) // an unrecognized querier (e.g. a test fake): run as-is
+		// Every querier in this package is the *sql.DB write pool or a *sql.Tx, so
+		// this is unreachable. Fail loudly rather than run a find-then-insert
+		// non-atomically (which would silently admit duplicates) if a new Querier
+		// implementation is ever introduced.
+		return fmt.Errorf("withTx: non-transactional querier %T", q)
 	}
 }

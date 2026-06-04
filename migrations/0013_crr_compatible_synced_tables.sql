@@ -17,15 +17,16 @@
 -- SQLite cannot ALTER a column to add NOT NULL, a DEFAULT, drop a UNIQUE, or drop a
 -- FK, so each synced table is rebuilt (create -> copy -> drop -> rename). Local-only
 -- tables (jobs, audit_log, schema_migrations, the FTS shadow tables) are NOT rebuilt
--- and keep their foreign keys. Referential integrity is preserved by the application
--- (parent-before-child writes within a transaction) and the reconcile sweep.
+-- and keep their foreign keys to artifacts. Referential integrity is preserved by the
+-- application (parent-before-child writes within a transaction) and the reconcile
+-- sweep.
 --
--- PRAGMA foreign_keys is a no-op inside a transaction (and the migration runner runs
--- this whole file in one). defer_foreign_keys CAN be set inside a transaction and
--- delays all FK enforcement to COMMIT, by which point every table has been rebuilt
--- and the data is consistent. Tables are rebuilt children-before-parents as a second
--- line of defense.
-PRAGMA defer_foreign_keys = ON;
+-- The migration runner applies this file with foreign-key enforcement disabled on the
+-- connection (PRAGMA foreign_keys is a no-op inside a transaction, so it cannot be set
+-- here). That is required: DROP TABLE artifacts, while jobs/audit_log still reference
+-- it, would otherwise fail at COMMIT — defer_foreign_keys is NOT sufficient, because
+-- the parent DROP raises a deferred violation the later re-create does not clear.
+-- Tables are still rebuilt children-before-parents for clarity.
 
 -- conflicts (was REFERENCES claims)
 CREATE TABLE conflicts__crr (
@@ -173,7 +174,9 @@ CREATE TABLE renders__crr (
   source_query TEXT,
   artifact_ids TEXT,
   output_path  TEXT,
-  privacy_max  TEXT NOT NULL DEFAULT 'public'
+  -- Class-D needs a default; pick the MOST restrictive tier (fail-closed) so a write
+  -- that omits the export ceiling never silently widens it. Every real writer sets it.
+  privacy_max  TEXT NOT NULL DEFAULT 'restricted'
                  CHECK (privacy_max IN ('public','personal','sensitive','restricted')),
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -258,6 +261,10 @@ CREATE TABLE artifacts__crr (
   status          TEXT NOT NULL DEFAULT 'ingested'
                     CHECK (status IN ('ingested','enriching','ready','failed')),
   relevance_score REAL,
+  -- The '' default is a class-D formality: every insert (store.insert) and every
+  -- replicated change carries a real TimeFormat timestamp, so a row never actually
+  -- takes ''. (An '' would sort before all real timestamps, so do not start relying
+  -- on the default — keep both columns always set at the write path.)
   first_seen_at   TEXT NOT NULL DEFAULT '',
   last_seen_at    TEXT NOT NULL DEFAULT '',
   last_engaged_at TEXT,

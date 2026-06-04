@@ -56,20 +56,25 @@ func (s *Sweeper) Sweep(ctx context.Context) (int, error) {
 		}
 	}
 
-	n, err := s.sweepArtifacts(ctx)
-	collect("reconcile artifacts", n, err)
-	if ctx.Err() != nil {
-		return total, errors.Join(errs...)
+	// Each step is independent; on context cancellation stop before the next so a
+	// shutdown does not keep starting work.
+	steps := []struct {
+		name string
+		run  func(context.Context) (int, error)
+	}{
+		{"reconcile artifacts", s.sweepArtifacts},
+		{"reconcile entities", s.st.Graph.ReconcileDuplicates},
+		{"reconcile claims", s.st.Claims.ReconcileDuplicates},
+		{"dedup conflicts", s.st.Conflicts.DedupDuplicates},
+		{"dedup links", s.st.Graph.DedupLinks},
 	}
-
-	en, eerr := s.st.Graph.ReconcileDuplicates(ctx)
-	collect("reconcile entities", en, eerr)
-	cn, cerr := s.st.Claims.ReconcileDuplicates(ctx)
-	collect("reconcile claims", cn, cerr)
-	xn, xerr := s.st.Conflicts.DedupDuplicates(ctx)
-	collect("dedup conflicts", xn, xerr)
-	ln, lerr := s.st.Graph.DedupLinks(ctx)
-	collect("dedup links", ln, lerr)
+	for _, step := range steps {
+		if ctx.Err() != nil {
+			break
+		}
+		n, err := step.run(ctx)
+		collect(step.name, n, err)
+	}
 
 	return total, errors.Join(errs...)
 }
