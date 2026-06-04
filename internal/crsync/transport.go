@@ -28,9 +28,19 @@ type ChangeStore interface {
 type DBChangeStore struct{ DB *sql.DB }
 
 func (d DBChangeStore) Changes(ctx context.Context, since int64) ([]Change, int64, error) {
-	return Changes(ctx, d.DB, since)
+	return Changes(ctx, d.DB, since, DefaultPageRows)
 }
+
+// Apply validates that every change targets a synced (CRR) table before merging it.
+// A peer's changeset is untrusted: a buggy, forked, or compromised peer could name
+// jobs/audit_log or an arbitrary table. The whole batch is rejected — not partially
+// applied — if any change is out of bounds.
 func (d DBChangeStore) Apply(ctx context.Context, changes []Change) error {
+	for _, c := range changes {
+		if !IsSynced(c.Table) {
+			return fmt.Errorf("crsync: refusing change to non-synced table %q", c.Table)
+		}
+	}
 	return Apply(ctx, d.DB, changes)
 }
 
@@ -62,9 +72,15 @@ type applyRequest struct {
 func Handler(cs ChangeStore, token string, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /changes", requireToken(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		since, err := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
-		if err != nil || since < 0 {
-			since = 0
+		raw := r.URL.Query().Get("since")
+		since := int64(0)
+		if raw != "" {
+			v, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || v < 0 {
+				http.Error(w, "invalid since", http.StatusBadRequest)
+				return
+			}
+			since = v
 		}
 		changes, version, err := cs.Changes(r.Context(), since)
 		if err != nil {
@@ -107,10 +123,19 @@ func requireToken(token string, next http.Handler) http.Handler {
 	})
 }
 
+// writeJSON encodes to a buffer first so a marshal error (e.g. an unexpected
+// changeset value type) becomes a clean 500 rather than a 200 with a truncated body
+// the puller cannot decode.
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, "encode", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(b)
 }
 
 // Puller pulls changesets from configured peers and applies them locally, advancing
@@ -126,14 +151,23 @@ type Puller struct {
 	logger *slog.Logger
 }
 
-// NewPuller builds a Puller. client may be nil (a default client with a timeout is
+// NewPuller builds a Puller. client may be nil (a default client with a timeout, and
+// redirects disabled so a peer cannot bounce the token-bearing request elsewhere, is
 // used).
 func NewPuller(cs ChangeStore, wm Watermarks, peers []string, token string, client *http.Client, logger *slog.Logger) *Puller {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{
+			Timeout:       30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
 	}
 	return &Puller{cs: cs, wm: wm, peers: peers, token: token, client: client, logger: logger}
 }
+
+// maxPagesPerSync bounds one syncPeer call so a pathological non-advancing peer
+// cannot loop forever; at DefaultPageRows rows per page this is a very large
+// changeset before the sync simply resumes on the next tick.
+const maxPagesPerSync = 100_000
 
 // Run pulls from every peer on a ticker until ctx is cancelled (one pull at start).
 func (p *Puller) Run(ctx context.Context, interval time.Duration) {
@@ -162,50 +196,68 @@ func (p *Puller) SyncAll(ctx context.Context) {
 	}
 }
 
-// syncPeer pulls the peer's changes since our watermark, applies them, and advances
-// the watermark. Apply is committed before the watermark moves, so a crash between
-// them only re-pulls (idempotent), never loses changes.
+// syncPeer pulls the peer's changes in pages, applying each and advancing the
+// watermark, until a page comes back empty (caught up). Apply is committed before the
+// watermark moves, so a crash between them only re-pulls (idempotent), never loses
+// changes.
 func (p *Puller) syncPeer(ctx context.Context, peer string) error {
 	since, err := p.wm.Watermark(ctx, peer)
 	if err != nil {
 		return fmt.Errorf("read watermark: %w", err)
 	}
+	for page := 0; page < maxPagesPerSync; page++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		got, err := p.pullPage(ctx, peer, since)
+		if err != nil {
+			return err
+		}
+		if len(got.Changes) == 0 {
+			return nil // caught up
+		}
+		if err := p.cs.Apply(ctx, got.Changes); err != nil {
+			return fmt.Errorf("apply: %w", err)
+		}
+		if got.Version <= since {
+			// Non-empty page that does not advance the clock would loop forever.
+			return fmt.Errorf("peer %q returned %d changes but version %d did not advance past %d",
+				peer, len(got.Changes), got.Version, since)
+		}
+		if err := p.wm.SetWatermark(ctx, peer, got.Version); err != nil {
+			return fmt.Errorf("advance watermark: %w", err)
+		}
+		since = got.Version
+	}
+	return fmt.Errorf("peer %q: page limit reached, resuming next tick", peer)
+}
 
+// pullPage fetches one page of changes from the peer starting after since.
+func (p *Puller) pullPage(ctx context.Context, peer string, since int64) (changesResponse, error) {
 	u, err := url.Parse(peer)
 	if err != nil {
-		return fmt.Errorf("invalid peer url: %w", err)
+		return changesResponse{}, fmt.Errorf("invalid peer url: %w", err)
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/sync/changes"
 	u.RawQuery = "since=" + strconv.FormatInt(since, 10)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return err
+		return changesResponse{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+p.token)
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return err
+		return changesResponse{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
-		return fmt.Errorf("peer returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return changesResponse{}, fmt.Errorf("peer returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	var got changesResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxApplyBytes)).Decode(&got); err != nil {
-		return fmt.Errorf("decode changes: %w", err)
+		return changesResponse{}, fmt.Errorf("decode changes: %w", err)
 	}
-
-	if len(got.Changes) > 0 {
-		if err := p.cs.Apply(ctx, got.Changes); err != nil {
-			return fmt.Errorf("apply: %w", err)
-		}
-	}
-	if got.Version > since {
-		if err := p.wm.SetWatermark(ctx, peer, got.Version); err != nil {
-			return fmt.Errorf("advance watermark: %w", err)
-		}
-	}
-	return nil
+	return got, nil
 }

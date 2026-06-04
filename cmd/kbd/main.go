@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -137,6 +138,42 @@ func openWriteDB(cfg *config.Config, logger *slog.Logger) (*sql.DB, bool, error)
 		return nil, false, oerr
 	}
 	return db, true, nil
+}
+
+// warnInsecurePeers logs a warning for any sync peer reached over plaintext http://
+// whose host is not loopback or a Tailscale address (100.64.0.0/10, fd7a:115c:a1e0::/48).
+// The bearer token crosses such a link in the clear; the intended deployment is
+// https or http-over-Tailscale (WireGuard-encrypted). A hostname (not an IP) cannot
+// be verified, so it is warned too.
+func warnInsecurePeers(peers []string, logger *slog.Logger) {
+	for _, peer := range peers {
+		u, err := url.Parse(peer)
+		if err != nil {
+			logger.Warn("sync peer URL is unparseable", "peer", peer, "err", err)
+			continue
+		}
+		if u.Scheme == "https" {
+			continue
+		}
+		ip := net.ParseIP(u.Hostname())
+		if ip != nil && (ip.IsLoopback() || isTailscale(ip)) {
+			continue
+		}
+		logger.Warn("sync peer uses plaintext http and is not loopback/Tailscale; the API token crosses the network in the clear — use https or http-over-Tailscale",
+			"peer", peer)
+	}
+}
+
+// isTailscale reports whether ip is in Tailscale's CGNAT range (100.64.0.0/10) or
+// its ULA range (fd7a:115c:a1e0::/48).
+func isTailscale(ip net.IP) bool {
+	for _, cidr := range []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"} {
+		_, n, _ := net.ParseCIDR(cidr)
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // serve assembles the daemon over an already-bound listener (injected so it is
@@ -448,6 +485,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		mux.Handle("/", handler)
 		handler = mux
 		if len(cfg.SyncPeers) > 0 {
+			warnInsecurePeers(cfg.SyncPeers, logger)
 			puller := crsync.NewPuller(cs, st.Sync, cfg.SyncPeers, cfg.APIToken, nil, logger)
 			go puller.Run(ctx, syncPullInterval)
 		}

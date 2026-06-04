@@ -146,39 +146,108 @@ func mustJSON(v any) json.RawMessage {
 	return b
 }
 
-// Changes returns every change with db_version greater than since (a peer's
-// watermark), plus the largest db_version observed — what to send a peer to bring it
-// up to date. Includes forwarded changes (from other sites) so changes propagate
-// transitively through a gossip topology.
-func Changes(ctx context.Context, db *sql.DB, since int64) ([]Change, int64, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT "table", pk, cid, val, col_version, db_version, site_id, cl, seq
-		 FROM crsql_changes WHERE db_version > ? ORDER BY db_version, seq`, since)
-	if err != nil {
-		return nil, since, fmt.Errorf("crsync: read changes: %w", err)
-	}
-	defer rows.Close()
+// DefaultPageRows bounds one Changes page to this many rows (column-changes), so a
+// fresh peer pulling from since=0 does not materialize the entire history at once.
+// The puller loops pages until caught up. cr-sqlite's crsql_changes virtual table
+// only supports a simple `db_version > ? ORDER BY db_version, seq LIMIT ?` scan (a
+// computed-boundary subquery errors), so paging is row-based with the commit
+// boundary handled in Go.
+const DefaultPageRows = 10000
 
-	out := []Change{}
-	max := since
-	for rows.Next() {
-		var c Change
-		var val any // preserve the value's SQLite storage class (see Value)
-		if err := rows.Scan(&c.Table, &c.PK, &c.CID, &val, &c.ColVersion, &c.DBVersion, &c.SiteID, &c.CL, &c.Seq); err != nil {
-			return nil, since, fmt.Errorf("crsync: scan change: %w", err)
+const changeCols = `"table", pk, cid, val, col_version, db_version, site_id, cl, seq`
+
+// Changes returns one page of changes with db_version greater than since (a peer's
+// watermark) plus the largest db_version returned. A page never splits a commit's
+// column-changes (all rows of one db_version go together) so the watermark is always
+// safe to advance: every change at or below the returned version was included, and
+// the next pull (db_version > version) skips nothing. maxRows <= 0 uses
+// DefaultPageRows. Includes forwarded changes (from other sites) so changes propagate
+// transitively through a gossip topology.
+func Changes(ctx context.Context, db *sql.DB, since int64, maxRows int) ([]Change, int64, error) {
+	if maxRows <= 0 {
+		maxRows = DefaultPageRows
+	}
+	// Fetch one extra row to detect truncation mid-commit.
+	all, err := scanChanges(ctx, db,
+		`SELECT `+changeCols+` FROM crsql_changes WHERE db_version > ? ORDER BY db_version, seq LIMIT ?`,
+		since, maxRows+1)
+	if err != nil {
+		return nil, since, err
+	}
+	if len(all) <= maxRows {
+		return all, maxVersion(all, since), nil // complete: this is the last page
+	}
+	// Truncated: the highest db_version present may be partial. Keep only the
+	// db_versions strictly below it (those are fully included); the partial one is
+	// re-fetched whole on the next page.
+	lastDV := all[len(all)-1].DBVersion
+	var keep []Change
+	keepMax := since
+	for _, c := range all {
+		if c.DBVersion < lastDV {
+			keep = append(keep, c)
+			if c.DBVersion > keepMax {
+				keepMax = c.DBVersion
+			}
 		}
-		c.Val = Value{X: val}
-		if c.DBVersion > max {
-			max = c.DBVersion
+	}
+	if len(keep) > 0 {
+		return keep, keepMax, nil
+	}
+	// A single commit larger than the page: fetch the whole commit so it is never
+	// split (bounded by the commit's own size).
+	commit, err := scanChanges(ctx, db,
+		`SELECT `+changeCols+` FROM crsql_changes WHERE db_version > ? ORDER BY db_version, seq`, lastDV-1)
+	if err != nil {
+		return nil, since, err
+	}
+	var out []Change
+	for _, c := range commit {
+		if c.DBVersion != lastDV {
+			break // only this commit's rows (ordered, so they come first)
 		}
 		out = append(out, c)
 	}
-	return out, max, rows.Err()
+	return out, lastDV, nil
 }
 
-// Apply merges a peer's changeset into the local database in one transaction. The
-// CRDT merge (cr-sqlite's INSERT INTO crsql_changes) keeps the causally-newer value
-// per column, so applying is idempotent and order-independent across peers.
+// scanChanges runs a changeset query and decodes the rows, preserving each value's
+// SQLite storage class (see Value).
+func scanChanges(ctx context.Context, db *sql.DB, query string, args ...any) ([]Change, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("crsync: read changes: %w", err)
+	}
+	defer rows.Close()
+	out := []Change{}
+	for rows.Next() {
+		var c Change
+		var val any
+		if err := rows.Scan(&c.Table, &c.PK, &c.CID, &val, &c.ColVersion, &c.DBVersion, &c.SiteID, &c.CL, &c.Seq); err != nil {
+			return nil, fmt.Errorf("crsync: scan change: %w", err)
+		}
+		c.Val = Value{X: val}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func maxVersion(changes []Change, since int64) int64 {
+	m := since
+	for _, c := range changes {
+		if c.DBVersion > m {
+			m = c.DBVersion
+		}
+	}
+	return m
+}
+
+// Apply merges a changeset into the local database in one transaction. The CRDT
+// merge (cr-sqlite's INSERT INTO crsql_changes) keeps the causally-newer value per
+// column, so applying is idempotent and order-independent across peers. This is the
+// low-level primitive and does not police table names; the production path
+// (DBChangeStore.Apply) validates that every change targets a synced table before
+// reaching here, because a peer's changeset is untrusted input.
 func Apply(ctx context.Context, db *sql.DB, changes []Change) error {
 	if len(changes) == 0 {
 		return nil

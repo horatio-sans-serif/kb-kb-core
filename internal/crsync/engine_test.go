@@ -57,11 +57,11 @@ func TestEngine_DistinctRowsConverge(t *testing.T) {
 	}
 
 	// Exchange changesets both directions (ULID-keyed rows never collide on PK).
-	ca, _, err := Changes(ctx, a, 0)
+	ca, _, err := Changes(ctx, a, 0, 0)
 	if err != nil {
 		t.Fatalf("changes A: %v", err)
 	}
-	cb, _, err := Changes(ctx, b, 0)
+	cb, _, err := Changes(ctx, b, 0, 0)
 	if err != nil {
 		t.Fatalf("changes B: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestEngine_WatermarkIncremental(t *testing.T) {
 	b := openReplica(t, ext, "b.db")
 
 	_, _ = a.ExecContext(ctx, `INSERT INTO note (id, body) VALUES ('A1', 'one')`)
-	ca, vA, err := Changes(ctx, a, 0)
+	ca, vA, err := Changes(ctx, a, 0, 0)
 	if err != nil || len(ca) == 0 {
 		t.Fatalf("first changes: %v (%d rows)", err, len(ca))
 	}
@@ -106,7 +106,7 @@ func TestEngine_WatermarkIncremental(t *testing.T) {
 	// A new local change advances A's version; pulling since the watermark yields
 	// only the new change.
 	_, _ = a.ExecContext(ctx, `INSERT INTO note (id, body) VALUES ('A2', 'two')`)
-	ca2, _, err := Changes(ctx, a, vA)
+	ca2, _, err := Changes(ctx, a, vA, 0)
 	if err != nil {
 		t.Fatalf("incremental changes: %v", err)
 	}

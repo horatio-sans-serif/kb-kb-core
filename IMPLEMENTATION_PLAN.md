@@ -1712,4 +1712,28 @@ fails CHECK constraints. Proven end to end against the real extension
 (`TestSync_EndToEnd_TwoReplicas`): an artifact written on replica A converges onto
 replica B over the HTTP transport.
 
+**Review (Stage 3) fixes applied:** an independent review surfaced and these were
+realized —
+
+- C1 (critical): `Apply` ingested changes into any attacker-named table with no
+  allowlist. `DBChangeStore.Apply` (the production trust boundary) now rejects the
+  whole batch if any change targets a non-synced table; the low-level `Apply`
+  primitive stays unpoliced so the engine tests can use a synthetic table.
+- H1 (high, a real sync-stall): the GET changeset was unbounded — once the
+  cumulative changeset exceeded the 64 MiB decode cap a peer pulling from since=0
+  would reject mid-decode forever. `Changes` now pages (row-based, never splitting a
+  commit's column-changes — cr-sqlite's crsql_changes only supports a simple
+  `db_version > ? ORDER BY db_version, seq LIMIT ?` scan); the puller loops pages
+  until caught up. This also bounds each Apply transaction (fixes the giant-write-lock
+  concern).
+- H2: the `Value` storage-class round-trip is now tested end to end (REAL set, REAL
+  NULL, text) against the real extension; `crsync.writeJSON` buffers-then-writes so a
+  marshal error is a clean 500, not a corrupt 200.
+- M2: the daemon warns when a sync peer is plaintext http:// and not loopback/Tailscale
+  (the token would cross the network in the clear).
+- M3: a malformed `since` is a 400, not a silent full re-pull.
+- L2: the puller's HTTP client no longer follows redirects.
+- Tests added: non-synced-table rejection, invalid-since 400, multi-page pagination,
+  value-type preservation, watermark persistence across reopen.
+
 This completes Phase 17 — multi-device peer sync.

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -15,24 +16,29 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 // fakeChangeStore is an in-memory ChangeStore so the transport is exercised without
 // the native extension. Changes returns rows with db_version > since.
 type fakeChangeStore struct {
-	mu        sync.Mutex
-	changes   []Change
-	version   int64
-	applied   []Change
-	sinceSeen int64
+	mu         sync.Mutex
+	changes    []Change
+	applied    []Change
+	sinceSeen  int64
+	sinceCalls []int64
 }
 
 func (f *fakeChangeStore) Changes(_ context.Context, since int64) ([]Change, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sinceSeen = since
+	f.sinceCalls = append(f.sinceCalls, since)
 	var out []Change
+	maxV := since
 	for _, c := range f.changes {
 		if c.DBVersion > since {
 			out = append(out, c)
+			if c.DBVersion > maxV {
+				maxV = c.DBVersion
+			}
 		}
 	}
-	return out, f.version, nil
+	return out, maxV, nil
 }
 
 func (f *fakeChangeStore) Apply(_ context.Context, changes []Change) error {
@@ -88,7 +94,6 @@ func TestPuller_PullsAndAdvancesWatermark(t *testing.T) {
 			{Table: "artifacts", PK: []byte("a"), CID: "title", Val: Value{X: "x"}, DBVersion: 7, SiteID: []byte("s")},
 			{Table: "artifacts", PK: []byte("b"), CID: "title", Val: Value{X: "y"}, DBVersion: 9, SiteID: []byte("s")},
 		},
-		version: 9,
 	}
 	srv := httptest.NewServer(http.StripPrefix("/sync", Handler(peerStore, testToken, discardLogger())))
 	defer srv.Close()
@@ -99,9 +104,10 @@ func TestPuller_PullsAndAdvancesWatermark(t *testing.T) {
 
 	p.SyncAll(ctx)
 
-	// The peer saw a pull from watermark 0.
-	if peerStore.sinceSeen != 0 {
-		t.Errorf("peer saw since=%d, want 0 on first pull", peerStore.sinceSeen)
+	// The first page pulled from watermark 0; the loop then pulled again from the
+	// advanced watermark (9) and got an empty page, so it stopped.
+	if len(peerStore.sinceCalls) < 2 || peerStore.sinceCalls[0] != 0 {
+		t.Errorf("peer since calls = %v, want first pull from 0 then a follow-up", peerStore.sinceCalls)
 	}
 	// Local applied both changes and advanced the watermark to the peer's version.
 	if len(localStore.applied) != 2 {
@@ -111,13 +117,45 @@ func TestPuller_PullsAndAdvancesWatermark(t *testing.T) {
 		t.Errorf("watermark = %d, want 9", v)
 	}
 
-	// A second pull starts from the advanced watermark and applies nothing new.
+	// A second sync starts from the advanced watermark and applies nothing new.
 	p.SyncAll(ctx)
 	if peerStore.sinceSeen != 9 {
-		t.Errorf("peer saw since=%d on second pull, want 9", peerStore.sinceSeen)
+		t.Errorf("peer saw since=%d on the latest pull, want 9", peerStore.sinceSeen)
 	}
 	if len(localStore.applied) != 2 {
-		t.Errorf("second pull applied more changes (%d), want still 2", len(localStore.applied))
+		t.Errorf("second sync applied more changes (%d), want still 2", len(localStore.applied))
+	}
+}
+
+func TestDBChangeStore_RejectsNonSyncedTable(t *testing.T) {
+	// Apply through the production ChangeStore must reject a change to a table that
+	// is not a synced CRR (an untrusted peer naming jobs/audit_log/anything). The
+	// validation happens before any DB work, so a nil DB is never touched.
+	cs := DBChangeStore{DB: nil}
+	err := cs.Apply(context.Background(), []Change{
+		{Table: "artifacts", CID: "title", Val: Value{X: "ok"}},
+		{Table: "jobs", CID: "status", Val: Value{X: "pending"}},
+	})
+	if err == nil {
+		t.Fatal("Apply should reject a change to a non-synced table")
+	}
+	if got := err.Error(); !strings.Contains(got, "jobs") {
+		t.Errorf("error = %q, want it to name the rejected table 'jobs'", got)
+	}
+}
+
+func TestHandler_RejectsInvalidSince(t *testing.T) {
+	srv := httptest.NewServer(http.StripPrefix("/sync", Handler(&fakeChangeStore{}, testToken, discardLogger())))
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/sync/changes?since=notanumber", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("invalid since status = %d, want 400", resp.StatusCode)
 	}
 }
 
@@ -125,7 +163,6 @@ func TestPuller_WrongTokenDoesNotAdvance(t *testing.T) {
 	ctx := context.Background()
 	peerStore := &fakeChangeStore{
 		changes: []Change{{Table: "artifacts", PK: []byte("a"), CID: "title", DBVersion: 3, SiteID: []byte("s")}},
-		version: 3,
 	}
 	srv := httptest.NewServer(http.StripPrefix("/sync", Handler(peerStore, testToken, discardLogger())))
 	defer srv.Close()
