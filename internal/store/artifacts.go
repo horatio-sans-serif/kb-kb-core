@@ -54,22 +54,9 @@ func (r *ArtifactRepo) UpsertByContentHash(ctx context.Context, a *Artifact) (*A
 // not only when wrapped in Store.Tx. _txlock=immediate means BEGIN takes the write
 // lock, so concurrent writers serialize rather than race.
 func (r *ArtifactRepo) inTx(ctx context.Context, fn func(*ArtifactRepo) error) error {
-	db, ok := r.q.(*sql.DB)
-	if !ok {
-		return fn(r) // already inside a transaction
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("artifact tx begin: %w", err)
-	}
-	if err := fn(&ArtifactRepo{q: tx, rq: tx}); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("artifact tx commit: %w", err)
-	}
-	return nil
+	return withTx(ctx, r.q, func(q Querier) error {
+		return fn(&ArtifactRepo{q: q, rq: q})
+	})
 }
 
 // upsert runs the find-then-insert atomically (see inTx), then delegates to

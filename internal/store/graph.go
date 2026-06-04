@@ -234,13 +234,45 @@ func (r *GraphRepo) AddLink(ctx context.Context, src, dst, relation string, weig
 	if !kb.ValidRelation(relation) {
 		return fmt.Errorf("%w: %q", ErrInvalidRelation, relation)
 	}
-	if _, err := r.q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO links(id, src_id, dst_id, relation, weight, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		NewID(), src, dst, relation, weight, now()); err != nil {
-		return fmt.Errorf("add link %q->%q (%s): %w", src, dst, relation, err)
-	}
-	return nil
+	// Dedup is application-level (find-then-insert), not a unique index: cr-sqlite
+	// (§8.16) forbids non-primary-key unique indexes on replicated tables. Atomic
+	// via withTx so concurrent callers never double-insert (a cross-replica
+	// duplicate is reconciled by DedupLinks, not prevented here).
+	return withTx(ctx, r.q, func(q Querier) error {
+		var exists bool
+		if err := q.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM links WHERE src_id = ? AND dst_id = ? AND relation = ?)`,
+			src, dst, relation).Scan(&exists); err != nil {
+			return fmt.Errorf("find link %q->%q (%s): %w", src, dst, relation, err)
+		}
+		if exists {
+			return nil
+		}
+		if _, err := q.ExecContext(ctx,
+			`INSERT INTO links(id, src_id, dst_id, relation, weight, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			NewID(), src, dst, relation, weight, now()); err != nil {
+			return fmt.Errorf("add link %q->%q (%s): %w", src, dst, relation, err)
+		}
+		return nil
+	})
+}
+
+// DedupLinks collapses cross-replica duplicate links — rows sharing
+// (src_id, dst_id, relation) — keeping the lowest id (deterministic across
+// replicas). Links carry no references, so the extras are simply dropped. Returns
+// how many it removed.
+func (r *GraphRepo) DedupLinks(ctx context.Context) (int, error) {
+	var n int64
+	err := withTx(ctx, r.q, func(q Querier) error {
+		res, err := q.ExecContext(ctx,
+			`DELETE FROM links WHERE id NOT IN (SELECT MIN(id) FROM links GROUP BY src_id, dst_id, relation)`)
+		if err != nil {
+			return fmt.Errorf("dedup links: %w", err)
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return int(n), err
 }
 
 // neighborChunk bounds how many frontier ids go into one query. Each query uses

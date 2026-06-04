@@ -33,11 +33,13 @@ func New(st *store.Store, rescore RescoreFunc) *Sweeper {
 	return &Sweeper{st: st, rescore: rescore}
 }
 
-// Sweep merges every duplicate group into its lowest-id survivor and returns how
-// many losers it merged. The survivor is deterministic (the group's lowest id), so
-// independent replicas converge on the same survivor. Each merge and the survivor's
-// re-score run in one transaction. A per-group failure is collected and the rest
-// proceed.
+// Sweep reconciles every kind of cross-replica duplicate and returns the total
+// number of rows it merged or removed. The survivor of each group is deterministic
+// (its lowest id), so independent replicas converge on the same result. It runs in
+// dependency order: artifacts first (a merge re-points/drops the loser's children),
+// then claims (a merge re-points conflicts), then conflicts and links (the residual
+// pairs the earlier merges can create). A per-step failure is collected and the
+// rest proceed.
 //
 // Idempotency: a re-run on a single replica is exact (an already-merged loser is a
 // no-op). Concurrent merges on two replicas that then sync converge on the same
@@ -45,6 +47,34 @@ func New(st *store.Store, rescore RescoreFunc) *Sweeper {
 // child (see Merge) — best-effort under §8.16, reconciled exactly by the next
 // single-replica sweep.
 func (s *Sweeper) Sweep(ctx context.Context) (int, error) {
+	total := 0
+	var errs []error
+	collect := func(step string, n int, err error) {
+		total += n
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", step, err))
+		}
+	}
+
+	n, err := s.sweepArtifacts(ctx)
+	collect("reconcile artifacts", n, err)
+	if ctx.Err() != nil {
+		return total, errors.Join(errs...)
+	}
+
+	cn, cerr := s.st.Claims.ReconcileDuplicates(ctx)
+	collect("reconcile claims", cn, cerr)
+	xn, xerr := s.st.Conflicts.DedupDuplicates(ctx)
+	collect("dedup conflicts", xn, xerr)
+	ln, lerr := s.st.Graph.DedupLinks(ctx)
+	collect("dedup links", ln, lerr)
+
+	return total, errors.Join(errs...)
+}
+
+// sweepArtifacts merges duplicate artifact groups into their lowest-id survivor,
+// re-scoring each survivor (its relevance inputs changed) in the merge transaction.
+func (s *Sweeper) sweepArtifacts(ctx context.Context) (int, error) {
 	groups, err := s.st.Artifacts.DuplicateGroups(ctx)
 	if err != nil {
 		return 0, err

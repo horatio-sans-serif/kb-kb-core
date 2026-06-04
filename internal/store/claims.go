@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -15,10 +16,12 @@ const claimCols = `id, artifact_id, statement, embedding, created_at`
 
 // Create inserts a claim, assigning a ULID and CreatedAt. The embedding is stored
 // as a JSON float array, or NULL when absent. Idempotent on (artifact_id,
-// statement) via migration 0009's unique index (INSERT OR IGNORE): re-extracting
-// the same statement is a no-op, keeping the original row's id stable. To replace
-// an artifact's claim set wholesale (a future re-enrich), use DeleteByArtifact
-// first — removed statements are not reclaimed by a re-extract alone.
+// statement): re-extracting the same statement is a no-op, keeping the original
+// row's id stable. Dedup is application-level (find-then-insert, atomic via
+// withTx), not migration 0009's unique index, which cr-sqlite (§8.16) forbids on a
+// replicated table — a cross-replica duplicate is reconciled by ReconcileDuplicates.
+// To replace an artifact's claim set wholesale (a future re-enrich), use
+// DeleteByArtifact first — removed statements are not reclaimed by a re-extract.
 func (r *ClaimRepo) Create(ctx context.Context, c *Claim) error {
 	if c.ID == "" {
 		c.ID = NewID()
@@ -34,10 +37,112 @@ func (r *ClaimRepo) Create(ctx context.Context, c *Claim) error {
 		}
 		emb = string(b)
 	}
-	if _, err := r.q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO claims(`+claimCols+`) VALUES (?, ?, ?, ?, ?)`,
-		c.ID, c.ArtifactID, c.Statement, emb, c.CreatedAt); err != nil {
-		return fmt.Errorf("create claim for %q: %w", c.ArtifactID, err)
+	return withTx(ctx, r.q, func(q Querier) error {
+		var exists bool
+		if err := q.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM claims WHERE artifact_id = ? AND statement = ?)`,
+			c.ArtifactID, c.Statement).Scan(&exists); err != nil {
+			return fmt.Errorf("find claim for %q: %w", c.ArtifactID, err)
+		}
+		if exists {
+			return nil
+		}
+		if _, err := q.ExecContext(ctx,
+			`INSERT INTO claims(`+claimCols+`) VALUES (?, ?, ?, ?, ?)`,
+			c.ID, c.ArtifactID, c.Statement, emb, c.CreatedAt); err != nil {
+			return fmt.Errorf("create claim for %q: %w", c.ArtifactID, err)
+		}
+		return nil
+	})
+}
+
+// ReconcileDuplicates merges cross-replica duplicate claims — rows sharing
+// (artifact_id, statement) — into the lowest-id survivor (deterministic across
+// replicas): it re-points the loser's conflicts (claim_a/claim_b) to the survivor,
+// drops the degenerate self-conflicts that re-point can create, and deletes the
+// loser claim. Returns how many losers it merged. Each merge runs in its own
+// transaction; a per-group failure is collected and the rest proceed.
+func (r *ClaimRepo) ReconcileDuplicates(ctx context.Context) (int, error) {
+	groups, err := r.duplicateGroups(ctx)
+	if err != nil {
+		return 0, err
+	}
+	merged := 0
+	var errs []error
+	for _, g := range groups {
+		survivor := g[0] // lowest id (groups come id-ascending)
+		for _, loser := range g[1:] {
+			err := withTx(ctx, r.q, func(q Querier) error {
+				return (&ClaimRepo{q: q, rq: q}).mergeInto(ctx, survivor, loser)
+			})
+			if err != nil {
+				errs = append(errs, fmt.Errorf("merge claim %q into %q: %w", loser, survivor, err))
+				if ctx.Err() != nil {
+					return merged, errors.Join(errs...)
+				}
+				continue
+			}
+			merged++
+		}
+	}
+	return merged, errors.Join(errs...)
+}
+
+// duplicateGroups returns the id groups (2+, id-ascending) of claims sharing an
+// (artifact_id, statement). Boundaries are detected on the key columns directly (no
+// concatenation), so a statement containing any byte cannot merge unrelated groups.
+func (r *ClaimRepo) duplicateGroups(ctx context.Context) ([][]string, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT artifact_id, statement, id FROM claims
+		 WHERE (artifact_id, statement) IN (
+		   SELECT artifact_id, statement FROM claims
+		   GROUP BY artifact_id, statement HAVING COUNT(*) > 1)
+		 ORDER BY artifact_id, statement, id`)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate claim groups: %w", err)
+	}
+	defer rows.Close()
+
+	var out [][]string
+	var curA, curS string
+	var cur []string
+	first := true
+	for rows.Next() {
+		var a, s, id string
+		if err := rows.Scan(&a, &s, &id); err != nil {
+			return nil, fmt.Errorf("scan claim dup row: %w", err)
+		}
+		if first || a != curA || s != curS {
+			if len(cur) > 1 {
+				out = append(out, cur)
+			}
+			curA, curS, cur, first = a, s, nil, false
+		}
+		cur = append(cur, id)
+	}
+	if len(cur) > 1 {
+		out = append(out, cur)
+	}
+	return out, rows.Err()
+}
+
+// mergeInto folds the loser claim into the survivor; r must be transaction-bound.
+func (r *ClaimRepo) mergeInto(ctx context.Context, survivor, loser string) error {
+	for _, col := range []string{"claim_a", "claim_b"} {
+		if _, err := r.q.ExecContext(ctx,
+			`UPDATE OR IGNORE conflicts SET `+col+` = ? WHERE `+col+` = ?`, survivor, loser); err != nil {
+			return fmt.Errorf("re-point conflicts.%s: %w", col, err)
+		}
+		if _, err := r.q.ExecContext(ctx, `DELETE FROM conflicts WHERE `+col+` = ?`, loser); err != nil {
+			return fmt.Errorf("drop leftover conflicts.%s: %w", col, err)
+		}
+	}
+	// A loser-vs-survivor conflict becomes survivor-vs-survivor after the re-point.
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM conflicts WHERE claim_a = claim_b`); err != nil {
+		return fmt.Errorf("drop self-conflicts: %w", err)
+	}
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM claims WHERE id = ?`, loser); err != nil {
+		return fmt.Errorf("delete loser claim %q: %w", loser, err)
 	}
 	return nil
 }
@@ -131,8 +236,10 @@ func scanClaims(rows *sql.Rows) ([]*Claim, error) {
 const conflictCols = `id, claim_a, claim_b, status, rationale, created_at`
 
 // Create inserts a conflict between two claims, canonicalizing the pair (claim_a <
-// claim_b) so the same contradiction discovered from either side dedups against
-// the unique index (INSERT OR IGNORE). Idempotent.
+// claim_b) so the same contradiction discovered from either side dedups. Idempotent
+// on (claim_a, claim_b). Dedup is application-level (find-then-insert, atomic via
+// withTx), not migration 0008's unique index, which cr-sqlite (§8.16) forbids on a
+// replicated table — a cross-replica duplicate is reconciled by DedupDuplicates.
 func (r *ConflictRepo) Create(ctx context.Context, c *Conflict) error {
 	if c.ID == "" {
 		c.ID = NewID()
@@ -147,12 +254,40 @@ func (r *ConflictRepo) Create(ctx context.Context, c *Conflict) error {
 	if a > b {
 		a, b = b, a
 	}
-	if _, err := r.q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO conflicts(`+conflictCols+`) VALUES (?, ?, ?, ?, ?, ?)`,
-		c.ID, a, b, c.Status, nullIfEmpty(c.Rationale), c.CreatedAt); err != nil {
-		return fmt.Errorf("create conflict %q/%q: %w", a, b, err)
-	}
-	return nil
+	return withTx(ctx, r.q, func(q Querier) error {
+		var exists bool
+		if err := q.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM conflicts WHERE claim_a = ? AND claim_b = ?)`, a, b).Scan(&exists); err != nil {
+			return fmt.Errorf("find conflict %q/%q: %w", a, b, err)
+		}
+		if exists {
+			return nil
+		}
+		if _, err := q.ExecContext(ctx,
+			`INSERT INTO conflicts(`+conflictCols+`) VALUES (?, ?, ?, ?, ?, ?)`,
+			c.ID, a, b, c.Status, nullIfEmpty(c.Rationale), c.CreatedAt); err != nil {
+			return fmt.Errorf("create conflict %q/%q: %w", a, b, err)
+		}
+		return nil
+	})
+}
+
+// DedupDuplicates collapses cross-replica duplicate conflicts — rows sharing
+// (claim_a, claim_b) — keeping the lowest id (deterministic across replicas).
+// Conflicts carry no references, so the extras are dropped. Returns how many it
+// removed.
+func (r *ConflictRepo) DedupDuplicates(ctx context.Context) (int, error) {
+	var n int64
+	err := withTx(ctx, r.q, func(q Querier) error {
+		res, err := q.ExecContext(ctx,
+			`DELETE FROM conflicts WHERE id NOT IN (SELECT MIN(id) FROM conflicts GROUP BY claim_a, claim_b)`)
+		if err != nil {
+			return fmt.Errorf("dedup conflicts: %w", err)
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return int(n), err
 }
 
 // ListByStatus returns conflicts in the given status (open|resolved|dismissed),

@@ -147,3 +147,32 @@ func nullIfEmpty(s string) any {
 
 // scanner is satisfied by both *sql.Row and *sql.Rows.
 type scanner interface{ Scan(dest ...any) error }
+
+// withTx runs fn with a write querier that is guaranteed transactional, so a repo
+// method whose correctness needs several statements to be atomic (a find-then-insert
+// dedup, a reconcile re-point) is safe however it is called. If q is already a
+// *sql.Tx (the caller wrapped it in Store.Tx) that transaction is reused; if it is
+// the *sql.DB write pool (an auto-commit call) an immediate transaction is opened
+// and committed on success. _txlock=immediate makes BEGIN take the write lock, so
+// concurrent writers serialize rather than race.
+func withTx(ctx context.Context, q Querier, fn func(Querier) error) error {
+	switch v := q.(type) {
+	case *sql.Tx:
+		return fn(v)
+	case *sql.DB:
+		tx, err := v.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin tx: %w", err)
+		}
+		if err := fn(tx); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		return nil
+	default:
+		return fn(q) // an unrecognized querier (e.g. a test fake): run as-is
+	}
+}

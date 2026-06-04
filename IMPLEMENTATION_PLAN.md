@@ -1625,8 +1625,30 @@ re-architecture surfaced and these were realized —
 - L2 (raised in review) was a non-issue: migration 0002 already dropped the
   redundant `idx_artifacts_hash`.
 
-**Next:** Stage 2c — the same dedup move for entities/claims/conflicts/links (drop
-their unique indexes + reconcile or read-side dedup) and NOT NULL PKs + unchecked
-FKs on synced tables, so crsql_as_crr accepts them. Stage 3 — peer transport
-(changeset-exchange HTTP over Tailscale) + daemon wiring behind extension
-availability.
+### Stage 2c: cr-sqlite-compatible synced schema
+
+Empirical probe (the real extension over the migrated schema) found three classes
+crsql_as_crr rejects: (A) nullable `TEXT PRIMARY KEY` on 12 tables, (B) non-PK
+unique indexes on entities/links/claims/conflicts, (C) checked foreign keys on
+every synced table (cr-sqlite inspects the schema, not the runtime pragma).
+
+**Stage 2c-1 (links/claims/conflicts dedup): Complete.** Migration 0012 drops the
+three droppable unique indexes (idx_links_unique, idx_claims_artifact_statement,
+idx_conflicts_pair; non-unique replacements kept for lookup). A shared `withTx`
+helper makes any repo method atomic whether called in a Store.Tx or auto-commit
+(ArtifactRepo.inTx now delegates to it). AddLink/Claims.Create/Conflicts.Create are
+find-then-insert (same-replica dedup without a unique index). Reconcile primitives:
+GraphRepo.DedupLinks and ConflictRepo.DedupDuplicates (delete extras, keep lowest
+id), ClaimRepo.ReconcileDuplicates (merge dup claims, re-pointing conflicts +
+dropping self-conflicts). Sweeper.Sweep now orchestrates all in dependency order
+(artifacts -> claims -> conflicts -> links) and returns the total reconciled. After
+2c-1 the probe shows links/claims/conflicts failing only on class A (PK), no longer
+class B.
+
+**Next: Stage 2c-2** — rebuild every synced table (NOT NULL PK; drop entities'
+UNIQUE(kind,name); drop all FK constraints, keeping the columns) via one migration
+using `PRAGMA defer_foreign_keys=ON` (settable inside the migration tx, unlike
+`foreign_keys`); move entity dedup to find-then-insert + reconcile-merge; turn the
+crsql probe into an acceptance test asserting crsql_as_crr accepts all synced
+tables. Stage 3 — peer transport (changeset-exchange HTTP over Tailscale) + daemon
+wiring behind extension availability.
