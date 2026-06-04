@@ -261,10 +261,24 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		}
 	}()
 
+	// Re-score = re-run the relevance stage standalone (no deps; the embedding
+	// already exists). Triggered by a fresh encounter, an engagement (§9), or a
+	// reconcile merge (the survivor inherits the loser's encounters). Coalesce: skip
+	// if a re-score for this artifact is already queued.
+	rescore := func(ctx context.Context, tx *store.Store, artifactID string) error {
+		has, err := tx.Jobs.HasUnfinishedType(ctx, artifactID, pipeline.RescoreJobType)
+		if err != nil || has {
+			return err
+		}
+		_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: pipeline.RescoreJobType, ArtifactID: &artifactID})
+		return err
+	}
+
 	// Reconcile: merge cross-replica duplicate artifacts (the same_as dedup after
 	// sync, §8.2/§8.16). Single-node it finds nothing; once peers sync, it collapses
-	// duplicates created offline into one survivor.
-	reconciler := reconcile.New(st)
+	// duplicates created offline into one survivor, re-scoring each survivor whose
+	// inputs the merge changed.
+	reconciler := reconcile.New(st, rescore)
 	runReconcile := func() {
 		switch n, err := reconciler.Sweep(ctx); {
 		case err != nil && ctx.Err() == nil:
@@ -318,18 +332,6 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 			}
 		}
 	}()
-
-	// Re-score = re-run the relevance stage standalone (no deps; the embedding
-	// already exists). Triggered by a fresh encounter or an engagement (§9).
-	// Coalesce: skip if a re-score for this artifact is already queued.
-	rescore := func(ctx context.Context, tx *store.Store, artifactID string) error {
-		has, err := tx.Jobs.HasUnfinishedType(ctx, artifactID, pipeline.RescoreJobType)
-		if err != nil || has {
-			return err
-		}
-		_, err = tx.Jobs.Enqueue(ctx, store.EnqueueSpec{Type: pipeline.RescoreJobType, ArtifactID: &artifactID})
-		return err
-	}
 
 	// PULL sources: register connectors and poll due sources on a ticker, ingesting
 	// new items through the same shared path as push ingest.

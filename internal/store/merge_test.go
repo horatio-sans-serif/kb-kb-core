@@ -67,6 +67,137 @@ func TestArtifactRepo_Merge(t *testing.T) {
 	}
 }
 
+func TestArtifactRepo_Merge_FoldsEngagementSignal(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Survivor sighted later and never engaged; loser sighted earlier and engaged.
+	// The merge must keep the earliest sighting and carry the engagement forward:
+	// last_engaged_at and the active tier live on the artifact row the merge is
+	// about to tombstone, so without folding they would be lost.
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO artifacts(id,type,canonical_url,title,privacy_tier,lifecycle_tier,status,first_seen_at,last_seen_at,created_at,updated_at)
+		 VALUES ('01AAAAAAAAAAAAAAAAAAAAAAAA','webpage','https://e.com/d','s','public','archive','ready',
+		         '2025-06-01T00:00:00.000000000Z','2025-06-01T00:00:00.000000000Z','2025-06-01T00:00:00.000000000Z','2025-06-01T00:00:00.000000000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO artifacts(id,type,canonical_url,title,privacy_tier,lifecycle_tier,status,first_seen_at,last_seen_at,last_engaged_at,created_at,updated_at)
+		 VALUES ('01BBBBBBBBBBBBBBBBBBBBBBBB','webpage','https://e.com/d','l','public','active','ready',
+		         '2025-01-01T00:00:00.000000000Z','2025-03-01T00:00:00.000000000Z','2025-03-01T00:00:00.000000000Z','2025-01-01T00:00:00.000000000Z','2025-01-01T00:00:00.000000000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	survivor, loser := "01AAAAAAAAAAAAAAAAAAAAAAAA", "01BBBBBBBBBBBBBBBBBBBBBBBB"
+
+	if err := st.Artifacts.Merge(ctx, survivor, loser); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	got, err := st.Artifacts.Get(ctx, survivor)
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	if got.LastEngagedAt == nil || *got.LastEngagedAt != "2025-03-01T00:00:00.000000000Z" {
+		t.Errorf("survivor last_engaged_at = %v, want the loser's 2025-03-01 (engagement signal lost otherwise)", got.LastEngagedAt)
+	}
+	if got.LifecycleTier != "active" {
+		t.Errorf("survivor lifecycle = %q, want active (engagement reverses archive)", got.LifecycleTier)
+	}
+	if got.FirstSeenAt != "2025-01-01T00:00:00.000000000Z" {
+		t.Errorf("survivor first_seen_at = %q, want the earliest (loser's)", got.FirstSeenAt)
+	}
+}
+
+func TestArtifactRepo_Merge_DropsSelfLoopLinks(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	url := "https://e.com/loop"
+	survivor := rawArtifact(t, st, "01AAAAAAAAAAAAAAAAAAAAAAAA", url)
+	loser := rawArtifact(t, st, "01BBBBBBBBBBBBBBBBBBBBBBBB", url)
+
+	// Duplicates share entities/topics, so the graph builder linked them both ways.
+	// Re-pointing src then dst would collapse both edges to one S->S self-loop.
+	if err := st.Graph.AddLink(ctx, survivor, loser, "shares_entity", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Graph.AddLink(ctx, loser, survivor, "shares_entity", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Artifacts.Merge(ctx, survivor, loser); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	var selfLoops int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM links WHERE src_id = dst_id`).Scan(&selfLoops); err != nil {
+		t.Fatal(err)
+	}
+	if selfLoops != 0 {
+		t.Errorf("merge left %d self-loop link(s); a node is not its own neighbor", selfLoops)
+	}
+}
+
+func TestArtifactRepo_Merge_RepointsEngagementsAndJobs(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	url := "https://e.com/ref"
+	survivor := rawArtifact(t, st, "01AAAAAAAAAAAAAAAAAAAAAAAA", url)
+	loser := rawArtifact(t, st, "01BBBBBBBBBBBBBBBBBBBBBBBB", url)
+
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO engagements(id, artifact_id, kind, created_at) VALUES ('01E0000000000000000000000E', ?, 'thumbs_up', ?)`,
+		loser, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Jobs.Enqueue(ctx, EnqueueSpec{Type: "fetch", ArtifactID: &loser}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Artifacts.Merge(ctx, survivor, loser); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	count := func(table, id string) int {
+		var n int
+		if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table+` WHERE artifact_id = ?`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if c := count("engagements", loser); c != 0 {
+		t.Errorf("loser still has %d engagement(s); merge must re-point them (lost feedback)", c)
+	}
+	if c := count("jobs", loser); c != 0 {
+		t.Errorf("loser still has %d job(s); merge must re-point them (orphaned work)", c)
+	}
+	if c := count("engagements", survivor); c != 1 {
+		t.Errorf("survivor should inherit the engagement, got %d", c)
+	}
+	if c := count("jobs", survivor); c != 1 {
+		t.Errorf("survivor should inherit the job, got %d", c)
+	}
+}
+
+func TestArtifactRepo_Merge_LatestEnrichmentPerKind(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	url := "https://e.com/enr"
+	survivor := rawArtifact(t, st, "01AAAAAAAAAAAAAAAAAAAAAAAA", url)
+	loser := rawArtifact(t, st, "01BBBBBBBBBBBBBBBBBBBBBBBB", url)
+	_ = st.Enrichments.Create(ctx, &Enrichment{ArtifactID: survivor, Kind: "summary", Payload: `"S"`})
+	_ = st.Enrichments.Create(ctx, &Enrichment{ArtifactID: loser, Kind: "summary", Payload: `"L"`})
+
+	if err := st.Artifacts.Merge(ctx, survivor, loser); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	// Both summaries re-point to the survivor — enrichments keep history (a synced
+	// table can carry no uniqueness), so the merge does not delete the redundant
+	// row. Every production read is latest-per-kind, so exactly one wins.
+	all, _ := st.Enrichments.ListForArtifact(ctx, survivor)
+	if len(all) != 2 {
+		t.Errorf("survivor should accumulate both summaries (history preserved), got %d", len(all))
+	}
+	if _, err := st.Enrichments.LatestByKind(ctx, survivor, "summary"); err != nil {
+		t.Fatalf("latest-by-kind should return one summary after merge: %v", err)
+	}
+}
+
 func TestArtifactRepo_DuplicateGroups(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

@@ -1273,7 +1273,7 @@ rather than silently storing both. The claims/conflicts tables exist from Phase 
 
 - **`store.ClaimRepo`**: `Create` (embedding round-trips as a JSON float array,
   NULL when absent); `ListByArtifact`; `ListExcludingArtifact` — the
-  contradiction-comparison candidate set (every OTHER live artifact's *embedded*
+  contradiction-comparison candidate set (every OTHER live artifact's _embedded_
   claims, tombstoned and unembedded claims excluded).
 - **`store.ConflictRepo`**: `Create` canonicalizes the claim pair (claim_a <
   claim_b) and `INSERT OR IGNORE`s against migration `0008`'s unique index, so the
@@ -1297,14 +1297,15 @@ pipeline after entities.
 **Status: Complete.** `enrich.Conflicts` is a pipeline stage (DependsOn claims, so
 this artifact's claims are committed when it runs): for each of the artifact's
 claims it vector-prefilters the most similar claims from other artifacts (cosine
->= 0.6, top 5 per claim — contradictions are same-topic but opposite), asks the
-local model whether the pair genuinely contradicts, and emits a `kb.Conflict` for
-each that does. Conflicts are returned as data and inserted in the effect tx
-(deduped via the canonical pair + 0008 index); the pipeline announces
-`conflict.detected` post-commit. When the judge endpoint is remote, the candidate
-set is restricted to cloud-safe (public/personal) claims so sensitive statements
-never leave the machine (§8.17), and the stage is gated on the artifact's own tier
-like summarize. Wired into the daemon pipeline after claims.
+
+> = 0.6, top 5 per claim — contradictions are same-topic but opposite), asks the
+> local model whether the pair genuinely contradicts, and emits a `kb.Conflict` for
+> each that does. Conflicts are returned as data and inserted in the effect tx
+> (deduped via the canonical pair + 0008 index); the pipeline announces
+> `conflict.detected` post-commit. When the judge endpoint is remote, the candidate
+> set is restricted to cloud-safe (public/personal) claims so sensitive statements
+> never leave the machine (§8.17), and the stage is gated on the artifact's own tier
+> like summarize. Wired into the daemon pipeline after claims.
 
 ## Stage 4: Conflict resolution API
 
@@ -1574,22 +1575,55 @@ exist across offline replicas and are merged back into one.
 ### Stage 2a: Artifact dedup -> application-level
 
 **Status: Complete.** UpsertByCanonical/ByContentHash now find the live row
-carrying the dedup key (find-then-insert), atomic inside the ingest Tx, instead of
-INSERT ... ON CONFLICT(unique index). Migration 0011 drops the artifact unique
-indexes (non-unique ones kept for lookup). A single replica still never makes a
-duplicate; concurrent in-tx upserts of the same URL collapse to one.
+carrying the dedup key (find-then-insert) instead of INSERT ... ON CONFLICT(unique
+index). Migration 0011 drops the artifact unique indexes (non-unique ones kept for
+lookup). The find-then-insert is made atomic by `inTx`: inside a Tx it reuses the
+caller's transaction; called directly it opens its own immediate transaction — so a
+single replica never makes a duplicate whether the caller wraps it or not.
+Concurrent upserts of the same URL collapse to one, in-Tx or auto-commit.
 
 ### Stage 2b: same_as merge + reconcile sweep
 
 **Status: Complete.** `ArtifactRepo.Merge(survivor, loser)` folds a duplicate into
 its survivor — re-points the loser's children (encounters, enrichments,
-artifact_entities/topics, review_schedule, links) with UPDATE OR IGNORE +
-drop-leftover so shared rows dedup without a PK collision, drops the loser's
+artifact_entities/topics, review_schedule, engagements, jobs, audit_log, links)
+with UPDATE OR IGNORE + drop-leftover so shared rows dedup without a PK collision,
+drops self-loop links from a mutually-linked pair, folds the loser's artifact-level
+signals into the survivor (earliest first_seen, latest last_seen/last_engaged,
+active tier — so a merge never loses the engagement signal), drops the loser's
 claims/conflicts, and tombstones the loser. `DuplicateGroups` finds live artifacts
 sharing a canonical_url/content_hash (id-ascending, so the survivor is
 deterministic across replicas). `reconcile.Sweeper.Sweep` merges each group into
-its lowest-id survivor — idempotent, so a re-run after sync is safe. Wired into the
-daemon on a 10-minute ticker (single-node it finds nothing).
+its lowest-id survivor and re-scores the survivor (its relevance inputs changed) —
+idempotent on a single replica. Wired into the daemon on a 10-minute ticker
+(single-node it finds nothing).
+
+**Review (Stage 2a/2b) fixes applied:** an independent code review of the dedup
+re-architecture surfaced and these were realized —
+
+- C1: `Merge` re-points every table referencing artifacts(id) — added engagements
+  (the feedback signal), jobs, audit_log (were silently orphaned); renders'
+  JSON `artifact_ids` is documented as accepted-to-linger.
+- C1/engagement loss: the live engagement signal is `artifacts.last_engaged_at`
+  (the engagements table has no writer yet), which the tombstone discarded —
+  `foldSignals` now carries last_engaged_at/first_seen/last_seen/active-tier to the
+  survivor.
+- H1: re-pointing a mutually-linked duplicate pair collapsed both edges to a
+  persistent `S->S` self-loop — `Merge` now deletes `src_id = dst_id` links.
+- H2: the survivor inherited the loser's encounters but kept a stale
+  relevance_score — `Sweeper` takes a `RescoreFunc` and re-scores the survivor in
+  the merge tx.
+- H3: duplicate enrichments accumulate on the survivor — documented and tested as
+  intentional (synced table, latest-per-kind reads win; `ListForArtifact` has no
+  production caller).
+- M1: the "must run in a Tx" contract is now enforced by `inTx`, not just
+  documented — direct callers are wrapped automatically (test: concurrent
+  auto-commit upserts collapse to one).
+- M2/L3: corrected the Sweep idempotency comment (concurrent cross-replica merges
+  converge but can leave a residual duplicate child — best-effort under §8.16); the
+  cancel path no longer drops already-collected per-group errors.
+- L2 (raised in review) was a non-issue: migration 0002 already dropped the
+  redundant `idx_artifacts_hash`.
 
 **Next:** Stage 2c — the same dedup move for entities/claims/conflicts/links (drop
 their unique indexes + reconcile or read-side dedup) and NOT NULL PKs + unchecked

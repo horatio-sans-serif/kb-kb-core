@@ -394,6 +394,41 @@ func TestArtifact_ConcurrentUpsert_NoDuplicates(t *testing.T) {
 	}
 }
 
+func TestArtifact_ConcurrentUpsert_AutoCommit_NoDuplicates(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	url := "https://example.com/autocommit-race"
+
+	// Called directly (no enclosing Tx), the upsert wraps itself in an immediate
+	// transaction, so the find-then-insert stays atomic and concurrent direct
+	// callers still collapse to one artifact — the contract is enforced, not just
+	// documented.
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = st.Artifacts.UpsertByCanonical(ctx, &Artifact{Type: "webpage", CanonicalURL: &url})
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("auto-commit upsert %d failed: %v", i, err)
+		}
+	}
+	list, err := st.Artifacts.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Errorf("concurrent auto-commit upserts created %d artifacts, want 1", len(list))
+	}
+}
+
 func TestArtifact_Patch(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

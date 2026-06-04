@@ -25,12 +25,14 @@ const artifactSelect = `SELECT ` + artifactColNames + ` FROM artifacts`
 // constraint: cr-sqlite (§8.16) forbids non-primary-key unique indexes on
 // replicated tables, because uniqueness can't be enforced across offline replicas.
 // So a cross-replica duplicate may transiently exist and is reconciled by the
-// same_as merge sweep, not prevented here. MUST run inside a Tx: the immediate
-// transaction serializes the find and the insert so a single replica never makes a
-// duplicate (the ingest path wraps it). A nil CanonicalURL never dedups (always
-// inserts). The find is scoped to live rows, so a tombstoned URL is free for a new
-// artifact (a re-sighting after soft-delete is a new artifact). A re-sighting only
-// touches last_seen_at/updated_at — never an existing artifact's enriched fields.
+// same_as merge sweep, not prevented here. The find and the insert are atomic: when
+// already inside a Tx the caller's immediate transaction serializes them (the
+// ingest path); called directly it opens its own immediate transaction (see inTx),
+// so a single replica never makes a duplicate either way. A nil CanonicalURL never
+// dedups (always inserts). The find is scoped to live rows, so a tombstoned URL is
+// free for a new artifact (a re-sighting after soft-delete is a new artifact). A
+// re-sighting only touches last_seen_at/updated_at — never an existing artifact's
+// enriched fields.
 func (r *ArtifactRepo) UpsertByCanonical(ctx context.Context, a *Artifact) (*Artifact, error) {
 	return r.upsert(ctx, a, "canonical_url", a.CanonicalURL)
 }
@@ -44,10 +46,49 @@ func (r *ArtifactRepo) UpsertByContentHash(ctx context.Context, a *Artifact) (*A
 	return r.upsert(ctx, a, "content_hash", a.ContentHash)
 }
 
-// upsert finds a live artifact already carrying the dedup key and touches it, or
-// inserts a new one. keyCol is a trusted constant column name ("canonical_url" or
+// inTx runs fn against an ArtifactRepo bound to a transaction. If this repo is
+// already transaction-scoped (q is a *sql.Tx, e.g. inside Store.Tx) it reuses that
+// transaction; otherwise (q is the *sql.DB write pool, an auto-commit call) it
+// opens its own immediate transaction. This makes a multi-statement invariant — the
+// find-then-insert upsert, the merge's re-points — atomic for a direct caller too,
+// not only when wrapped in Store.Tx. _txlock=immediate means BEGIN takes the write
+// lock, so concurrent writers serialize rather than race.
+func (r *ArtifactRepo) inTx(ctx context.Context, fn func(*ArtifactRepo) error) error {
+	db, ok := r.q.(*sql.DB)
+	if !ok {
+		return fn(r) // already inside a transaction
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("artifact tx begin: %w", err)
+	}
+	if err := fn(&ArtifactRepo{q: tx, rq: tx}); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("artifact tx commit: %w", err)
+	}
+	return nil
+}
+
+// upsert runs the find-then-insert atomically (see inTx), then delegates to
+// upsertLocked. keyCol is a trusted constant column name ("canonical_url" or
 // "content_hash"), not user input.
 func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, keyCol string, key *string) (*Artifact, error) {
+	var out *Artifact
+	err := r.inTx(ctx, func(tr *ArtifactRepo) error {
+		var e error
+		out, e = tr.upsertLocked(ctx, a, keyCol, key)
+		return e
+	})
+	return out, err
+}
+
+// upsertLocked finds a live artifact already carrying the dedup key and touches it,
+// or inserts a new one. It MUST run with r bound to a transaction (upsert ensures
+// this via inTx) so the find and the insert are one atomic unit.
+func (r *ArtifactRepo) upsertLocked(ctx context.Context, a *Artifact, keyCol string, key *string) (*Artifact, error) {
 	if key != nil {
 		existing, err := r.findLiveByKey(ctx, keyCol, *key)
 		if err != nil {
@@ -351,15 +392,33 @@ func (r *ArtifactRepo) EnrichingIDs(ctx context.Context) ([]string, error) {
 // Merge folds the loser artifact into the survivor (the design's same_as dedup):
 // it re-points the loser's child rows to the survivor — UPDATE OR IGNORE then drop
 // any that would have duplicated an existing survivor row (a shared encounter
-// source, entity, topic, …) — drops the loser's claims and their conflicts (the
-// survivor keeps its own derived ones), and tombstones the loser. The caller picks
-// the survivor deterministically (lowest id) so independent replicas converge on
-// the same merge. Idempotent and live-scoped: a survivor==loser or already-merged
-// loser is a no-op. MUST run inside a Tx (the reconcile sweep wraps it).
+// source, entity, topic, …) — folds the loser's artifact-level signals into the
+// survivor (earliest sighting, latest engagement, active tier), drops the loser's
+// claims and their conflicts (the survivor keeps its own derived ones), and
+// tombstones the loser. The caller picks the survivor deterministically (lowest id)
+// so independent replicas converge on the same merge. Idempotent and live-scoped: a
+// survivor==loser or already-merged loser is a no-op. Atomic via inTx — the
+// reconcile sweep wraps it in a Tx; a direct caller is wrapped automatically.
+//
+// The loser's enrichments re-point too rather than being deleted, so the survivor
+// may carry two of a kind (its own plus the loser's). That is intentional:
+// enrichments is a synced table (no uniqueness possible), and every read path is
+// latest-per-kind (LatestByKind / ForEachLatestEmbedding), so one wins and the
+// redundant row is harmless dead weight. The child re-points DELETE leftover rows
+// (those tables carry no deleted_at to tombstone); a concurrent cross-replica merge
+// can therefore leave a residual duplicate child after sync — acceptable under the
+// design's best-effort dedup (§8.16), and the next single-replica sweep is exact.
 func (r *ArtifactRepo) Merge(ctx context.Context, survivorID, loserID string) error {
 	if survivorID == loserID {
 		return nil
 	}
+	return r.inTx(ctx, func(tr *ArtifactRepo) error {
+		return tr.mergeLocked(ctx, survivorID, loserID)
+	})
+}
+
+// mergeLocked is Merge's body; r must be transaction-bound (Merge ensures this).
+func (r *ArtifactRepo) mergeLocked(ctx context.Context, survivorID, loserID string) error {
 	reassign := func(table, col string) error {
 		if _, err := r.q.ExecContext(ctx, `UPDATE OR IGNORE `+table+` SET `+col+` = ? WHERE `+col+` = ?`, survivorID, loserID); err != nil {
 			return fmt.Errorf("merge re-point %s.%s: %w", table, col, err)
@@ -369,18 +428,32 @@ func (r *ArtifactRepo) Merge(ctx context.Context, survivorID, loserID string) er
 		}
 		return nil
 	}
+	// Every table that references artifacts(id). engagements is the explicit "I
+	// care" feedback signal (§8.9); jobs/audit_log are local-only but still point
+	// at the artifact. renders.artifact_ids is a JSON array, not an FK column, so
+	// the loser id lingers in past-render provenance — accepted (a render is a
+	// historical record, not live state).
 	for _, tc := range []struct{ table, col string }{
 		{"encounters", "artifact_id"},
 		{"enrichments", "artifact_id"},
 		{"artifact_entities", "artifact_id"},
 		{"artifact_topics", "artifact_id"},
 		{"review_schedule", "artifact_id"},
+		{"engagements", "artifact_id"},
+		{"jobs", "artifact_id"},
+		{"audit_log", "artifact_id"},
 		{"links", "src_id"},
 		{"links", "dst_id"},
 	} {
 		if err := reassign(tc.table, tc.col); err != nil {
 			return err
 		}
+	}
+	// Re-pointing a mutually-linked pair (both S->L and L->S existed — duplicates
+	// share entities/topics, so the graph builder linked them both ways) collapses
+	// both edges to one S->S self-loop. Drop them: a node is not its own neighbor.
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM links WHERE src_id = dst_id`); err != nil {
+		return fmt.Errorf("merge drop self-loop links: %w", err)
 	}
 	// The loser's claims (and the conflicts referencing them) are dropped — the
 	// survivor keeps its own; conflicts re-detect over the merged set.
@@ -392,6 +465,9 @@ func (r *ArtifactRepo) Merge(ctx context.Context, survivorID, loserID string) er
 	if _, err := r.q.ExecContext(ctx, `DELETE FROM claims WHERE artifact_id = ?`, loserID); err != nil {
 		return fmt.Errorf("merge loser claims: %w", err)
 	}
+	if err := r.foldSignals(ctx, survivorID, loserID); err != nil {
+		return err
+	}
 	ts := now()
 	if _, err := r.q.ExecContext(ctx,
 		`UPDATE artifacts SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
@@ -399,6 +475,69 @@ func (r *ArtifactRepo) Merge(ctx context.Context, survivorID, loserID string) er
 		return fmt.Errorf("merge tombstone loser %q: %w", loserID, err)
 	}
 	return r.reindexFTS(ctx, loserID) // drop the tombstoned loser from the FTS index
+}
+
+// foldSignals carries the loser's artifact-level aggregate signals into the
+// survivor before the loser is tombstoned: the earliest first_seen_at, the latest
+// last_seen_at and last_engaged_at, and the active tier if either side is active
+// (engagement reverses an archive, §8.12). Without this the merge would discard the
+// loser's sighting history and engagement — the most valuable user signal — when it
+// tombstones the loser row those columns live on. TimeFormat strings are
+// lexicographically ordered, so min/max are plain string comparisons.
+func (r *ArtifactRepo) foldSignals(ctx context.Context, survivorID, loserID string) error {
+	survivor, err := r.Get(ctx, survivorID)
+	if err != nil {
+		return fmt.Errorf("merge fold: read survivor: %w", err)
+	}
+	loser, err := r.Get(ctx, loserID)
+	if err != nil {
+		return fmt.Errorf("merge fold: read loser: %w", err)
+	}
+	firstSeen := minStr(survivor.FirstSeenAt, loser.FirstSeenAt)
+	lastSeen := maxStr(survivor.LastSeenAt, loser.LastSeenAt)
+	lastEngaged := maxPtr(survivor.LastEngagedAt, loser.LastEngagedAt)
+	lifecycle := survivor.LifecycleTier
+	if survivor.LifecycleTier == "active" || loser.LifecycleTier == "active" {
+		lifecycle = "active"
+	}
+	if _, err := r.q.ExecContext(ctx,
+		`UPDATE artifacts SET first_seen_at = ?, last_seen_at = ?, last_engaged_at = ?, lifecycle_tier = ?, updated_at = ?
+		 WHERE id = ?`,
+		firstSeen, lastSeen, lastEngaged, lifecycle, now(), survivorID); err != nil {
+		return fmt.Errorf("merge fold signals into survivor %q: %w", survivorID, err)
+	}
+	return nil
+}
+
+// minStr/maxStr return the lexicographically smaller/larger of two TimeFormat
+// strings (== chronological order, see store.TimeFormat).
+func minStr(a, b string) string {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxStr(a, b string) string {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// maxPtr returns the later of two optional timestamps; nil (never set) sorts before
+// any real timestamp, and nil only when both are nil.
+func maxPtr(a, b *string) *string {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case *a >= *b:
+		return a
+	default:
+		return b
+	}
 }
 
 // DuplicateGroups returns the sets of live artifacts that share a dedup key (a
