@@ -116,7 +116,7 @@ func (p *Pipeline) EnqueueTx(ctx context.Context, tx *store.Store, artifactID st
 // enrichments.
 func (p *Pipeline) RegisterHandlers(st *store.Store, runner *jobs.Runner, bus *events.Bus) {
 	for _, name := range p.order {
-		runner.Handle(name, p.handler(st, p.enrichers[name]))
+		runner.Handle(name, p.handler(st, p.enrichers[name], bus))
 	}
 	// Re-score jobs reuse the designated scoring stage's handler under a distinct
 	// type, so a re-score recomputes the score but stays out of completion
@@ -126,7 +126,7 @@ func (p *Pipeline) RegisterHandlers(st *store.Store, runner *jobs.Runner, bus *e
 		if !ok {
 			panic(fmt.Sprintf("pipeline: rescore stage %q is not registered", p.rescoreStage))
 		}
-		runner.Handle(RescoreJobType, p.handler(st, e))
+		runner.Handle(RescoreJobType, p.handler(st, e, bus))
 	}
 	runner.SetOnComplete(p.finalize(st, bus))
 }
@@ -199,7 +199,7 @@ func (p *Pipeline) Reconcile(ctx context.Context, st *store.Store, bus *events.B
 	return nil
 }
 
-func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
+func (p *Pipeline) handler(st *store.Store, e kb.Enricher, bus *events.Bus) jobs.Handler {
 	return func(ctx context.Context, job store.Job) error {
 		if job.ArtifactID == nil {
 			return fmt.Errorf("pipeline: %s job %s has no artifact", e.Name(), job.ID)
@@ -231,7 +231,7 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 		// was written), and a commit lands the rows together with the 'done' status
 		// so a reclaim can never re-run a stage that already wrote — exactly-once
 		// enrichment writes. (The runner's own MarkDone afterward is then a no-op.)
-		return st.Tx(ctx, func(tx *store.Store) error {
+		if err := st.Tx(ctx, func(tx *store.Store) error {
 			for i := range res.Enrichments {
 				if err := tx.Enrichments.Create(ctx, &res.Enrichments[i]); err != nil {
 					return err
@@ -247,6 +247,11 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 					return err
 				}
 			}
+			for i := range res.Conflicts {
+				if err := tx.Conflicts.Create(ctx, &res.Conflicts[i]); err != nil {
+					return err
+				}
+			}
 			// Graph mutations (entity links, edges) run in the same tx so they are
 			// atomic with the stage's completion: a rolled-back attempt leaves no
 			// graph rows, and only the committing attempt's effects ever land.
@@ -256,7 +261,20 @@ func (p *Pipeline) handler(st *store.Store, e kb.Enricher) jobs.Handler {
 				}
 			}
 			return tx.Jobs.MarkDone(ctx, job.ID)
-		})
+		}); err != nil {
+			return err
+		}
+
+		// After the effects commit, announce detected contradictions so the surfacing
+		// layer can raise them for human resolution (§8.13). Published post-commit so
+		// a subscriber never sees a conflict that a rolled-back tx didn't persist.
+		if len(res.Conflicts) > 0 {
+			bus.Publish(events.New(events.ConflictDetected, map[string]string{
+				"artifact_id": a.ID,
+				"count":       fmt.Sprintf("%d", len(res.Conflicts)),
+			}))
+		}
+		return nil
 	}
 }
 

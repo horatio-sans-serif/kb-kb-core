@@ -145,6 +145,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	enrichment.Register(enrich.NewEmbed(llmClient, cfg.EmbedModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewEntities(llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewClaims(llmClient, llmClient, cfg.SummarizeModel, cfg.EmbedModel, cfg.OllamaIsLocal))
+	enrichment.Register(enrich.NewConflicts(st.Claims, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	enrichment.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	enrichment.SetRescoreStage(enrich.RelevanceStage) // re-scores re-run the relevance stage
 	enrichment.RegisterHandlers(st, runner, bus)

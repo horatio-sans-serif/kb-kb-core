@@ -52,13 +52,18 @@ func (r *ClaimRepo) ListByArtifact(ctx context.Context, artifactID string) ([]*C
 // ListExcludingArtifact returns the embedded claims of every OTHER live artifact —
 // the contradiction-comparison candidate set for a newly-claimed artifact. Claims
 // without an embedding (nothing to vector-prefilter on) and claims of tombstoned
-// artifacts are excluded.
-func (r *ClaimRepo) ListExcludingArtifact(ctx context.Context, artifactID string) ([]*Claim, error) {
-	rows, err := r.rq.QueryContext(ctx,
-		`SELECT c.id, c.artifact_id, c.statement, c.embedding, c.created_at FROM claims c
-		 JOIN artifacts a ON a.id = c.artifact_id AND a.deleted_at IS NULL
-		 WHERE c.artifact_id != ? AND c.embedding IS NOT NULL
-		 ORDER BY c.created_at, c.id`, artifactID)
+// artifacts are excluded. When cloudSafeOnly is set (a remote LLM judges the
+// comparison), claims of sensitive/restricted artifacts are also excluded so they
+// never leave the machine (§8.17).
+func (r *ClaimRepo) ListExcludingArtifact(ctx context.Context, artifactID string, cloudSafeOnly bool) ([]*Claim, error) {
+	q := `SELECT c.id, c.artifact_id, c.statement, c.embedding, c.created_at FROM claims c
+	      JOIN artifacts a ON a.id = c.artifact_id AND a.deleted_at IS NULL
+	      WHERE c.artifact_id != ? AND c.embedding IS NOT NULL`
+	if cloudSafeOnly {
+		q += ` AND a.privacy_tier IN ('public','personal')`
+	}
+	q += ` ORDER BY c.created_at, c.id`
+	rows, err := r.rq.QueryContext(ctx, q, artifactID)
 	if err != nil {
 		return nil, fmt.Errorf("list claims excluding %q: %w", artifactID, err)
 	}

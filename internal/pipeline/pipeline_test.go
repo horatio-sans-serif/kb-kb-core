@@ -224,7 +224,7 @@ func TestPipeline_HandlerCompletesAtomically(t *testing.T) {
 	if err != nil || job == nil {
 		t.Fatalf("claim: job=%v err=%v", job, err)
 	}
-	if err := p.handler(st, e)(ctx, *job); err != nil {
+	if err := p.handler(st, e, events.NewBus())(ctx, *job); err != nil {
 		t.Fatalf("handler: %v", err)
 	}
 
@@ -273,7 +273,7 @@ func TestPipeline_HandlerRollsBackOnWriteError(t *testing.T) {
 
 	// The handler must fail, and the whole transaction must roll back: neither the
 	// valid enrichment nor the MarkDone may survive (atomicity).
-	if err := p.handler(st, e)(ctx, *job); err == nil {
+	if err := p.handler(st, e, events.NewBus())(ctx, *job); err == nil {
 		t.Fatal("handler should error when an enrichment write fails")
 	}
 	got, _ := st.Jobs.Get(ctx, job.ID)

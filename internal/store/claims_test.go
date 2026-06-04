@@ -51,12 +51,33 @@ func TestClaimRepo_ListExcludingArtifact(t *testing.T) {
 	_ = st.Claims.Create(ctx, &Claim{ArtifactID: b, Statement: "B2"}) // no embedding → skipped
 
 	// Comparison set for artifact a: only b's claims that have an embedding.
-	others, err := st.Claims.ListExcludingArtifact(ctx, a)
+	others, err := st.Claims.ListExcludingArtifact(ctx, a, false)
 	if err != nil {
 		t.Fatalf("list excluding: %v", err)
 	}
 	if len(others) != 1 || others[0].Statement != "B1" {
 		t.Errorf("excluding-a set = %+v, want [B1] (embedded, not from a)", others)
+	}
+}
+
+func TestClaimRepo_CloudSafeExcludesSensitive(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a := mkArtifact(t, st, "h1")
+	// A sensitive artifact with an embedded claim.
+	hs := "hs"
+	sens, _ := st.Artifacts.UpsertByContentHash(ctx, &Artifact{Type: "note", Title: "s", BodyMarkdown: "b", ContentHash: &hs, PrivacyTier: "sensitive"})
+	_ = st.Claims.Create(ctx, &Claim{ArtifactID: sens.ID, Statement: "secret claim", Embedding: []float32{1}})
+
+	// cloudSafeOnly excludes the sensitive artifact's claim (never sent to a remote judge).
+	safe, _ := st.Claims.ListExcludingArtifact(ctx, a, true)
+	if len(safe) != 0 {
+		t.Errorf("cloud-safe set must exclude sensitive claims, got %d", len(safe))
+	}
+	// Without the flag it is included.
+	all, _ := st.Claims.ListExcludingArtifact(ctx, a, false)
+	if len(all) != 1 {
+		t.Errorf("local set should include all embedded claims, got %d", len(all))
 	}
 }
 
@@ -68,7 +89,7 @@ func TestClaimRepo_ExcludesTombstoned(t *testing.T) {
 	if err := st.Artifacts.SoftDelete(ctx, b); err != nil {
 		t.Fatalf("soft delete: %v", err)
 	}
-	others, _ := st.Claims.ListExcludingArtifact(ctx, a)
+	others, _ := st.Claims.ListExcludingArtifact(ctx, a, false)
 	if len(others) != 0 {
 		t.Errorf("claims of a tombstoned artifact must be excluded, got %d", len(others))
 	}

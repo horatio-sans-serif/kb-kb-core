@@ -1292,5 +1292,19 @@ as `EnrichResult.Claims` data, inserted in the pipeline's effect transaction
 (exactly-once). Records a `claims` audit enrichment row. Wired into the daemon
 pipeline after entities.
 
-**Next:** Stage 3 — conflict detection (cosine pre-filter + LLM judgment →
-conflicts + `conflict.detected` event) + the conflict resolution API.
+## Stage 3: Conflict detection
+
+**Status: Complete.** `enrich.Conflicts` is a pipeline stage (DependsOn claims, so
+this artifact's claims are committed when it runs): for each of the artifact's
+claims it vector-prefilters the most similar claims from other artifacts (cosine
+>= 0.6, top 5 per claim — contradictions are same-topic but opposite), asks the
+local model whether the pair genuinely contradicts, and emits a `kb.Conflict` for
+each that does. Conflicts are returned as data and inserted in the effect tx
+(deduped via the canonical pair + 0008 index); the pipeline announces
+`conflict.detected` post-commit. When the judge endpoint is remote, the candidate
+set is restricted to cloud-safe (public/personal) claims so sensitive statements
+never leave the machine (§8.17), and the stage is gated on the artifact's own tier
+like summarize. Wired into the daemon pipeline after claims.
+
+**Next:** Stage 4 — conflict resolution API (`GET /conflicts`, `POST
+/conflicts/{id}` resolve/dismiss).
