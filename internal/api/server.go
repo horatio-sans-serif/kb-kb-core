@@ -20,6 +20,7 @@ import (
 	"kb/internal/render"
 	"kb/internal/review"
 	"kb/internal/search"
+	"kb/internal/sources"
 	"kb/internal/store"
 	"kb/internal/surface"
 )
@@ -327,13 +328,16 @@ type createSourceRequest struct {
 }
 
 type sourceJSON struct {
-	ID             string          `json:"id"`
-	Kind           string          `json:"kind"`
-	Connector      string          `json:"connector"`
-	Enabled        bool            `json:"enabled"`
-	DefaultPrivacy string          `json:"default_privacy"`
-	LastFetchedAt  string          `json:"last_fetched_at,omitempty"`
-	Health         json.RawMessage `json:"health,omitempty"`
+	ID                  string          `json:"id"`
+	Kind                string          `json:"kind"`
+	Connector           string          `json:"connector"`
+	Enabled             bool            `json:"enabled"`
+	DefaultPrivacy      string          `json:"default_privacy"`
+	Status              string          `json:"status"` // unknown|healthy|degraded|failing
+	ConsecutiveFailures int             `json:"consecutive_failures,omitempty"`
+	LastFetchedAt       string          `json:"last_fetched_at,omitempty"`
+	NextFetchAt         string          `json:"next_fetch_at,omitempty"`
+	Health              json.RawMessage `json:"health,omitempty"`
 }
 
 func validKind(k string) bool {
@@ -435,8 +439,16 @@ func toSourceJSON(src *store.Source) sourceJSON {
 	if src.LastFetchedAt != nil {
 		j.LastFetchedAt = *src.LastFetchedAt
 	}
-	if src.Health != nil {
+	var health kb.Health
+	polled := src.Health != nil
+	if polled {
 		j.Health = json.RawMessage(*src.Health)
+		_ = json.Unmarshal([]byte(*src.Health), &health)
+		j.ConsecutiveFailures = health.ConsecutiveFailures
+	}
+	j.Status = sources.DeriveStatus(health, polled)
+	if next, ok := sources.NextFetchAt(src.LastFetchedAt, src.Schedule); ok {
+		j.NextFetchAt = next
 	}
 	return j
 }

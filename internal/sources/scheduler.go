@@ -143,6 +143,36 @@ func (s *Scheduler) poll(ctx context.Context, conn kb.SourceConnector, src *kb.S
 	return n, nil
 }
 
+// DeriveStatus turns a source's health snapshot into a coarse operator status:
+// unknown (never polled), healthy, degraded (some recent failures, below the
+// alert threshold), or failing (at/over the threshold). §8.15 dashboard.
+func DeriveStatus(h kb.Health, polled bool) string {
+	switch {
+	case !polled:
+		return "unknown"
+	case h.OK:
+		return "healthy"
+	case h.ConsecutiveFailures >= failureAlertThreshold:
+		return "failing"
+	default:
+		return "degraded"
+	}
+}
+
+// NextFetchAt returns when a PULL source is next due (last poll + its refresh
+// interval) as a store-format timestamp, or ("", false) if it has never been
+// polled (due now).
+func NextFetchAt(lastFetchedAt, schedule *string) (string, bool) {
+	if lastFetchedAt == nil {
+		return "", false
+	}
+	last, err := time.Parse(store.TimeFormat, *lastFetchedAt)
+	if err != nil {
+		return "", false
+	}
+	return store.FormatTime(last.Add(ttl(schedule))), true
+}
+
 // due reports whether a source's refresh interval has elapsed.
 func due(src *kb.Source, now time.Time) bool {
 	if src.LastFetchedAt == nil {

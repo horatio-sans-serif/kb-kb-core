@@ -1440,5 +1440,17 @@ snapshot rather than overwriting it:
   `failureAlertThreshold` (3), so a persistently-broken feed doesn't spam. The
   scheduler took a `*events.Bus`.
 
-**Next:** Stage 2 — derived health status + next-fetch time on the source API
-(healthy / degraded / failing).
+## Stage 2: Derived health status on the source API
+
+**Status: Complete.** `GET /sources` now surfaces a derived `status` per source —
+`unknown` (never polled), `healthy`, `degraded` (some recent failures below the
+alert threshold), or `failing` (at/over it) — plus `consecutive_failures` and
+`next_fetch_at` (last poll + the source's refresh interval). `sources.DeriveStatus`
+and `sources.NextFetchAt` keep the threshold and schedule logic in the sources
+package; the API parses the health snapshot to populate them.
+
+This completes Phase 12 (source health monitoring): consecutive-failure tracking +
+source.failed alerting, and the operator dashboard fields.
+
+**Deferred:** auth-expiry detection from AuthState (re-auth prompts); schema-drift
+detection (hash a source's output shape); a dedicated health-history view.
