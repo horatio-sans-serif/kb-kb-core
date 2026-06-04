@@ -1353,5 +1353,17 @@ Different-dimension centroids (a changed embed model) are skipped, so they
 naturally start new topics. A per-artifact failure is collected and the rest
 proceed. Wired into the daemon on a 5-minute ticker + at startup.
 
-**Next:** Stage 3 — topic query API (list topics, artifacts in a topic) +
-shares_topic graph edges.
+## Stage 3: Topic query API
+
+**Status: Complete.** `GET /topics` lists the emergent topics by size (live member
+count, largest first; empty topics excluded). `GET /topics/{id}` returns a topic
+and its member artifacts (highest membership score first, with title/url; 404
+unknown). Backed by `TopicRepo.ListWithCounts/Get/Members` (live-only). Reads the
+store directly.
+
+This completes Phase 10 (topic clustering): store layer, incremental
+leader-clustering sweep, and the query API.
+
+**Deferred:** LLM-derived topic labels (vs the founding artifact's title);
+shares_topic graph edges between co-topic artifacts; topic-scoped conflict
+comparison; topic drift / re-clustering.

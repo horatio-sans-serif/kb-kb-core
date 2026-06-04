@@ -77,6 +77,85 @@ func (r *TopicRepo) MemberCount(ctx context.Context, topicID string) (int, error
 	return n, nil
 }
 
+// TopicWithCount is a topic plus its live member count (the topic list view).
+type TopicWithCount struct {
+	Topic       *Topic
+	MemberCount int
+}
+
+// ListWithCounts returns topics that have at least one live member, largest first,
+// each with its live member count.
+func (r *TopicRepo) ListWithCounts(ctx context.Context, limit int) ([]TopicWithCount, error) {
+	if limit <= 0 {
+		limit = surfaceDefaultLimit
+	}
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT t.id, t.label, COUNT(*) AS n FROM topics t
+		 JOIN artifact_topics at ON at.topic_id = t.id
+		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL
+		 GROUP BY t.id, t.label ORDER BY n DESC, t.id LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list topics with counts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []TopicWithCount
+	for rows.Next() {
+		var t Topic
+		var n int
+		if err := rows.Scan(&t.ID, &t.Label, &n); err != nil {
+			return nil, fmt.Errorf("scan topic count: %w", err)
+		}
+		out = append(out, TopicWithCount{Topic: &t, MemberCount: n})
+	}
+	return out, rows.Err()
+}
+
+// Get returns a topic by id, or ErrNotFound.
+func (r *TopicRepo) Get(ctx context.Context, id string) (*Topic, error) {
+	rows, err := r.rq.QueryContext(ctx, `SELECT id, label, centroid FROM topics WHERE id = ?`, id)
+	if err != nil {
+		return nil, fmt.Errorf("get topic %q: %w", id, err)
+	}
+	defer rows.Close()
+	ts, err := scanTopics(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(ts) == 0 {
+		return nil, fmt.Errorf("get topic %q: %w", id, ErrNotFound)
+	}
+	return ts[0], nil
+}
+
+// TopicMember is one artifact's membership in a topic.
+type TopicMember struct {
+	ArtifactID string
+	Score      float64
+}
+
+// Members returns a topic's live member artifacts, highest membership score first.
+func (r *TopicRepo) Members(ctx context.Context, topicID string) ([]TopicMember, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT at.artifact_id, at.score FROM artifact_topics at
+		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL
+		 WHERE at.topic_id = ? ORDER BY at.score DESC, at.artifact_id`, topicID)
+	if err != nil {
+		return nil, fmt.Errorf("members of topic %q: %w", topicID, err)
+	}
+	defer rows.Close()
+
+	var out []TopicMember
+	for rows.Next() {
+		var m TopicMember
+		if err := rows.Scan(&m.ArtifactID, &m.Score); err != nil {
+			return nil, fmt.Errorf("scan topic member: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // TopicsForArtifact returns the topics a live artifact is assigned to.
 func (r *TopicRepo) TopicsForArtifact(ctx context.Context, artifactID string) ([]*Topic, error) {
 	rows, err := r.rq.QueryContext(ctx,

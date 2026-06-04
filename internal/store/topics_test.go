@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -45,6 +46,52 @@ func TestTopicRepo_CreateListAssign(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ID != tp.ID {
 		t.Errorf("topics for artifact = %+v, want the assigned topic", got)
+	}
+}
+
+func TestTopicRepo_ListWithCountsGetMembers(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a := mkArtifact(t, st, "h1")
+	b := mkArtifact(t, st, "h2")
+	gone := mkArtifact(t, st, "h3")
+
+	big := &Topic{Label: "big", Centroid: []float32{1}}
+	small := &Topic{Label: "small", Centroid: []float32{2}}
+	_ = st.Topics.Create(ctx, big)
+	_ = st.Topics.Create(ctx, small)
+	_ = st.Topics.Assign(ctx, a, big.ID, 0.9)
+	_ = st.Topics.Assign(ctx, b, big.ID, 0.7)
+	_ = st.Topics.Assign(ctx, gone, small.ID, 0.5)
+	_ = st.Artifacts.SoftDelete(ctx, gone) // small now has 0 live members
+
+	// ListWithCounts: only topics with >=1 live member, biggest first.
+	list, err := st.Topics.ListWithCounts(ctx, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].Topic.ID != big.ID || list[0].MemberCount != 2 {
+		t.Fatalf("list = %+v, want only big with 2 members", list)
+	}
+
+	got, err := st.Topics.Get(ctx, big.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Label != "big" {
+		t.Errorf("get = %+v", got)
+	}
+	if _, err := st.Topics.Get(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get(missing) = %v, want ErrNotFound", err)
+	}
+
+	// Members: live members, highest score first; tombstoned excluded.
+	members, err := st.Topics.Members(ctx, big.ID)
+	if err != nil {
+		t.Fatalf("members: %v", err)
+	}
+	if len(members) != 2 || members[0].ArtifactID != a || members[0].Score != 0.9 {
+		t.Errorf("members = %+v, want [a(0.9), b(0.7)]", members)
 	}
 }
 

@@ -129,6 +129,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /graph/{id}", s.requireAuth(http.HandlerFunc(s.handleGraph)))
 	mux.Handle("GET /conflicts", s.requireAuth(http.HandlerFunc(s.handleListConflicts)))
 	mux.Handle("POST /conflicts/{id}", s.requireAuth(http.HandlerFunc(s.handleResolveConflict)))
+	mux.Handle("GET /topics", s.requireAuth(http.HandlerFunc(s.handleListTopics)))
+	mux.Handle("GET /topics/{id}", s.requireAuth(http.HandlerFunc(s.handleGetTopic)))
 	return mux
 }
 
@@ -772,6 +774,75 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
+}
+
+type topicListItemJSON struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	MemberCount int    `json:"member_count"`
+}
+
+type topicMemberJSON struct {
+	ArtifactID string  `json:"artifact_id"`
+	Title      string  `json:"title,omitempty"`
+	URL        string  `json:"url,omitempty"`
+	Score      float64 `json:"score"`
+}
+
+type topicJSON struct {
+	ID      string            `json:"id"`
+	Label   string            `json:"label"`
+	Members []topicMemberJSON `json:"members"`
+}
+
+// handleListTopics lists the emergent topics by size (§8.7), largest first.
+func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {
+	topics, err := s.deps.Store.Topics.ListWithCounts(r.Context(), maxSurfaceLimit)
+	if err != nil {
+		s.serverError(w, "list topics", err)
+		return
+	}
+	out := make([]topicListItemJSON, 0, len(topics))
+	for _, t := range topics {
+		out = append(out, topicListItemJSON{ID: t.Topic.ID, Label: t.Topic.Label, MemberCount: t.MemberCount})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"topics": out})
+}
+
+// handleGetTopic returns a topic and its member artifacts (highest score first).
+func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid topic id", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	topic, err := s.deps.Store.Topics.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown topic", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "get topic", err)
+		return
+	}
+	members, err := s.deps.Store.Topics.Members(ctx, id)
+	if err != nil {
+		s.serverError(w, "topic members", err)
+		return
+	}
+	out := topicJSON{ID: topic.ID, Label: topic.Label, Members: make([]topicMemberJSON, 0, len(members))}
+	for _, m := range members {
+		item := topicMemberJSON{ArtifactID: m.ArtifactID, Score: m.Score}
+		if a, err := s.deps.Store.Artifacts.GetLive(ctx, m.ArtifactID); err == nil {
+			item.Title = a.Title
+			if a.CanonicalURL != nil {
+				item.URL = *a.CanonicalURL
+			}
+		}
+		out.Members = append(out.Members, item)
+	}
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 type claimJSON struct {
