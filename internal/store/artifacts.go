@@ -19,31 +19,68 @@ const artifactSelect = `SELECT ` + artifactColNames + ` FROM artifacts`
 
 // UpsertByCanonical inserts the artifact, or — when a live row already has the
 // same canonical URL — bumps its last_seen_at/updated_at and returns it. This is
-// the one-artifact-many-encounters keystone (Principle 1), atomic in a single
-// statement so concurrent callers cannot create a duplicate.
+// the one-artifact-many-encounters keystone (Principle 1).
 //
-// A nil CanonicalURL never conflicts, so it always inserts. The partial unique
-// index is scoped to live rows, so a tombstoned URL is free for a new artifact
-// (a re-sighting after soft-delete is a new artifact, not a resurrection).
-// Caller-supplied type/privacy/lifecycle/status/score are honored on insert;
-// on conflict only last_seen_at/updated_at change (a re-sighting must not
-// clobber an existing artifact's enriched fields).
+// Dedup is application-level (find-the-live-row-then-insert), not a DB unique
+// constraint: cr-sqlite (§8.16) forbids non-primary-key unique indexes on
+// replicated tables, because uniqueness can't be enforced across offline replicas.
+// So a cross-replica duplicate may transiently exist and is reconciled by the
+// same_as merge sweep, not prevented here. MUST run inside a Tx: the immediate
+// transaction serializes the find and the insert so a single replica never makes a
+// duplicate (the ingest path wraps it). A nil CanonicalURL never dedups (always
+// inserts). The find is scoped to live rows, so a tombstoned URL is free for a new
+// artifact (a re-sighting after soft-delete is a new artifact). A re-sighting only
+// touches last_seen_at/updated_at — never an existing artifact's enriched fields.
 func (r *ArtifactRepo) UpsertByCanonical(ctx context.Context, a *Artifact) (*Artifact, error) {
-	return r.upsert(ctx, a, `ON CONFLICT(canonical_url) WHERE canonical_url IS NOT NULL AND deleted_at IS NULL`)
+	return r.upsert(ctx, a, "canonical_url", a.CanonicalURL)
 }
 
 // UpsertByContentHash is the content-fingerprint dedup path (§8.2): the same
-// content provided as a body, or (Phase 2) fetched from different URLs, collapses
-// to one artifact. ContentHash must be set. URL artifacts carry a NULL
-// content_hash until fetched, so the two upsert paths never collide. Same
-// insert/conflict semantics as UpsertByCanonical.
+// content provided as a body, or fetched from different URLs, collapses to one
+// artifact. ContentHash must be set. URL artifacts carry a NULL content_hash until
+// fetched, so the two upsert paths never collide. Same find-then-insert semantics
+// as UpsertByCanonical.
 func (r *ArtifactRepo) UpsertByContentHash(ctx context.Context, a *Artifact) (*Artifact, error) {
-	return r.upsert(ctx, a, `ON CONFLICT(content_hash) WHERE content_hash IS NOT NULL AND deleted_at IS NULL`)
+	return r.upsert(ctx, a, "content_hash", a.ContentHash)
 }
 
-// upsert performs the shared insert-or-touch, differing only by the ON CONFLICT
-// target. conflict is a trusted constant (not user input).
-func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, conflict string) (*Artifact, error) {
+// upsert finds a live artifact already carrying the dedup key and touches it, or
+// inserts a new one. keyCol is a trusted constant column name ("canonical_url" or
+// "content_hash"), not user input.
+func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, keyCol string, key *string) (*Artifact, error) {
+	if key != nil {
+		existing, err := r.findLiveByKey(ctx, keyCol, *key)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			ts := now()
+			if _, err := r.q.ExecContext(ctx,
+				`UPDATE artifacts SET last_seen_at = ?, updated_at = ? WHERE id = ?`, ts, ts, existing.ID); err != nil {
+				return nil, fmt.Errorf("touch artifact %q: %w", existing.ID, err)
+			}
+			existing.LastSeenAt, existing.UpdatedAt = ts, ts
+			return existing, nil
+		}
+	}
+	return r.insert(ctx, a)
+}
+
+// findLiveByKey returns the live artifact carrying key in keyCol, or nil.
+func (r *ArtifactRepo) findLiveByKey(ctx context.Context, keyCol, key string) (*Artifact, error) {
+	a, err := scanArtifact(r.q.QueryRowContext(ctx,
+		artifactSelect+` WHERE `+keyCol+` = ? AND deleted_at IS NULL LIMIT 1`, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find artifact by %s: %w", keyCol, err)
+	}
+	return a, nil
+}
+
+// insert writes a new artifact (applying defaults) and indexes it.
+func (r *ArtifactRepo) insert(ctx context.Context, a *Artifact) (*Artifact, error) {
 	if a.ID == "" {
 		a.ID = NewID()
 	}
@@ -69,8 +106,6 @@ func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, conflict string)
 			privacy_tier, lifecycle_tier, status, relevance_score,
 			first_seen_at, last_seen_at, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 `+conflict+`
-		 DO UPDATE SET last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at
 		 RETURNING `+artifactColNames,
 		a.ID, a.Type, a.CanonicalURL, a.ContentHash, a.Title, a.BodyMarkdown,
 		a.PrivacyTier, a.LifecycleTier, a.Status, a.RelevanceScore,
@@ -78,16 +113,10 @@ func (r *ArtifactRepo) upsert(ctx context.Context, a *Artifact, conflict string)
 
 	got, err := scanArtifact(row)
 	if err != nil {
-		return nil, fmt.Errorf("upsert artifact: %w", err)
+		return nil, fmt.Errorf("insert artifact: %w", err)
 	}
-	// Only index on a fresh insert. The ON CONFLICT touch bumps last_seen_at/
-	// updated_at and never changes title/body, so re-indexing it would rewrite an
-	// identical FTS row — and re-sighting is the hot path (Principle 1). The
-	// insert is the only case where created_at == updated_at.
-	if got.CreatedAt == got.UpdatedAt {
-		if err := r.reindexFTS(ctx, got.ID); err != nil {
-			return nil, err
-		}
+	if err := r.reindexFTS(ctx, got.ID); err != nil {
+		return nil, err
 	}
 	return got, nil
 }

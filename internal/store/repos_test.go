@@ -362,6 +362,9 @@ func TestArtifact_ConcurrentUpsert_NoDuplicates(t *testing.T) {
 	ctx := context.Background()
 	url := "https://example.com/race"
 
+	// App-level dedup (the find-then-insert upsert) is atomic only inside a Tx, the
+	// way the ingest path uses it — the immediate transaction serializes the
+	// find+insert so concurrent callers still collapse to one artifact.
 	const n = 20
 	var wg sync.WaitGroup
 	errs := make([]error, n)
@@ -369,7 +372,10 @@ func TestArtifact_ConcurrentUpsert_NoDuplicates(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = st.Artifacts.UpsertByCanonical(ctx, &Artifact{Type: "webpage", CanonicalURL: &url})
+			errs[i] = st.Tx(ctx, func(tx *Store) error {
+				_, err := tx.Artifacts.UpsertByCanonical(ctx, &Artifact{Type: "webpage", CanonicalURL: &url})
+				return err
+			})
 		}(i)
 	}
 	wg.Wait()
