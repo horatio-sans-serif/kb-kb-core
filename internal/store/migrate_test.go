@@ -40,6 +40,27 @@ func TestMigrate_FreshDB(t *testing.T) {
 	}
 }
 
+func TestOpenWithDriver(t *testing.T) {
+	// The default driver name works (Open delegates to it) and migrates.
+	path := filepath.Join(t.TempDir(), "kb.db")
+	db, err := OpenWithDriver(path, "sqlite3")
+	if err != nil {
+		t.Fatalf("OpenWithDriver(sqlite3): %v", err)
+	}
+	defer db.Close()
+	if _, err := Migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if !tableExists(t, db, "artifacts") {
+		t.Error("artifacts missing after OpenWithDriver+Migrate")
+	}
+
+	// An unregistered driver fails at open.
+	if _, err := OpenWithDriver(filepath.Join(t.TempDir(), "x.db"), "no_such_driver"); err == nil {
+		t.Error("OpenWithDriver with an unregistered driver should error")
+	}
+}
+
 func TestMigrate_Idempotent(t *testing.T) {
 	db := openTemp(t)
 

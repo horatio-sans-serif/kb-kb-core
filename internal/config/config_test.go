@@ -40,6 +40,40 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 }
 
+func TestConfig_SyncOptions(t *testing.T) {
+	cfg, err := Load(envFunc(map[string]string{
+		"KB_DB":            "/tmp/kb.db",
+		"KB_API_TOKEN":     "0123456789abcdef0123456789abcdef",
+		"KB_CRSQLITE_PATH": "/opt/crsqlite.dylib",
+		"KB_SYNC_PEERS":    "http://host-a:8087; http://host-b:8087",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CRSqlitePath != "/opt/crsqlite.dylib" {
+		t.Errorf("CRSqlitePath = %q, want the configured path", cfg.CRSqlitePath)
+	}
+	if len(cfg.SyncPeers) != 2 || cfg.SyncPeers[0] != "http://host-a:8087" || cfg.SyncPeers[1] != "http://host-b:8087" {
+		t.Errorf("SyncPeers = %v, want the two trimmed peer URLs", cfg.SyncPeers)
+	}
+}
+
+func TestConfig_SyncDefaultsOff(t *testing.T) {
+	cfg, err := Load(envFunc(map[string]string{
+		"KB_DB":        "/tmp/kb.db",
+		"KB_API_TOKEN": "0123456789abcdef0123456789abcdef",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CRSqlitePath != "" {
+		t.Errorf("CRSqlitePath = %q, want empty (single-node) by default", cfg.CRSqlitePath)
+	}
+	if len(cfg.SyncPeers) != 0 {
+		t.Errorf("SyncPeers = %v, want none by default", cfg.SyncPeers)
+	}
+}
+
 func TestConfig_RenderDirDefaultsBesideDB(t *testing.T) {
 	cfg, err := Load(envFunc(map[string]string{
 		"KB_DB":        "/var/lib/kb/kb.db",

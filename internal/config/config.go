@@ -23,6 +23,8 @@ type Config struct {
 	Interests       []string // KB_INTERESTS (semicolon-separated phrases for the relevance profile)
 	OllamaIsLocal   bool     // computed: true when OllamaURL is a loopback endpoint
 	RenderDir       string   // KB_RENDER_DIR (default: a "renders" dir beside the DB)
+	CRSqlitePath    string   // KB_CRSQLITE_PATH (path to the cr-sqlite extension; empty = single-node)
+	SyncPeers       []string // KB_SYNC_PEERS (semicolon-separated peer base URLs, e.g. http://host:8087)
 }
 
 // Load reads configuration via getenv (pass os.Getenv in production). It returns
@@ -40,6 +42,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		EmbedModel:      orDefault(getenv("KB_EMBED_MODEL"), "nomic-embed-text"),
 		Interests:       splitList(getenv("KB_INTERESTS")),
 		RenderDir:       getenv("KB_RENDER_DIR"),
+		CRSqlitePath:    getenv("KB_CRSQLITE_PATH"),
+		SyncPeers:       splitList(getenv("KB_SYNC_PEERS")),
 	}
 	// Renders default to a directory beside the database so output files live with
 	// the data they derive from. Use an absolute KB_DB in production: a relative

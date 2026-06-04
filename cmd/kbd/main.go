@@ -16,8 +16,11 @@ import (
 	"syscall"
 	"time"
 
+	"database/sql"
+
 	"kb/internal/api"
 	"kb/internal/config"
+	"kb/internal/crsync"
 	"kb/internal/decay"
 	"kb/internal/enrich"
 	"kb/internal/events"
@@ -110,17 +113,56 @@ func logLevel(s string) slog.Level {
 	}
 }
 
+// openWriteDB opens the single-writer pool. When a cr-sqlite extension is configured
+// and loads (the daemon was built with the `crsqlite` tag), the pool uses the
+// replication driver and the second return is true; otherwise it falls back to the
+// plain driver and runs single-node. A configured-but-unavailable extension is a
+// warning, not a failure, so the daemon still serves.
+func openWriteDB(cfg *config.Config, logger *slog.Logger) (*sql.DB, bool, error) {
+	driver, err := crsync.Register(cfg.CRSqlitePath)
+	if err != nil {
+		if cfg.CRSqlitePath != "" {
+			logger.Warn("cr-sqlite configured but unavailable; running single-node",
+				"path", cfg.CRSqlitePath, "err", err)
+		}
+		db, oerr := store.Open(cfg.DBPath)
+		return db, false, oerr
+	}
+	db, oerr := store.OpenWithDriver(cfg.DBPath, driver)
+	if oerr != nil {
+		return nil, false, oerr
+	}
+	return db, true, nil
+}
+
 // serve assembles the daemon over an already-bound listener (injected so it is
 // testable) and runs until ctx is cancelled, then shuts the HTTP server down
 // gracefully.
 func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slog.Logger) error {
-	db, err := store.Open(cfg.DBPath)
+	db, syncEnabled, err := openWriteDB(cfg, logger)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	if syncEnabled {
+		// crsql_finalize must run before the pool closes; deferred after Close so it
+		// runs first (LIFO).
+		defer func() {
+			if ferr := crsync.Finalize(context.Background(), db); ferr != nil {
+				logger.Warn("cr-sqlite finalize", "err", ferr)
+			}
+		}()
+	}
 	if _, err := store.Migrate(db); err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+	if syncEnabled {
+		// Convert the synced tables to CRRs (idempotent; safe every startup) so writes
+		// produce a changeset peers can merge.
+		if err := crsync.AsCRR(ctx, db, crsync.SyncedTables()); err != nil {
+			return fmt.Errorf("cr-sqlite convert tables: %w", err)
+		}
+		logger.Info("multi-device sync enabled", "peers", len(cfg.SyncPeers))
 	}
 
 	rdb, err := store.OpenReadOnly(cfg.DBPath)

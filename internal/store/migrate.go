@@ -21,7 +21,15 @@ import (
 // journaling, foreign-key enforcement, and immediate-locking transactions
 // applied to every pooled connection via the DSN.
 func Open(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", dsn(path))
+	return OpenWithDriver(path, "sqlite3")
+}
+
+// OpenWithDriver is Open but using a named, already-registered database/sql driver
+// instead of the default "sqlite3". The daemon uses it with the cr-sqlite driver
+// (crsync.Register) so the write pool loads the replication extension on every
+// connection while keeping the standard DSN pragmas and single-writer pool.
+func OpenWithDriver(path, driver string) (*sql.DB, error) {
+	db, err := sql.Open(driver, dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
