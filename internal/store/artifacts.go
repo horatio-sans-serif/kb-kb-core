@@ -354,6 +354,9 @@ func (r *ArtifactRepo) Patch(ctx context.Context, id string, p ArtifactPatch) er
 	if p.RelevanceScore != nil {
 		sets, args = append(sets, "relevance_score = ?"), append(args, *p.RelevanceScore)
 	}
+	if p.LifecycleTier != nil {
+		sets, args = append(sets, "lifecycle_tier = ?"), append(args, *p.LifecycleTier)
+	}
 	if len(sets) == 0 {
 		return nil
 	}

@@ -24,6 +24,7 @@ import (
 	"kb/internal/fetch"
 	"kb/internal/ingest"
 	"kb/internal/jobs"
+	"kb/internal/lifecycle"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
 	"kb/internal/rag"
@@ -52,6 +53,10 @@ const decayInterval = 6 * time.Hour
 // clusterInterval is how often the topic-clustering sweep groups newly-embedded
 // artifacts into topics.
 const clusterInterval = 5 * time.Minute
+
+// lifecycleInterval is how often the lifecycle sweep transitions artifacts
+// active -> archive -> purge.
+const lifecycleInterval = 6 * time.Hour
 
 // sourcePollInterval is how often the scheduler checks for PULL sources due to
 // refresh (each source's own schedule decides whether it actually fetches).
@@ -246,6 +251,32 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 				return
 			case <-t.C:
 				runCluster()
+			}
+		}
+	}()
+
+	// Lifecycle GC: periodically transition artifacts active -> archive -> purge by
+	// relevance and age (§8.12). Runs alongside the decay sweep, which keeps the
+	// scores it acts on fresh.
+	lifeSweeper := lifecycle.New(st)
+	runLifecycle := func() {
+		switch stats, err := lifeSweeper.Sweep(ctx); {
+		case err != nil && ctx.Err() == nil:
+			logger.Warn("lifecycle sweep", "err", err)
+		case stats.Archived > 0 || stats.Purged > 0:
+			logger.Info("lifecycle sweep", "archived", stats.Archived, "purged", stats.Purged, "reactivated", stats.Reactivated)
+		}
+	}
+	go func() {
+		runLifecycle()
+		t := time.NewTicker(lifecycleInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runLifecycle()
 			}
 		}
 	}()

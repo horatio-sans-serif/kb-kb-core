@@ -1367,3 +1367,28 @@ leader-clustering sweep, and the query API.
 **Deferred:** LLM-derived topic labels (vs the founding artifact's title);
 shares_topic graph edges between co-topic artifacts; topic-scoped conflict
 comparison; topic drift / re-clustering.
+
+---
+
+# Phase 11 — Lifecycle & GC (§8.12)
+
+Transition artifacts active -> archive -> purge by relevance and age (relevance
+decay itself is Phase 4.3). The lifecycle_tier column exists from Phase 0.
+
+## Stage 1: Lifecycle-transition sweep
+
+**Status: Complete.** `lifecycle.Sweeper` classifies every live, scored artifact
+by relevance and age-since-recency-anchor (so engagement, which resets the anchor,
+protects an artifact) and applies any tier change as a periodic sweep:
+
+- **`classify`** (pure): below the purge score AND old enough -> purged; below the
+  archive score AND old enough -> archive; else active. Default policy: archive
+  after 30d below 0.2, purge after 180d below 0.05.
+- A purge tombstones the artifact and records `lifecycle_tier=purged` (tier
+  patched while live, then soft-delete, in one tx); other transitions patch the
+  tier. Unscored artifacts are exempt; per-artifact failures are collected.
+- `kb.ArtifactPatch` gained `LifecycleTier`; wired into the daemon on a 6h ticker.
+
+**Next:** Stage 2 — per-source storage budgets (cap a noisy feed). Stage 3 —
+compaction (hard-delete tombstoned artifacts + cascade derived rows past a grace
+period) + a lifecycle status endpoint.

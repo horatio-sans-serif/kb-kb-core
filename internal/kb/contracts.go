@@ -39,6 +39,7 @@ type ArtifactPatch struct {
 	ContentHash    *string
 	Status         *ArtifactStatus
 	RelevanceScore *float64
+	LifecycleTier  *LifecycleTier
 }
 
 // GraphTx is the subset of knowledge-graph writes an enricher applies inside the
