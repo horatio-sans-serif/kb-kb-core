@@ -1418,3 +1418,27 @@ status endpoint. Relevance decay is Phase 4.3.
 
 **Deferred:** physical compaction past the sync horizon; review prompts for
 archive-tier items; byte-based (not count-based) storage budgets.
+
+---
+
+# Phase 12 — Source health monitoring (§8.15)
+
+Per-source fetch health: consecutive-failure tracking + alerting, and a derived
+status surfaced to the operator. Builds on the Phase 5 scheduler, which already
+records a health snapshot per poll.
+
+## Stage 1: Consecutive-failure tracking + alerting
+
+**Status: Complete.** The scheduler now derives each poll's health from the prior
+snapshot rather than overwriting it:
+
+- **`kb.Health`** gained `ConsecutiveFailures` (incremented on a failed poll, reset
+  to 0 on any success) and `LastSuccessAt` (carried across failures, so "failing
+  since" is derivable).
+- **`Scheduler.nextHealth`** computes the new snapshot from the prior; a
+  `source.failed` event fires once, when the count first reaches
+  `failureAlertThreshold` (3), so a persistently-broken feed doesn't spam. The
+  scheduler took a `*events.Bus`.
+
+**Next:** Stage 2 — derived health status + next-fetch time on the source API
+(healthy / degraded / failing).

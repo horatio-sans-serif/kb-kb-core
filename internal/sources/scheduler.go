@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"kb/internal/canon"
+	"kb/internal/events"
 	"kb/internal/ingest"
 	"kb/internal/kb"
 	"kb/internal/store"
@@ -16,22 +17,29 @@ import (
 // defaultTTL is how often a PULL source refreshes when its schedule says nothing.
 const defaultTTL = time.Hour
 
+// failureAlertThreshold is how many consecutive failed polls raise a
+// source.failed alert. The event fires once, when the count first reaches the
+// threshold, so a persistently-broken source does not spam every poll (§8.15).
+const failureAlertThreshold = 3
+
 // Scheduler polls due PULL sources via their registered connectors and ingests the
 // new items through the shared ingest path (design §8.1).
 type Scheduler struct {
 	st       *store.Store
 	reg      *Registry
 	ingester *ingest.Ingester
+	bus      *events.Bus
 	now      func() time.Time
 	logger   *slog.Logger
 }
 
-// NewScheduler builds a scheduler. logger defaults to slog.Default().
-func NewScheduler(st *store.Store, reg *Registry, ingester *ingest.Ingester, logger *slog.Logger) *Scheduler {
+// NewScheduler builds a scheduler. logger defaults to slog.Default(); bus may be
+// nil (no health alerts).
+func NewScheduler(st *store.Store, reg *Registry, ingester *ingest.Ingester, bus *events.Bus, logger *slog.Logger) *Scheduler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Scheduler{st: st, reg: reg, ingester: ingester, now: time.Now, logger: logger}
+	return &Scheduler{st: st, reg: reg, ingester: ingester, bus: bus, now: time.Now, logger: logger}
 }
 
 // Run polls on a ticker until ctx is cancelled. A tick error is logged (a wedged
@@ -95,12 +103,19 @@ func (s *Scheduler) poll(ctx context.Context, conn kb.SourceConnector, src *kb.S
 	}
 	items, newCursor, ferr := conn.Fetch(ctx, src, since)
 	ts := store.FormatTime(now)
-	health := healthJSON(kb.Health{OK: ferr == nil, Detail: errString(ferr)})
+	h := s.nextHealth(src.Health, ferr, ts)
+	health := healthJSON(h)
 
 	if ferr != nil {
 		// Keep the old cursor; record the failed attempt and health.
 		if err := s.st.Sources.UpdateFetchState(ctx, src.ID, src.Cursor, &ts, &health); err != nil {
 			return 0, err
+		}
+		// Alert once, when the failures first reach the threshold.
+		if h.ConsecutiveFailures == failureAlertThreshold && s.bus != nil {
+			s.bus.Publish(events.New(events.SourceFailed, map[string]string{
+				"source_id": src.ID, "connector": src.Connector, "detail": h.Detail,
+			}))
 		}
 		return 0, ferr
 	}
@@ -191,6 +206,26 @@ func errString(err error) string {
 		s = s[:maxHealthDetail]
 	}
 	return s
+}
+
+// nextHealth derives the new health snapshot from the prior one and this poll's
+// outcome: a success resets the consecutive-failure count and stamps the success
+// time; a failure increments the count and carries the prior success time forward
+// (so "failing since" is derivable).
+func (s *Scheduler) nextHealth(prior *string, ferr error, ts string) kb.Health {
+	var prev kb.Health
+	if prior != nil && *prior != "" {
+		_ = json.Unmarshal([]byte(*prior), &prev) // a corrupt prior degrades to zero value
+	}
+	if ferr == nil {
+		return kb.Health{OK: true, LastSuccessAt: ts}
+	}
+	return kb.Health{
+		OK:                  false,
+		Detail:              errString(ferr),
+		ConsecutiveFailures: prev.ConsecutiveFailures + 1,
+		LastSuccessAt:       prev.LastSuccessAt,
+	}
 }
 
 func healthJSON(h kb.Health) string {

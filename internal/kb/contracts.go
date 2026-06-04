@@ -110,11 +110,15 @@ type RawItem struct {
 
 // Health is a source's health snapshot (design §8.15). It is persisted as JSON
 // (the source scheduler) and surfaced by the health endpoint, so the keys are
-// stable lowercase.
+// stable lowercase. ConsecutiveFailures counts polls that have failed in a row
+// (reset to 0 on any success); LastSuccessAt is the last OK poll's timestamp,
+// carried across failures so the dashboard can show "failing since".
 type Health struct {
-	OK        bool   `json:"ok"`
-	Detail    string `json:"detail,omitempty"`
-	AuthValid bool   `json:"auth_valid,omitempty"`
+	OK                  bool   `json:"ok"`
+	Detail              string `json:"detail,omitempty"`
+	AuthValid           bool   `json:"auth_valid,omitempty"`
+	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
+	LastSuccessAt       string `json:"last_success_at,omitempty"`
 }
 
 // SourceConnector is the behavioral contract a connector implements (design §7 /

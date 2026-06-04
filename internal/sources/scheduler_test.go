@@ -36,7 +36,8 @@ func newScheduler(t *testing.T, conn kb.SourceConnector) (*store.Store, *Schedul
 	st := storetest.New(t)
 	reg := NewRegistry()
 	reg.Register("stub", conn)
-	return st, NewScheduler(st, reg, ingest.New(st, nil, nil, events.NewBus()), nil)
+	bus := events.NewBus()
+	return st, NewScheduler(st, reg, ingest.New(st, nil, nil, bus), bus, nil)
 }
 
 func TestScheduler_PollsAndIngests(t *testing.T) {
@@ -125,6 +126,59 @@ func TestScheduler_RecordsHealthOnFetchError(t *testing.T) {
 		t.Error("last_fetched_at should record the failed attempt")
 	}
 }
+
+func TestScheduler_TracksConsecutiveFailuresAndAlerts(t *testing.T) {
+	ctx := context.Background()
+	conn := &stubConnector{err: errors.New("feed unreachable")}
+	st := storetest.New(t)
+	reg := NewRegistry()
+	reg.Register("stub", conn)
+	bus := events.NewBus()
+	sub, cancel := bus.Subscribe()
+	defer cancel()
+	sch := NewScheduler(st, reg, ingest.New(st, nil, nil, bus), bus, nil)
+
+	src := &store.Source{Kind: "PULL", Connector: "stub", DefaultPrivacy: "personal"}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	now := time.Now()
+	// Poll directly, re-reading the source so each poll sees the prior health.
+	for i := 1; i <= failureAlertThreshold; i++ {
+		cur, _ := st.Sources.Get(ctx, src.ID)
+		if _, err := sch.poll(ctx, conn, cur, now); err == nil {
+			t.Fatalf("poll %d: expected the fetch error", i)
+		}
+		got, _ := st.Sources.Get(ctx, src.ID)
+		if !strings.Contains(*got.Health, `"consecutive_failures":`+itoa(i)) {
+			t.Errorf("after failure %d, health = %s, want consecutive_failures %d", i, *got.Health, i)
+		}
+	}
+
+	// source.failed published exactly once, at the threshold.
+	select {
+	case e := <-sub:
+		if e.Type != events.SourceFailed {
+			t.Errorf("event = %q, want source.failed", e.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no source.failed event after reaching the failure threshold")
+	}
+
+	// A success resets the consecutive-failure count.
+	conn.err = nil
+	cur, _ := st.Sources.Get(ctx, src.ID)
+	if _, err := sch.poll(ctx, conn, cur, now); err != nil {
+		t.Fatalf("recovery poll: %v", err)
+	}
+	got, _ := st.Sources.Get(ctx, src.ID)
+	if !strings.Contains(*got.Health, `"ok":true`) || strings.Contains(*got.Health, `"consecutive_failures"`) {
+		t.Errorf("after recovery, health = %s, want ok:true and no consecutive_failures", *got.Health)
+	}
+}
+
+func itoa(n int) string { return string(rune('0' + n)) }
 
 func TestScheduler_BadURLFallsBackToNote(t *testing.T) {
 	ctx := context.Background()

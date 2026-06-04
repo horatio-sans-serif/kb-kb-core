@@ -304,7 +304,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	registry := sources.NewRegistry()
 	registry.Register("rss", rss.New(ssrf.HTTPClient(30*time.Second)))
 	ingester := ingest.New(st, enrichment, rescore, bus)
-	scheduler := sources.NewScheduler(st, registry, ingester, logger)
+	scheduler := sources.NewScheduler(st, registry, ingester, bus, logger)
 	go scheduler.Run(ctx, sourcePollInterval)
 
 	// Retrieval: hybrid search, and RAG question-answering grounded on it. Both
