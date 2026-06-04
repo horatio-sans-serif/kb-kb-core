@@ -434,8 +434,10 @@ type updateSourceRequest struct {
 	Config         json.RawMessage `json:"config,omitempty"`
 	Schedule       json.RawMessage `json:"schedule,omitempty"`
 	DefaultPrivacy string          `json:"default_privacy,omitempty"`
-	StorageBudget  *int            `json:"storage_budget,omitempty"`
-	Enabled        *bool           `json:"enabled,omitempty"`
+	// StorageBudget is a RawMessage so the three states are distinguishable: absent
+	// (unchanged), JSON null (clear to unlimited), a non-negative integer (set).
+	StorageBudget json.RawMessage `json:"storage_budget,omitempty"`
+	Enabled       *bool           `json:"enabled,omitempty"`
 }
 
 // handleUpdateSource applies a partial update to a source's mutable fields (config,
@@ -468,11 +470,16 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 	case req.DefaultPrivacy != "" && !validPrivacy(req.DefaultPrivacy):
 		http.Error(w, "invalid default_privacy", http.StatusBadRequest)
 		return
-	case req.StorageBudget != nil && *req.StorageBudget < 0:
-		http.Error(w, "storage_budget must be non-negative", http.StatusBadRequest)
+	}
+	budget, clearBudget, ok := parseBudget(req.StorageBudget)
+	if !ok {
+		http.Error(w, "storage_budget must be a non-negative integer or null", http.StatusBadRequest)
 		return
 	}
 
+	// Get then Update is not one transaction: two concurrent PATCHes to the same
+	// source can lost-update (last writer wins). Acceptable for a single-user local
+	// daemon; the single-writer pool still serializes the writes themselves.
 	ctx := r.Context()
 	src, err := s.deps.Store.Sources.Get(ctx, id)
 	if err != nil {
@@ -481,6 +488,12 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.serverError(w, "get source", err)
+		return
+	}
+	// Don't re-enable a source whose connector is no longer registered — that is the
+	// inert dead row handleCreateSource refuses to create.
+	if req.Enabled != nil && *req.Enabled && s.deps.Connectors != nil && !s.deps.Connectors.Has(src.Connector) {
+		http.Error(w, "cannot enable a source whose connector is not registered", http.StatusBadRequest)
 		return
 	}
 	if len(req.Config) > 0 {
@@ -493,8 +506,10 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 	if req.DefaultPrivacy != "" {
 		src.DefaultPrivacy = kb.PrivacyTier(req.DefaultPrivacy)
 	}
-	if req.StorageBudget != nil {
-		src.StorageBudget = req.StorageBudget
+	if clearBudget {
+		src.StorageBudget = nil
+	} else if budget != nil {
+		src.StorageBudget = budget
 	}
 	if req.Enabled != nil {
 		src.Enabled = *req.Enabled
@@ -504,6 +519,23 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, toSourceJSON(src))
+}
+
+// parseBudget interprets the storage_budget field: absent (nil raw) → unchanged
+// (nil budget, clear false); JSON null → clear true; a non-negative integer → set.
+// ok is false on a malformed or negative value.
+func parseBudget(raw json.RawMessage) (budget *int, clear, ok bool) {
+	if len(raw) == 0 {
+		return nil, false, true
+	}
+	if string(raw) == "null" {
+		return nil, true, true
+	}
+	var b int
+	if err := json.Unmarshal(raw, &b); err != nil || b < 0 {
+		return nil, false, false
+	}
+	return &b, false, true
 }
 
 // handleDeleteSource disables a source — the soft delete for a source (the row and

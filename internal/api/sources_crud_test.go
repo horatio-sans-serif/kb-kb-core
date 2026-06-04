@@ -47,6 +47,66 @@ func TestSources_Update(t *testing.T) {
 	}
 }
 
+func TestSources_UpdatePreservesOmittedFields(t *testing.T) {
+	// Update writes ALL mutable columns; the Get-first pattern must preserve any
+	// field the request doesn't set.
+	st, h := crudServer(t)
+	id := mkSource(t, st) // config {"url":"https://e.com/feed"}
+
+	rec := doPatch(h, "/sources/"+id, `{"default_privacy":"public"}`, "tok")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	got, _ := st.Sources.Get(context.Background(), id)
+	if got.Config != `{"url":"https://e.com/feed"}` {
+		t.Errorf("config should survive a privacy-only update, got %q", got.Config)
+	}
+	if got.Connector != "rss" || got.SourceWeight != 1.0 {
+		t.Errorf("immutable/untouched fields changed: %+v", got)
+	}
+}
+
+func TestSources_BudgetSetAndClear(t *testing.T) {
+	st, h := crudServer(t)
+	id := mkSource(t, st)
+
+	if rec := doPatch(h, "/sources/"+id, `{"storage_budget":40}`, "tok"); rec.Code != http.StatusOK {
+		t.Fatalf("set budget: %d", rec.Code)
+	}
+	if got, _ := st.Sources.Get(context.Background(), id); got.StorageBudget == nil || *got.StorageBudget != 40 {
+		t.Fatalf("budget not set: %+v", got.StorageBudget)
+	}
+	// Omitting it leaves it set.
+	_ = doPatch(h, "/sources/"+id, `{"default_privacy":"public"}`, "tok")
+	if got, _ := st.Sources.Get(context.Background(), id); got.StorageBudget == nil {
+		t.Error("omitted budget should be unchanged, got cleared")
+	}
+	// Explicit null clears it (back to unlimited).
+	if rec := doPatch(h, "/sources/"+id, `{"storage_budget":null}`, "tok"); rec.Code != http.StatusOK {
+		t.Fatalf("clear budget: %d", rec.Code)
+	}
+	if got, _ := st.Sources.Get(context.Background(), id); got.StorageBudget != nil {
+		t.Errorf("explicit null should clear the budget, got %v", got.StorageBudget)
+	}
+	// A negative budget is rejected.
+	if rec := doPatch(h, "/sources/"+id, `{"storage_budget":-5}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("negative budget = %d, want 400", rec.Code)
+	}
+}
+
+func TestSources_EnableUnregisteredConnectorIs400(t *testing.T) {
+	ctx := context.Background()
+	st, h := crudServer(t) // registry has only "rss"
+	// A source whose connector is not registered (created directly), disabled.
+	src := &store.Source{Kind: "PULL", Connector: "defunct"}
+	_ = st.Sources.Create(ctx, src)
+	_ = st.Sources.SetEnabled(ctx, src.ID, false)
+
+	if rec := doPatch(h, "/sources/"+src.ID, `{"enabled":true}`, "tok"); rec.Code != http.StatusBadRequest {
+		t.Errorf("re-enabling an unregistered-connector source = %d, want 400", rec.Code)
+	}
+}
+
 func TestSources_UpdateInvalidPrivacy(t *testing.T) {
 	st, h := crudServer(t)
 	id := mkSource(t, st)
