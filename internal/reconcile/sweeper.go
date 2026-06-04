@@ -62,6 +62,8 @@ func (s *Sweeper) Sweep(ctx context.Context) (int, error) {
 		return total, errors.Join(errs...)
 	}
 
+	en, eerr := s.st.Graph.ReconcileDuplicates(ctx)
+	collect("reconcile entities", en, eerr)
 	cn, cerr := s.st.Claims.ReconcileDuplicates(ctx)
 	collect("reconcile claims", cn, cerr)
 	xn, xerr := s.st.Conflicts.DedupDuplicates(ctx)

@@ -19,7 +19,7 @@ type fakeEnricher struct {
 	okFn      func(kb.PrivacyTier) bool
 	onEnrich  func(*kb.Artifact)
 	enrichErr error
-	extra     []kb.Enrichment // appended to the result (e.g. a bad-FK row to force a tx rollback)
+	extra     []kb.Enrichment // appended to the result (e.g. a duplicate-PK row to force a tx rollback)
 }
 
 func (f *fakeEnricher) Name() string        { return f.name }
@@ -251,10 +251,14 @@ func TestPipeline_HandlerCompletesAtomically(t *testing.T) {
 func TestPipeline_HandlerRollsBackOnWriteError(t *testing.T) {
 	st := storetest.New(t)
 	ctx := context.Background()
-	// The enricher returns a valid row plus one with a bogus artifact_id, which
-	// violates the enrichments FK — the second Create fails mid-transaction.
+	// The enricher returns a valid row plus two extras sharing one id; the second
+	// extra collides on the enrichments primary key, failing the Create
+	// mid-transaction. (Synced tables no longer enforce foreign keys — §8.16 — so a
+	// bad artifact_id would not error; a duplicate PK is the FK-independent way to
+	// force a write failure.)
 	e := &fakeEnricher{name: "a", extra: []kb.Enrichment{
-		{ArtifactID: "01NONEXISTENT", Kind: "bad", Payload: "{}", Model: "test", PromptVersion: "v1"},
+		{ID: "01DUPLICATEPK0000000000000", ArtifactID: "", Kind: "x", Payload: "{}", Model: "test", PromptVersion: "v1"},
+		{ID: "01DUPLICATEPK0000000000000", ArtifactID: "", Kind: "y", Payload: "{}", Model: "test", PromptVersion: "v1"},
 	}}
 	p := New()
 	p.Register(e)

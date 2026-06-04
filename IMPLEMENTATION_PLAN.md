@@ -1627,10 +1627,12 @@ re-architecture surfaced and these were realized —
 
 ### Stage 2c: cr-sqlite-compatible synced schema
 
-Empirical probe (the real extension over the migrated schema) found three classes
+Empirical probe (the real extension over the migrated schema) found four classes
 crsql_as_crr rejects: (A) nullable `TEXT PRIMARY KEY` on 12 tables, (B) non-PK
 unique indexes on entities/links/claims/conflicts, (C) checked foreign keys on
-every synced table (cr-sqlite inspects the schema, not the runtime pragma).
+every synced table (cr-sqlite inspects the schema, not the runtime pragma), and
+(D) a NON-NULL column without a DEFAULT (any column except the PK), which breaks
+cross-version schema compatibility.
 
 **Stage 2c-1 (links/claims/conflicts dedup): Complete.** Migration 0012 drops the
 three droppable unique indexes (idx_links_unique, idx_claims_artifact_statement,
@@ -1645,10 +1647,26 @@ dropping self-conflicts). Sweeper.Sweep now orchestrates all in dependency order
 2c-1 the probe shows links/claims/conflicts failing only on class A (PK), no longer
 class B.
 
-**Next: Stage 2c-2** — rebuild every synced table (NOT NULL PK; drop entities'
-UNIQUE(kind,name); drop all FK constraints, keeping the columns) via one migration
-using `PRAGMA defer_foreign_keys=ON` (settable inside the migration tx, unlike
-`foreign_keys`); move entity dedup to find-then-insert + reconcile-merge; turn the
-crsql probe into an acceptance test asserting crsql_as_crr accepts all synced
-tables. Stage 3 — peer transport (changeset-exchange HTTP over Tailscale) + daemon
-wiring behind extension availability.
+**Stage 2c-2 (cr-sqlite-compatible synced schema): Complete.** Migration 0013
+rebuilds every synced table (create -> copy -> drop -> rename) to satisfy classes
+A-D: NOT NULL primary keys; entities' UNIQUE(kind,name) dropped; all FK constraints
+dropped (columns kept); a DEFAULT on every non-PK NOT NULL column. It runs under
+`PRAGMA defer_foreign_keys=ON` (settable inside the migration tx, unlike
+`foreign_keys`), rebuilding children before parents. Local-only tables (jobs,
+audit_log, schema_migrations, FTS shadow tables) keep their FKs. UpsertEntity is now
+find-then-insert (ON CONFLICT(kind,name) no longer has an index); GraphRepo.Reconcile
+Duplicates merges duplicate entities (re-pointing artifact_entities), wired into the
+sweep. The old DB-FK-enforcement test became a regression guard for the deliberate
+absence of FKs; the pipeline rollback test forces its error with a duplicate PK
+instead of a bad FK.
+
+Acceptance: `internal/crsync/ascrr_test.go` (crsqlite-tagged) asserts the real
+extension accepts crsql_as_crr on every synced table (and rejects the local-only
+ones). `TestMigration0013_PreservesData` (default build) seeds data after 0012, then
+applies 0013 and checks the rows + the CRR-shaped schema (no FK, NOT NULL PK, no
+non-PK unique index) survive.
+
+**Next: Stage 3** — peer transport (changeset-exchange HTTP over Tailscale) + daemon
+wiring behind extension availability (config `KB_CRSQLITE_PATH`): on startup, when
+the extension loads, open via crsync, call AsCRR on the synced tables, and exchange
+changesets with peers.

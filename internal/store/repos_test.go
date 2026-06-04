@@ -625,12 +625,18 @@ func TestEnrichment_GetNotFound(t *testing.T) {
 	}
 }
 
-func TestEncounter_ForeignKeyEnforced(t *testing.T) {
+func TestEncounter_NoForeignKeyEnforcement(t *testing.T) {
 	st := newTestStore(t)
+	// Synced tables carry no CHECKED foreign keys: cr-sqlite (§8.16) forbids them,
+	// because a replica can receive a child row before its parent. So a dangling
+	// reference inserts WITHOUT a DB error — referential integrity is maintained by
+	// the application (parent-before-child writes in a Tx) and the reconcile sweep,
+	// not the engine. This guards against re-adding a FK that would break
+	// crsql_as_crr (migration 0013).
 	err := st.Encounters.Record(context.Background(),
 		&Encounter{ArtifactID: "01NOSUCH", SourceID: "01NOSUCH"})
-	if err == nil {
-		t.Error("expected a foreign-key violation for an encounter referencing a missing artifact/source")
+	if err != nil {
+		t.Errorf("encounters must not enforce a foreign key (cr-sqlite requirement), got %v", err)
 	}
 }
 

@@ -27,6 +27,11 @@ var (
 // same (kind, name) — the dedup keystone of the graph. Non-empty Aliases replace
 // the stored set; nil Aliases leave an existing set intact. Returns the canonical
 // entity id.
+//
+// Dedup is application-level (find-then-insert, atomic via withTx), not a
+// UNIQUE(kind, name) constraint, which cr-sqlite (§8.16) forbids on a replicated
+// table. A cross-replica duplicate (two devices coining the same entity offline)
+// may transiently exist and is reconciled by ReconcileDuplicates.
 func (r *GraphRepo) UpsertEntity(ctx context.Context, e *kb.Entity) (string, error) {
 	if !kb.ValidEntityKind(e.Kind) {
 		return "", fmt.Errorf("%w: %q", ErrInvalidEntityKind, e.Kind)
@@ -43,15 +48,122 @@ func (r *GraphRepo) UpsertEntity(ctx context.Context, e *kb.Entity) (string, err
 		aliases = string(b)
 	}
 	var id string
-	err := r.q.QueryRowContext(ctx,
-		`INSERT INTO entities(id, kind, name, aliases) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(kind, name) DO UPDATE SET aliases = COALESCE(excluded.aliases, entities.aliases)
-		 RETURNING id`,
-		e.ID, e.Kind, e.Name, aliases).Scan(&id)
+	err := withTx(ctx, r.q, func(q Querier) error {
+		var existing, existingAliases sql.NullString
+		err := q.QueryRowContext(ctx,
+			`SELECT id, aliases FROM entities WHERE kind = ? AND name = ? ORDER BY id LIMIT 1`,
+			e.Kind, e.Name).Scan(&existing, &existingAliases)
+		switch {
+		case err == nil:
+			// Re-mint of a known entity: keep its id, replace aliases only when new
+			// ones are supplied (COALESCE semantics of the old upsert).
+			id = existing.String
+			if aliases != nil {
+				if _, err := q.ExecContext(ctx,
+					`UPDATE entities SET aliases = ? WHERE id = ?`, aliases, id); err != nil {
+					return fmt.Errorf("update entity aliases %q: %w", id, err)
+				}
+			}
+			return nil
+		case errors.Is(err, sql.ErrNoRows):
+			id = e.ID
+			if _, err := q.ExecContext(ctx,
+				`INSERT INTO entities(id, kind, name, aliases) VALUES (?, ?, ?, ?)`,
+				e.ID, e.Kind, e.Name, aliases); err != nil {
+				return fmt.Errorf("insert entity %q/%q: %w", e.Kind, e.Name, err)
+			}
+			return nil
+		default:
+			return fmt.Errorf("find entity %q/%q: %w", e.Kind, e.Name, err)
+		}
+	})
 	if err != nil {
-		return "", fmt.Errorf("upsert entity %q/%q: %w", e.Kind, e.Name, err)
+		return "", err
 	}
 	return id, nil
+}
+
+// ReconcileDuplicates merges cross-replica duplicate entities — rows sharing
+// (kind, name) — into the lowest-id survivor (deterministic across replicas): it
+// re-points the loser's artifact_entities to the survivor (UPDATE OR IGNORE +
+// drop-leftover, since (artifact_id, entity_id) is the PK) and deletes the loser
+// entity. Returns how many losers it merged. Each merge runs in its own transaction.
+func (r *GraphRepo) ReconcileDuplicates(ctx context.Context) (int, error) {
+	groups, err := r.duplicateEntityGroups(ctx)
+	if err != nil {
+		return 0, err
+	}
+	merged := 0
+	var errs []error
+	for _, g := range groups {
+		survivor := g[0] // lowest id (groups come id-ascending)
+		for _, loser := range g[1:] {
+			err := withTx(ctx, r.q, func(q Querier) error {
+				return (&GraphRepo{q: q, rq: q}).mergeEntity(ctx, survivor, loser)
+			})
+			if err != nil {
+				errs = append(errs, fmt.Errorf("merge entity %q into %q: %w", loser, survivor, err))
+				if ctx.Err() != nil {
+					return merged, errors.Join(errs...)
+				}
+				continue
+			}
+			merged++
+		}
+	}
+	return merged, errors.Join(errs...)
+}
+
+// duplicateEntityGroups returns the id groups (2+, id-ascending) of entities sharing
+// a (kind, name). Boundaries are detected on the key columns directly.
+func (r *GraphRepo) duplicateEntityGroups(ctx context.Context) ([][]string, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT kind, name, id FROM entities
+		 WHERE (kind, name) IN (
+		   SELECT kind, name FROM entities GROUP BY kind, name HAVING COUNT(*) > 1)
+		 ORDER BY kind, name, id`)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate entity groups: %w", err)
+	}
+	defer rows.Close()
+
+	var out [][]string
+	var curKind, curName string
+	var cur []string
+	first := true
+	for rows.Next() {
+		var kind, name, id string
+		if err := rows.Scan(&kind, &name, &id); err != nil {
+			return nil, fmt.Errorf("scan entity dup row: %w", err)
+		}
+		if first || kind != curKind || name != curName {
+			if len(cur) > 1 {
+				out = append(out, cur)
+			}
+			curKind, curName, cur, first = kind, name, nil, false
+		}
+		cur = append(cur, id)
+	}
+	if len(cur) > 1 {
+		out = append(out, cur)
+	}
+	return out, rows.Err()
+}
+
+// mergeEntity folds the loser entity into the survivor; r must be transaction-bound.
+func (r *GraphRepo) mergeEntity(ctx context.Context, survivor, loser string) error {
+	if _, err := r.q.ExecContext(ctx,
+		`UPDATE OR IGNORE artifact_entities SET entity_id = ? WHERE entity_id = ?`, survivor, loser); err != nil {
+		return fmt.Errorf("re-point artifact_entities: %w", err)
+	}
+	if _, err := r.q.ExecContext(ctx,
+		`DELETE FROM artifact_entities WHERE entity_id = ?`, loser); err != nil {
+		return fmt.Errorf("drop leftover artifact_entities: %w", err)
+	}
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM entities WHERE id = ?`, loser); err != nil {
+		return fmt.Errorf("delete loser entity %q: %w", loser, err)
+	}
+	return nil
 }
 
 // LinkArtifactEntity records that an artifact mentions an entity. Idempotent.

@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"testing"
+
+	"kb/internal/kb"
 )
 
 // These exercise the cross-replica dedup that replaces the unique indexes
@@ -175,6 +178,109 @@ func TestClaimRepo_ReconcileDuplicates(t *testing.T) {
 	if claimA != survivor {
 		t.Errorf("conflict.claim_a = %q, want the survivor %q", claimA, survivor)
 	}
+}
+
+func TestUpsertEntity_Dedups(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	id1, err := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "technology", Name: "Go"})
+	if err != nil {
+		t.Fatalf("upsert 1: %v", err)
+	}
+	id2, err := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "technology", Name: "Go"})
+	if err != nil {
+		t.Fatalf("upsert 2: %v", err)
+	}
+	if id1 != id2 {
+		t.Errorf("same (kind,name) should return the same id without a unique index: %q vs %q", id1, id2)
+	}
+	var n int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM entities`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("entities = %d, want 1", n)
+	}
+}
+
+func TestUpsertEntity_AliasesCoalesce(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	id, err := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "org", Name: "Acme", Aliases: []string{"ACME Inc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliases := func() string {
+		var a sql.NullString
+		if err := st.db.QueryRowContext(ctx, `SELECT aliases FROM entities WHERE id = ?`, id).Scan(&a); err != nil {
+			t.Fatal(err)
+		}
+		return a.String
+	}
+	// A re-mint with no aliases must leave the stored set intact.
+	if _, err := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "org", Name: "Acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := aliases(); got != `["ACME Inc"]` {
+		t.Errorf("nil aliases should leave the set intact, got %q", got)
+	}
+	// A re-mint with new aliases replaces them.
+	if _, err := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "org", Name: "Acme", Aliases: []string{"A", "B"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := aliases(); got != `["A","B"]` {
+		t.Errorf("new aliases should replace, got %q", got)
+	}
+}
+
+func TestGraphRepo_ReconcileEntities(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	art := rawArtifact(t, st, "01A0000000000000000000000A", "https://e.com/e")
+	// Two replicas coined the same entity offline: duplicate (kind, name).
+	survivor := rawEntity(t, st, "01E0000000000000000000000A", "technology", "Go")
+	loser := rawEntity(t, st, "01E0000000000000000000000B", "technology", "Go")
+	// The artifact links BOTH (the cross-replica artifact_entities the merge must
+	// dedup without a PK collision).
+	for _, ent := range []string{survivor, loser} {
+		if _, err := st.db.ExecContext(ctx,
+			`INSERT INTO artifact_entities(artifact_id, entity_id) VALUES (?, ?)`, art, ent); err != nil {
+			t.Fatalf("seed link: %v", err)
+		}
+	}
+
+	n, err := st.Graph.ReconcileDuplicates(ctx)
+	if err != nil {
+		t.Fatalf("reconcile entities: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("merged %d entities, want 1", n)
+	}
+	var cnt int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM entities`).Scan(&cnt); err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 1 {
+		t.Errorf("entities = %d, want 1 (loser merged)", cnt)
+	}
+	ents, err := st.Graph.EntitiesForArtifact(ctx, art)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].ID != survivor {
+		t.Errorf("artifact link should dedup and re-point to the survivor %q, got %v", survivor, ents)
+	}
+}
+
+// rawEntity inserts an entity with an explicit id, bypassing dedup — to simulate the
+// cross-replica duplicates the reconcile sweep merges.
+func rawEntity(t *testing.T, st *Store, id, kind, name string) string {
+	t.Helper()
+	if _, err := st.db.ExecContext(context.Background(),
+		`INSERT INTO entities(id, kind, name) VALUES (?, ?, ?)`, id, kind, name); err != nil {
+		t.Fatalf("raw entity %s: %v", id, err)
+	}
+	return id
 }
 
 // rawClaim inserts a claim with an explicit id + statement, bypassing dedup — to

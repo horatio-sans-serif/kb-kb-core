@@ -3,9 +3,13 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"io/fs"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/fstest"
+
+	"kb/migrations"
 )
 
 func TestMigrate_FreshDB(t *testing.T) {
@@ -140,6 +144,148 @@ func TestMigrate_PartialFailureIsRecoverable(t *testing.T) {
 	if !tableExists(t, db, "b") {
 		t.Error("table b missing after the fixed re-run")
 	}
+}
+
+// TestMigration0013_PreservesData verifies the synced-table rebuild in 0013
+// (create -> copy -> drop -> rename) carries data through. A fresh full migrate runs
+// 0013 on empty tables and would hide a column omitted from the copy, so this seeds
+// data after 0012 and then applies 0013.
+func TestMigration0013_PreservesData(t *testing.T) {
+	db := openTemp(t)
+
+	// Apply only 0001..0012.
+	upTo12 := fstest.MapFS{}
+	entries, err := fs.ReadDir(migrations.FS, ".")
+	if err != nil {
+		t.Fatalf("read embedded migrations: %v", err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		v, err := versionFromName(e.Name())
+		if err != nil {
+			t.Fatalf("version %q: %v", e.Name(), err)
+		}
+		if v > 12 {
+			continue
+		}
+		b, err := fs.ReadFile(migrations.FS, e.Name())
+		if err != nil {
+			t.Fatalf("read %q: %v", e.Name(), err)
+		}
+		upTo12[e.Name()] = &fstest.MapFile{Data: b}
+	}
+	if _, err := migrateFS(db, upTo12); err != nil {
+		t.Fatalf("migrate to 0012: %v", err)
+	}
+
+	// Seed a parent (sources, with the 0005 columns), an artifact, and a child
+	// (encounter) — all fully populated.
+	ts := Now()
+	if _, err := db.Exec(
+		`INSERT INTO sources(id, kind, connector, cursor, last_fetched_at, health) VALUES ('s1','PULL','rss','cur',?, '{}')`, ts); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO artifacts(id, type, canonical_url, title, privacy_tier, lifecycle_tier, status, first_seen_at, last_seen_at, created_at, updated_at)
+		 VALUES ('a1','webpage','https://x','T','public','active','ready',?,?,?,?)`, ts, ts, ts, ts); err != nil {
+		t.Fatalf("seed artifact: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO encounters(id, artifact_id, source_id, seen_at, created_at) VALUES ('e1','a1','s1',?,?)`, ts, ts); err != nil {
+		t.Fatalf("seed encounter: %v", err)
+	}
+
+	// Apply the rest (0013).
+	if _, err := Migrate(db); err != nil {
+		t.Fatalf("apply 0013: %v", err)
+	}
+
+	// Data survived the rebuild, including the 0005 sources columns.
+	var title, connector, cursor string
+	if err := db.QueryRow(`SELECT title FROM artifacts WHERE id = 'a1'`).Scan(&title); err != nil || title != "T" {
+		t.Errorf("artifact title after rebuild = %q (err %v), want T", title, err)
+	}
+	if err := db.QueryRow(`SELECT connector, cursor FROM sources WHERE id = 's1'`).Scan(&connector, &cursor); err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	if connector != "rss" || cursor != "cur" {
+		t.Errorf("source columns after rebuild: connector=%q cursor=%q, want rss/cur", connector, cursor)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM encounters WHERE id = 'e1' AND artifact_id = 'a1'`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("encounter after rebuild = %d (err %v), want 1", n, err)
+	}
+
+	// The rebuilt schema is CRR-shaped: no foreign keys, NOT NULL primary key, and
+	// entities carries no UNIQUE index.
+	if fkCount(t, db, "encounters") != 0 {
+		t.Error("encounters still has a foreign key after 0013")
+	}
+	if !pkNotNull(t, db, "artifacts") {
+		t.Error("artifacts primary key is still nullable after 0013")
+	}
+	if hasUniqueIndex(t, db, "entities") {
+		t.Error("entities still has a UNIQUE index after 0013")
+	}
+}
+
+func fkCount(t *testing.T, db *sql.DB, table string) int {
+	t.Helper()
+	rows, err := db.Query(`SELECT * FROM pragma_foreign_key_list(?)`, table)
+	if err != nil {
+		t.Fatalf("foreign_key_list(%s): %v", table, err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	return n
+}
+
+func pkNotNull(t *testing.T, db *sql.DB, table string) bool {
+	t.Helper()
+	rows, err := db.Query(`SELECT name, "notnull", pk FROM pragma_table_info(?)`, table)
+	if err != nil {
+		t.Fatalf("table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var notnull, pk int
+		if err := rows.Scan(&name, &notnull, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if pk > 0 && notnull == 0 {
+			return false // a pk column that is nullable
+		}
+	}
+	return true
+}
+
+// hasUniqueIndex reports whether table has a unique index OTHER than the primary
+// key's auto-index (origin 'pk'). cr-sqlite allows the PK's unique index but forbids
+// any other (origin 'u' for a UNIQUE constraint, 'c' for a CREATE UNIQUE INDEX).
+func hasUniqueIndex(t *testing.T, db *sql.DB, table string) bool {
+	t.Helper()
+	rows, err := db.Query(`SELECT "unique", origin FROM pragma_index_list(?)`, table)
+	if err != nil {
+		t.Fatalf("index_list(%s): %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uniq int
+		var origin string
+		if err := rows.Scan(&uniq, &origin); err != nil {
+			t.Fatal(err)
+		}
+		if uniq == 1 && origin != "pk" {
+			return true
+		}
+	}
+	return false
 }
 
 // --- helpers ---
