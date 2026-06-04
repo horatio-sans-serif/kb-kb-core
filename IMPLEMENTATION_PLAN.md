@@ -1281,5 +1281,16 @@ rather than silently storing both. The claims/conflicts tables exist from Phase 
   (ErrNotFound for an unknown id).
 - **`kb.Claim` / `kb.Conflict`** domain types.
 
-**Next:** Stage 2 — claim-extraction enricher (LLM → claims, embedded). Stage 3 —
-conflict detection (cosine pre-filter + LLM judgment → conflicts + event) + API.
+## Stage 2: Claim-extraction enricher
+
+**Status: Complete.** `enrich.Claims` is a pipeline stage (DependsOn fetch,
+privacy-gated): one local-model call extracts the artifact's discrete factual
+assertions, each embedded via a separate embed call so the detector can
+vector-prefilter the comparison set. Claims are sanitized (blank/over-long
+dropped, deduped, capped at 16 — which also bounds the embed calls) and returned
+as `EnrichResult.Claims` data, inserted in the pipeline's effect transaction
+(exactly-once). Records a `claims` audit enrichment row. Wired into the daemon
+pipeline after entities.
+
+**Next:** Stage 3 — conflict detection (cosine pre-filter + LLM judgment →
+conflicts + `conflict.detected` event) + the conflict resolution API.

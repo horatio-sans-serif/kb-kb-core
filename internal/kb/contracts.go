@@ -61,6 +61,7 @@ type GraphTx interface {
 type EnrichResult struct {
 	Enrichments []Enrichment
 	Patch       *ArtifactPatch
+	Claims      []Claim // extracted claims inserted in the effect tx (§8.13)
 	ApplyGraph  func(ctx context.Context, g GraphTx) error
 }
 
