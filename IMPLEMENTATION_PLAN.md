@@ -1454,3 +1454,21 @@ source.failed alerting, and the operator dashboard fields.
 
 **Deferred:** auth-expiry detection from AuthState (re-auth prompts); schema-drift
 detection (hash a source's output shape); a dedicated health-history view.
+
+---
+
+# Phase 13 — Hacker News connector (§8.1)
+
+**Status: Complete.** A second real PULL connector (after RSS), proving the
+source-connector extensibility: `sources/hn` fetches Hacker News via the public
+Algolia search API (no auth). The fixed endpoint means the source config only
+tunes the query (`{tags?, min_points?}`, default `front_page`) — no arbitrary URL.
+Each poll filters to hits newer than the cursor (inclusive boundary, ingest
+dedups) and above `min_points`, advances the cursor to the newest `created_at_i`
+(unix-second string). Linked stories carry their article URL (the fetch stage
+retrieves the content); text posts carry their body; link-and-text-less items fall
+back to the HN discussion URL. SSRF-guarded client; HealthCheck. Registered in the
+daemon as `hackernews`. Base URL injectable for tests.
+
+**Deferred:** GitHub/Reddit/Mastodon connectors; auth-bearing connectors +
+AuthState expiry handling.
