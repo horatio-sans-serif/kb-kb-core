@@ -16,12 +16,13 @@ import (
 	"kb/internal/store"
 )
 
-// Policy is the lifecycle threshold set.
+// Policy is the lifecycle threshold set. A demotion needs BOTH a low score and
+// sufficient age — neither alone suffices.
 type Policy struct {
-	ArchiveAfter time.Duration // age past which a low-score artifact is archived
-	PurgeAfter   time.Duration // age past which a very-low-score artifact is purged
-	ArchiveBelow float64       // relevance at/above which an artifact stays active
-	PurgeBelow   float64       // relevance at/above which an artifact is at most archived
+	ArchiveAfter time.Duration // min age (with score < ArchiveBelow) to archive
+	PurgeAfter   time.Duration // min age (with score < PurgeBelow) to purge
+	ArchiveBelow float64       // score below which (and old enough) an artifact archives
+	PurgeBelow   float64       // score below which (and old enough) an artifact purges
 }
 
 // DefaultPolicy is the shipped lifecycle policy.
@@ -49,9 +50,21 @@ func classify(score float64, age time.Duration, p Policy) kb.LifecycleTier {
 
 // Stats reports what one sweep changed.
 type Stats struct {
-	Archived    int
-	Purged      int
-	Reactivated int
+	Archived int
+	Purged   int
+}
+
+// tierRank orders the lifecycle tiers so the sweep can demote (rank increases)
+// but never promote: active(0) -> archive(1) -> purged(2).
+func tierRank(t kb.LifecycleTier) int {
+	switch t {
+	case kb.Archive:
+		return 1
+	case kb.Purged:
+		return 2
+	default:
+		return 0 // active (and any unexpected value) is the lowest
+	}
 }
 
 // Sweeper applies the lifecycle policy over the store.
@@ -89,7 +102,12 @@ func (s *Sweeper) Sweep(ctx context.Context) (Stats, error) {
 			continue // unparseable timestamp: leave it alone
 		}
 		target := classify(*a.RelevanceScore, now.Sub(anchor), s.policy)
-		if target == a.LifecycleTier {
+		// Demote-only: the sweep moves an artifact down the lifecycle (active ->
+		// archive -> purge) but NEVER promotes it back up on its own. Promotion is
+		// reserved for an explicit engagement (which resets the artifact to active).
+		// This keeps an archive sticky and stops it flapping against a budget archive
+		// when a decayed artifact's score later recovers (relevance is not monotonic).
+		if tierRank(target) <= tierRank(a.LifecycleTier) {
 			continue
 		}
 		if err := s.apply(ctx, a.ID, target); err != nil {
@@ -104,8 +122,6 @@ func (s *Sweeper) Sweep(ctx context.Context) (Stats, error) {
 			stats.Archived++
 		case kb.Purged:
 			stats.Purged++
-		case kb.Active:
-			stats.Reactivated++
 		}
 	}
 	return stats, errors.Join(errs...)
@@ -117,6 +133,12 @@ func (s *Sweeper) Sweep(ctx context.Context) (Stats, error) {
 // footprint, and the count is of active-tier artifacts, so the budget is a cap on
 // how many of a source's artifacts stay active at once. Returns how many it
 // archived.
+//
+// Budgets are active-footprint caps, not ownership: an artifact encountered from
+// several sources counts against each, so any over-budget source may archive a
+// shared artifact (sources are processed oldest-first, so the first over-budget
+// one wins). That is acceptable because archiving is reversible — engagement
+// returns the artifact to active — and the lowest-relevance ones are demoted first.
 func (s *Sweeper) EnforceBudgets(ctx context.Context) (int, error) {
 	srcs, err := s.st.Sources.ListWithBudget(ctx)
 	if err != nil {

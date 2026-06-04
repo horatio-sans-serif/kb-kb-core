@@ -69,7 +69,7 @@ func TestBudget_IgnoresArchivedAndUnscored(t *testing.T) {
 	src := &Source{Kind: "PULL", Connector: "rss"}
 	_ = st.Sources.Create(ctx, src)
 
-	active := budgetArtifact(t, st, src.ID, "h1", 0.5)
+	budgetArtifact(t, st, src.ID, "h1", 0.5) // active, scored → the one that counts
 	archived := budgetArtifact(t, st, src.ID, "h2", 0.1)
 	arch := kb.Archive
 	_ = st.Artifacts.Patch(ctx, archived, kb.ArtifactPatch{LifecycleTier: &arch})
@@ -81,5 +81,4 @@ func TestBudget_IgnoresArchivedAndUnscored(t *testing.T) {
 	if n != 1 {
 		t.Errorf("count = %d, want 1 (only the active, scored artifact)", n)
 	}
-	_ = active
 }

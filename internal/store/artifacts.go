@@ -275,13 +275,16 @@ func (r *ArtifactRepo) list(ctx context.Context, clause string) ([]*Artifact, er
 }
 
 // RecordEngagement stamps last_engaged_at (and updated_at) on a live artifact —
-// the engagement signal the relevance model boosts (§8.9). It does not touch
-// title/body, so no FTS reindex is needed. Reports whether a live row was updated
-// (false = unknown or tombstoned artifact).
+// the engagement signal the relevance model boosts (§8.9) — and returns it to the
+// active lifecycle tier: engagement is the explicit "I care about this" that
+// reverses an archive (the lifecycle sweep only demotes, never promotes, §8.12).
+// It does not touch title/body, so no FTS reindex is needed. Reports whether a
+// live row was updated (false = unknown or tombstoned artifact).
 func (r *ArtifactRepo) RecordEngagement(ctx context.Context, id string) (bool, error) {
 	ts := now()
 	res, err := r.q.ExecContext(ctx,
-		`UPDATE artifacts SET last_engaged_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		`UPDATE artifacts SET last_engaged_at = ?, updated_at = ?, lifecycle_tier = 'active'
+		 WHERE id = ? AND deleted_at IS NULL`,
 		ts, ts, id)
 	if err != nil {
 		return false, fmt.Errorf("record engagement for %q: %w", id, err)
@@ -383,15 +386,17 @@ type LifecycleCounts struct {
 	Purged  int // tombstoned (deleted_at set)
 }
 
-// LifecycleCounts returns the live active/archive counts and the tombstoned
-// (purged) count — the lifecycle status view.
+// LifecycleCounts returns the live active/archive counts and the GC-purged count
+// (tombstoned AND lifecycle_tier='purged', so a user/other-path tombstone is not
+// miscounted as a GC purge) — the lifecycle status view. A full-table aggregate;
+// fine for an on-demand endpoint at the personal scale this targets.
 func (r *ArtifactRepo) LifecycleCounts(ctx context.Context) (LifecycleCounts, error) {
 	var c LifecycleCounts
 	err := r.rq.QueryRowContext(ctx,
 		`SELECT
 		   COALESCE(SUM(CASE WHEN deleted_at IS NULL AND lifecycle_tier = 'active' THEN 1 ELSE 0 END), 0),
 		   COALESCE(SUM(CASE WHEN deleted_at IS NULL AND lifecycle_tier = 'archive' THEN 1 ELSE 0 END), 0),
-		   COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+		   COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL AND lifecycle_tier = 'purged' THEN 1 ELSE 0 END), 0)
 		 FROM artifacts`).Scan(&c.Active, &c.Archive, &c.Purged)
 	if err != nil {
 		return LifecycleCounts{}, fmt.Errorf("lifecycle counts: %w", err)

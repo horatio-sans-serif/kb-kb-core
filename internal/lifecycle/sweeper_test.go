@@ -91,6 +91,72 @@ func TestSweeper_EnforceBudgets(t *testing.T) {
 	}
 }
 
+func TestSweeper_DemoteOnly_NoReactivationFlap(t *testing.T) {
+	// A healthy-score artifact archived for budget reasons must NOT be reactivated
+	// by a relevance sweep (that would flap against the next budget pass).
+	ctx := context.Background()
+	st := storetest.New(t)
+	now := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	id := seedScored(t, st, "h1", 0.9, store.FormatTime(now)) // high score, fresh
+	arch := kb.Archive
+	_ = st.Artifacts.Patch(ctx, id, kb.ArtifactPatch{LifecycleTier: &arch}) // budget-archived
+
+	sw := NewWithPolicy(st, DefaultPolicy(), func() time.Time { return now })
+	if _, err := sw.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	a, _ := st.Artifacts.Get(ctx, id)
+	if a.LifecycleTier != kb.Archive {
+		t.Errorf("sweep promoted an archived artifact to %q; it must stay archived (demote-only)", a.LifecycleTier)
+	}
+}
+
+func TestSweeper_EngagementReactivates(t *testing.T) {
+	// Engagement is the explicit promotion path: it returns an archived artifact to
+	// active.
+	ctx := context.Background()
+	st := storetest.New(t)
+	id := seedScored(t, st, "h1", 0.01, store.Now())
+	arch := kb.Archive
+	_ = st.Artifacts.Patch(ctx, id, kb.ArtifactPatch{LifecycleTier: &arch})
+
+	if ok, err := st.Artifacts.RecordEngagement(ctx, id); err != nil || !ok {
+		t.Fatalf("engage: ok=%v err=%v", ok, err)
+	}
+	a, _ := st.Artifacts.Get(ctx, id)
+	if a.LifecycleTier != kb.Active {
+		t.Errorf("engagement should reactivate, got %q", a.LifecycleTier)
+	}
+}
+
+func TestSweeper_BudgetSharedArtifact(t *testing.T) {
+	// An artifact encountered from two sources, one over budget, is archived for the
+	// over-budget source (active-footprint cap, not ownership).
+	ctx := context.Background()
+	st := storetest.New(t)
+	tight := 1
+	a := &store.Source{Kind: "PULL", Connector: "rss", StorageBudget: &tight}
+	b := &store.Source{Kind: "PUSH", Connector: "x"}
+	_ = st.Sources.Create(ctx, a)
+	_ = st.Sources.Create(ctx, b)
+
+	lo := seedScored(t, st, "h1", 0.1, store.Now())
+	hi := seedScored(t, st, "h2", 0.9, store.Now())
+	for _, id := range []string{lo, hi} {
+		_ = st.Encounters.Record(ctx, &store.Encounter{ArtifactID: id, SourceID: a.ID, SeenAt: store.Now()})
+	}
+	// The shared low-relevance one is also from b.
+	_ = st.Encounters.Record(ctx, &store.Encounter{ArtifactID: lo, SourceID: b.ID, SeenAt: store.Now()})
+
+	if n, err := New(st).EnforceBudgets(ctx); err != nil || n != 1 {
+		t.Fatalf("enforce = (%d, %v), want (1, nil)", n, err)
+	}
+	got, _ := st.Artifacts.Get(ctx, lo)
+	if got.LifecycleTier != kb.Archive {
+		t.Errorf("the shared low-relevance artifact should be archived for the over-budget source, got %q", got.LifecycleTier)
+	}
+}
+
 func TestSweeper_TransitionsTiers(t *testing.T) {
 	ctx := context.Background()
 	st := storetest.New(t)

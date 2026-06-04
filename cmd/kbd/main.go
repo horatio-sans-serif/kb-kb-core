@@ -264,7 +264,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		case err != nil && ctx.Err() == nil:
 			logger.Warn("lifecycle sweep", "err", err)
 		case stats.Archived > 0 || stats.Purged > 0:
-			logger.Info("lifecycle sweep", "archived", stats.Archived, "purged", stats.Purged, "reactivated", stats.Reactivated)
+			logger.Info("lifecycle sweep", "archived", stats.Archived, "purged", stats.Purged)
 		}
 		switch n, err := lifeSweeper.EnforceBudgets(ctx); {
 		case err != nil && ctx.Err() == nil:
