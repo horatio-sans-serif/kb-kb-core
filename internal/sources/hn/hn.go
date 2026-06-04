@@ -3,8 +3,15 @@
 // configured tag, filters to those newer than the cursor and above an optional
 // minimum points, and advances the cursor to the newest item's creation time.
 // Linked stories carry their article URL (the fetch stage retrieves the content);
-// text posts (Ask/Show HN) carry their body. The endpoint is fixed, so the source
-// config only tunes the query — no arbitrary URL, unlike the RSS connector.
+// text posts (Ask/Show HN) carry their body (raw HTML, like the RSS connector's
+// description — un-converted, a known shared fidelity limitation). The endpoint is
+// fixed, so the source config only tunes the query — no arbitrary URL, unlike RSS.
+//
+// Each poll reads at most hitsPerPage (50) of the most-recent items (no deep
+// paging). For the default front_page tag that is ample; a high-volume tag (e.g.
+// tags=story, the new-submissions firehose) at a slow refresh interval can produce
+// more than 50 items between polls, and the surplus is skipped as the cursor jumps
+// to the newest. Such a source needs a short refresh interval.
 package hn
 
 import (
@@ -77,11 +84,17 @@ func (c *Connector) Fetch(ctx context.Context, src *kb.Source, since kb.Cursor) 
 	out := make([]kb.RawItem, 0, len(hits))
 	newest := sinceTS
 	for _, h := range hits {
-		if h.Points < cfg.MinPoints {
-			continue
-		}
 		if since != "" && h.CreatedAt < sinceTS {
 			continue // strictly older than the cursor — already seen
+		}
+		// Advance the cursor for ANY in-window hit, BEFORE the content filters: a
+		// sub-threshold or title-less newest item must still move the cursor, or it
+		// pins the cursor and the whole window is re-emitted every poll.
+		if h.CreatedAt > newest {
+			newest = h.CreatedAt
+		}
+		if h.Points < cfg.MinPoints {
+			continue
 		}
 		title := strings.TrimSpace(h.Title)
 		if title == "" {
@@ -97,13 +110,10 @@ func (c *Connector) Fetch(ctx context.Context, src *kb.Source, since kb.Cursor) 
 			item.URL = "https://news.ycombinator.com/item?id=" + url.QueryEscape(h.ObjectID) // discussion fallback
 		}
 		out = append(out, item)
-		if h.CreatedAt > newest {
-			newest = h.CreatedAt
-		}
 	}
 
 	cursor := since
-	if newest > sinceTS || (since == "" && newest > 0) {
+	if newest > sinceTS {
 		cursor = kb.Cursor(strconv.FormatInt(newest, 10))
 	}
 	return out, cursor, nil

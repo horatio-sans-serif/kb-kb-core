@@ -90,6 +90,50 @@ func TestHN_CursorFiltersSeen(t *testing.T) {
 	}
 }
 
+func TestHN_CursorAdvancesPastSubThresholdNewest(t *testing.T) {
+	// The newest item is below min_points (dropped), but the cursor must still
+	// advance past it — otherwise it pins the cursor and the window re-emits forever.
+	json := `{"hits":[
+	  {"objectID":"9","title":"New low","url":"https://ex.com/n","points":5,"created_at_i":1700000900},
+	  {"objectID":"8","title":"Old high","url":"https://ex.com/o","points":200,"created_at_i":1700000100}
+	]}`
+	c, _ := testConnector(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(json)) })
+	items, cursor, err := c.Fetch(context.Background(), &kb.Source{Config: `{"min_points":100}`}, "")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(items) != 1 || items[0].Title != "Old high" {
+		t.Errorf("items = %+v, want only the supra-threshold one", items)
+	}
+	if cursor != "1700000900" {
+		t.Errorf("cursor = %q, want 1700000900 (advanced past the dropped newest item)", cursor)
+	}
+}
+
+func TestHN_DiscussionFallback(t *testing.T) {
+	json := `{"hits":[{"objectID":"42","title":"Discussion only","url":null,"points":10,"created_at_i":1700000500,"story_text":""}]}`
+	c, _ := testConnector(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(json)) })
+	items, _, err := c.Fetch(context.Background(), &kb.Source{}, "")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(items) != 1 || items[0].URL != "https://news.ycombinator.com/item?id=42" {
+		t.Errorf("link-and-text-less item should fall back to the HN discussion URL, got %+v", items)
+	}
+}
+
+func TestHN_NoNewItemsKeepsCursor(t *testing.T) {
+	c, _ := testConnector(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(algoliaJSON)) })
+	// Cursor past every item: nothing new, cursor unchanged.
+	items, cursor, err := c.Fetch(context.Background(), &kb.Source{}, "1700009999")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(items) != 0 || cursor != "1700009999" {
+		t.Errorf("no-new-items = (%d items, cursor %q), want (0, unchanged)", len(items), cursor)
+	}
+}
+
 func TestHN_DefaultTags(t *testing.T) {
 	var gotQuery url.Values
 	c, _ := testConnector(t, func(w http.ResponseWriter, r *http.Request) {
