@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"kb/internal/kb"
 	"kb/internal/llm"
@@ -19,6 +20,11 @@ const (
 	// maxCandidatesPerClaim bounds the LLM judgments per claim (the closest few
 	// candidates), so a large corpus can't make one artifact's detection unbounded.
 	maxCandidatesPerClaim = 5
+	// conflictsStageBudget bounds the whole stage. Up to numClaims×maxCandidates
+	// judgment calls run synchronously; this caps their total wall time so one
+	// artifact's detection can't run unbounded. On expiry the stage returns the
+	// contradictions found so far rather than failing (detection is advisory).
+	conflictsStageBudget = 3 * time.Minute
 )
 
 var conflictsSchema = json.RawMessage(`{
@@ -52,6 +58,12 @@ type ClaimReader interface {
 // stage runs. When the judge endpoint is remote, the candidate set is restricted
 // to cloud-safe (public/personal) claims so sensitive statements never leave the
 // machine (§8.17). local also gates the stage on the artifact's own tier.
+//
+// Scope: only this artifact's claims vs OTHER artifacts' claims are compared.
+// Intra-artifact contradictions (a document contradicting itself) are out of scope
+// by design — that is usually an extraction artifact, not a knowledge conflict.
+// Every cross-artifact pair is examined once, when the later artifact of the pair
+// is enriched.
 type Conflicts struct {
 	reader ClaimReader
 	judge  llm.Client
@@ -91,12 +103,23 @@ func (c *Conflicts) Enrich(ctx context.Context, a *kb.Artifact) (kb.EnrichResult
 		return kb.EnrichResult{}, nil
 	}
 
+	// Bound the whole stage. A judge error on one pair is tolerated (skip it and
+	// keep the rest) so a transient hiccup doesn't discard the verdicts already
+	// made and force all the calls to re-run on retry — UNLESS the parent context
+	// is cancelled (daemon shutting down), in which case abort so the job retries.
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, conflictsStageBudget)
+	defer cancel()
+
 	var conflicts []kb.Conflict
 	for _, m := range mine {
 		for _, cand := range topCandidates(m, others) {
 			verdict, err := c.judgeContradiction(ctx, m.Statement, cand.claim.Statement)
 			if err != nil {
-				return kb.EnrichResult{}, err
+				if parent.Err() != nil {
+					return kb.EnrichResult{}, parent.Err()
+				}
+				continue // transient judge/parse failure or budget expiry: skip this pair
 			}
 			if verdict.Contradicts {
 				conflicts = append(conflicts, kb.Conflict{

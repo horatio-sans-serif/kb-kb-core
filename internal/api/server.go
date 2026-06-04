@@ -798,7 +798,10 @@ func validConflictStatus(s string) bool {
 }
 
 // handleListConflicts lists detected contradictions for human resolution (§8.13),
-// each with both claim statements. ?status defaults to open.
+// each with both claim statements. ?status defaults to open. Claim statements are
+// returned regardless of their artifacts' privacy tiers: this is a local,
+// token-authenticated, single-user API and the tiers gate cloud egress, not local
+// reads (the requireAuth boundary is the relevant control).
 func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	if status == "" {

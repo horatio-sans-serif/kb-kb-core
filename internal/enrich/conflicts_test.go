@@ -2,6 +2,7 @@ package enrich
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"kb/internal/kb"
@@ -93,6 +94,23 @@ func TestConflicts_RemoteRestrictsCandidates(t *testing.T) {
 	}
 	if !reader.gotCloudSafe {
 		t.Error("a remote judge must request the cloud-safe candidate set")
+	}
+}
+
+func TestConflicts_ToleratesJudgeFailure(t *testing.T) {
+	// A transient judge failure must not fail the whole stage (which would force
+	// every judgment to re-run on retry); the pair is skipped and the rest proceed.
+	reader := &fakeClaimReader{
+		mine:   []*kb.Claim{{ID: "M1", Statement: "s", Embedding: []float32{1, 0}}},
+		others: []*kb.Claim{{ID: "O1", Statement: "o", Embedding: []float32{1, 0}}},
+	}
+	judge := &fakeLLM{err: errors.New("judge endpoint down")}
+	res, err := NewConflicts(reader, judge, "m", true).Enrich(context.Background(), &kb.Artifact{ID: "01ART", PrivacyTier: kb.Public})
+	if err != nil {
+		t.Fatalf("a transient judge failure should not fail the stage: %v", err)
+	}
+	if len(res.Conflicts) != 0 {
+		t.Errorf("no verdict → no conflict, got %+v", res.Conflicts)
 	}
 }
 

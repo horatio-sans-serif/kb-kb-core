@@ -14,7 +14,11 @@ type ConflictRepo struct{ q, rq Querier } // q: write pool; rq: read pool
 const claimCols = `id, artifact_id, statement, embedding, created_at`
 
 // Create inserts a claim, assigning a ULID and CreatedAt. The embedding is stored
-// as a JSON float array, or NULL when absent.
+// as a JSON float array, or NULL when absent. Idempotent on (artifact_id,
+// statement) via migration 0009's unique index (INSERT OR IGNORE): re-extracting
+// the same statement is a no-op, keeping the original row's id stable. To replace
+// an artifact's claim set wholesale (a future re-enrich), use DeleteByArtifact
+// first — removed statements are not reclaimed by a re-extract alone.
 func (r *ClaimRepo) Create(ctx context.Context, c *Claim) error {
 	if c.ID == "" {
 		c.ID = NewID()
@@ -31,9 +35,25 @@ func (r *ClaimRepo) Create(ctx context.Context, c *Claim) error {
 		emb = string(b)
 	}
 	if _, err := r.q.ExecContext(ctx,
-		`INSERT INTO claims(`+claimCols+`) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO claims(`+claimCols+`) VALUES (?, ?, ?, ?, ?)`,
 		c.ID, c.ArtifactID, c.Statement, emb, c.CreatedAt); err != nil {
 		return fmt.Errorf("create claim for %q: %w", c.ArtifactID, err)
+	}
+	return nil
+}
+
+// DeleteByArtifact removes an artifact's claims and the conflict rows that
+// reference them (either side) — the cascade a re-enrich or lifecycle GC needs,
+// since conflicts have a FK to claims. Deletes conflicts first to satisfy the FK.
+func (r *ClaimRepo) DeleteByArtifact(ctx context.Context, artifactID string) error {
+	if _, err := r.q.ExecContext(ctx,
+		`DELETE FROM conflicts WHERE claim_a IN (SELECT id FROM claims WHERE artifact_id = ?)
+		    OR claim_b IN (SELECT id FROM claims WHERE artifact_id = ?)`,
+		artifactID, artifactID); err != nil {
+		return fmt.Errorf("delete conflicts for artifact %q: %w", artifactID, err)
+	}
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM claims WHERE artifact_id = ?`, artifactID); err != nil {
+		return fmt.Errorf("delete claims for artifact %q: %w", artifactID, err)
 	}
 	return nil
 }
@@ -77,6 +97,8 @@ func (r *ClaimRepo) ListExcludingArtifact(ctx context.Context, artifactID string
 	      JOIN artifacts a ON a.id = c.artifact_id AND a.deleted_at IS NULL
 	      WHERE c.artifact_id != ? AND c.embedding IS NOT NULL`
 	if cloudSafeOnly {
+		// Mirror kb.PrivacyTier.AllowsCloud() — keep these two in sync if the tier
+		// set ever changes.
 		q += ` AND a.privacy_tier IN ('public','personal')`
 	}
 	q += ` ORDER BY c.created_at, c.id`
@@ -134,13 +156,19 @@ func (r *ConflictRepo) Create(ctx context.Context, c *Conflict) error {
 }
 
 // ListByStatus returns conflicts in the given status (open|resolved|dismissed),
-// newest first.
+// newest first. Conflicts whose either claim belongs to a tombstoned artifact are
+// excluded — a soft-deleted artifact's contradictions are no longer actionable.
 func (r *ConflictRepo) ListByStatus(ctx context.Context, status string, limit int) ([]*Conflict, error) {
 	if limit <= 0 {
 		limit = surfaceDefaultLimit
 	}
 	rows, err := r.rq.QueryContext(ctx,
-		`SELECT `+conflictCols+` FROM conflicts WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
+		`SELECT cf.id, cf.claim_a, cf.claim_b, cf.status, cf.rationale, cf.created_at FROM conflicts cf
+		 JOIN claims ca ON ca.id = cf.claim_a
+		 JOIN artifacts aa ON aa.id = ca.artifact_id AND aa.deleted_at IS NULL
+		 JOIN claims cb ON cb.id = cf.claim_b
+		 JOIN artifacts ab ON ab.id = cb.artifact_id AND ab.deleted_at IS NULL
+		 WHERE cf.status = ? ORDER BY cf.created_at DESC, cf.id DESC LIMIT ?`,
 		status, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list %s conflicts: %w", status, err)

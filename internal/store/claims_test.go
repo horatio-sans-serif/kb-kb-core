@@ -134,6 +134,62 @@ func TestConflictRepo_CreateDedupListResolve(t *testing.T) {
 	}
 }
 
+func TestClaimRepo_CreateIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a := mkArtifact(t, st, "h1")
+	// Re-creating the same (artifact_id, statement) is a no-op (idempotent extraction).
+	_ = st.Claims.Create(ctx, &Claim{ArtifactID: a, Statement: "X is true", Embedding: []float32{1}})
+	_ = st.Claims.Create(ctx, &Claim{ArtifactID: a, Statement: "X is true", Embedding: []float32{2}})
+	got, _ := st.Claims.ListByArtifact(ctx, a)
+	if len(got) != 1 {
+		t.Errorf("duplicate statement should store once, got %d", len(got))
+	}
+}
+
+func TestClaimRepo_DeleteByArtifactCascades(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a := mkArtifact(t, st, "h1")
+	ca := &Claim{ArtifactID: a, Statement: "A true"}
+	cb := &Claim{ArtifactID: a, Statement: "A false"}
+	_ = st.Claims.Create(ctx, ca)
+	_ = st.Claims.Create(ctx, cb)
+	_ = st.Conflicts.Create(ctx, &Conflict{ClaimA: ca.ID, ClaimB: cb.ID})
+
+	if err := st.Claims.DeleteByArtifact(ctx, a); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got, _ := st.Claims.ListByArtifact(ctx, a); len(got) != 0 {
+		t.Errorf("claims not deleted: %d", len(got))
+	}
+	// The dependent conflict was deleted too (no FK orphan).
+	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10); len(open) != 0 {
+		t.Errorf("dependent conflict not cascaded: %d", len(open))
+	}
+}
+
+func TestConflictRepo_ListExcludesTombstonedClaims(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a := mkArtifact(t, st, "h1")
+	ca := &Claim{ArtifactID: a, Statement: "A true"}
+	cb := &Claim{ArtifactID: a, Statement: "A false"}
+	_ = st.Claims.Create(ctx, ca)
+	_ = st.Claims.Create(ctx, cb)
+	_ = st.Conflicts.Create(ctx, &Conflict{ClaimA: ca.ID, ClaimB: cb.ID})
+
+	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10); len(open) != 1 {
+		t.Fatalf("expected 1 open conflict before tombstone, got %d", len(open))
+	}
+	if err := st.Artifacts.SoftDelete(ctx, a); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10); len(open) != 0 {
+		t.Errorf("conflict referencing a tombstoned artifact must not be listed, got %d", len(open))
+	}
+}
+
 func TestConflictRepo_SetStatusMissing(t *testing.T) {
 	st := newTestStore(t)
 	err := st.Conflicts.SetStatus(context.Background(), "nope", "resolved", "")
