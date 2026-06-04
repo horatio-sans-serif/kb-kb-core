@@ -67,6 +67,10 @@ const lifecycleInterval = 6 * time.Hour
 // duplicate artifacts.
 const reconcileInterval = 10 * time.Minute
 
+// syncPullInterval is how often the puller pulls changesets from configured peers
+// (when multi-device sync is enabled).
+const syncPullInterval = 30 * time.Second
+
 // sourcePollInterval is how often the scheduler checks for PULL sources due to
 // refresh (each source's own schedule decides whether it actually fetches).
 const sourcePollInterval = time.Minute
@@ -433,8 +437,24 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Surface:        surface.New(st),
 		Review:         review.New(st),
 	})
+	// When sync is enabled, expose the changeset-exchange endpoints (so peers can
+	// pull from us) and start the puller (to pull from configured peers). The /sync
+	// routes carry the same bearer token as the rest of the API.
+	handler := srv.Handler()
+	if syncEnabled {
+		cs := crsync.DBChangeStore{DB: db}
+		mux := http.NewServeMux()
+		mux.Handle("/sync/", http.StripPrefix("/sync", crsync.Handler(cs, cfg.APIToken, logger)))
+		mux.Handle("/", handler)
+		handler = mux
+		if len(cfg.SyncPeers) > 0 {
+			puller := crsync.NewPuller(cs, st.Sync, cfg.SyncPeers, cfg.APIToken, nil, logger)
+			go puller.Run(ctx, syncPullInterval)
+		}
+	}
+
 	httpSrv := &http.Server{
-		Handler:           srv.Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,   // slowloris guard; safe for SSE
 		ReadTimeout:       15 * time.Second,  // full request incl. /ingest body
 		IdleTimeout:       120 * time.Second, // reclaim idle keep-alives

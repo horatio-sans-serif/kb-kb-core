@@ -46,6 +46,7 @@ type Store struct {
 	Claims      *ClaimRepo
 	Conflicts   *ConflictRepo
 	Topics      *TopicRepo
+	Sync        *SyncRepo
 }
 
 // New wires the repositories to a single pool for both reads and writes (used in
@@ -76,6 +77,7 @@ func newStore(db *sql.DB, q, rq Querier) *Store {
 		Claims:      &ClaimRepo{q: q, rq: rq},
 		Conflicts:   &ConflictRepo{q: q, rq: rq},
 		Topics:      &TopicRepo{q: q, rq: rq},
+		Sync:        &SyncRepo{q: q, rq: rq},
 	}
 }
 

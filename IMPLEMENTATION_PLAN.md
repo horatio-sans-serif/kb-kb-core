@@ -1687,7 +1687,29 @@ realized —
   artifacts.
 - L6: the schema-shape assertions loop over all 16 synced tables, not 3.
 
-**Next: Stage 3** — peer transport (changeset-exchange HTTP over Tailscale) + daemon
-wiring behind extension availability (config `KB_CRSQLITE_PATH`): on startup, when
-the extension loads, open via crsync, call AsCRR on the synced tables, and exchange
-changesets with peers.
+### Stage 3: peer transport + daemon wiring
+
+**Stage 3a (driver seam + AsCRR wiring): Complete.** The crsync changeset ops
+(AsCRR/Changes/Apply/DBVersion/SiteID/Finalize + the Change/Value types) are plain
+SQL over \*sql.DB (changes.go, always built); only the native-extension driver
+registration is gated (`driver_crsqlite.go` vs `driver_stub.go`), so a default build
+carries no native code. `store.OpenWithDriver` opens the write pool with the
+cr-sqlite driver while keeping the standard DSN. Config adds `KB_CRSQLITE_PATH` and
+`KB_SYNC_PEERS`. `main.openWriteDB` opens with the replication driver when the
+extension loads, migrates, converts synced tables to CRRs (idempotent), and
+finalizes before close; a configured-but-unavailable extension warns and runs
+single-node.
+
+**Stage 3b (changeset transport + sync loop): Complete.** Migration 0014 adds the
+local `sync_state` watermark table; `store.SyncRepo` persists a monotonic per-peer
+watermark. `crsync.Handler` serves `GET/POST /sync/changes` (bearer-token guarded,
+shared with the API token); `crsync.Puller` pulls each peer's changes since the
+watermark, applies them (commit-before-advance, so a crash only re-pulls), and
+advances the watermark. The daemon mounts `/sync` when sync is enabled and starts
+the puller when peers are configured. `Change.Val` is a typed `Value` that preserves
+the SQLite storage class across JSON — without it a TEXT round-trips to a BLOB and
+fails CHECK constraints. Proven end to end against the real extension
+(`TestSync_EndToEnd_TwoReplicas`): an artifact written on replica A converges onto
+replica B over the HTTP transport.
+
+This completes Phase 17 — multi-device peer sync.

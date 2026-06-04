@@ -3,21 +3,17 @@
 // SQLite tables themselves into conflict-free replicated relations); the job queue
 // and derived indexes are local to each device and rebuilt, never synced.
 //
-// This file (the table classification) is pure and always built. The replication
-// engine — loading the cr-sqlite extension, converting tables to CRRs, exchanging
-// changesets — is behind the `crsqlite` build tag (engine.go), so the default
-// build and its dependency footprint are unchanged: a device without the extension
-// runs exactly as before, single-node.
+// This file (the table classification) and the changeset operations (changes.go)
+// are pure and always built. Only the driver registration that loads the native
+// extension is behind the `crsqlite` build tag (driver_crsqlite.go vs.
+// driver_stub.go), so the default build carries no native code and runs single-node.
 //
-// Deciding-test result (the §8.16 / "Phase 10" decision): cr-sqlite loads via
-// mattn/go-sqlite3 and replicates correctly, but crsql_as_crr requires each synced
-// table to have a NOT NULL primary key, NO non-primary-key unique indexes, and
-// unchecked foreign keys. The current schema's DB-enforced dedup (the
-// canonical_url / content_hash / (kind,name) unique indexes) and checked FKs are
-// therefore incompatible. Adopting cr-sqlite requires a schema migration that
-// drops those unique indexes and moves dedup to application-level reconciliation
-// (the design's same_as merge), and declares synced-table FKs unchecked — the
-// prerequisite tracked before this engine is wired to the live store.
+// crsql_as_crr requires each synced table to have a NOT NULL primary key, NO
+// non-primary-key unique index, NO checked foreign key, and a DEFAULT on every
+// non-PK NOT NULL column. Migration 0013 rebuilt the synced tables to satisfy this
+// (verified against the real extension by internal/crsync/ascrr_test.go); dedup that
+// the dropped unique indexes used to enforce moved to application-level
+// find-then-insert + the reconcile sweep (the design's same_as merge).
 package crsync
 
 // synced is the knowledge core: the tables whose rows are replicated across
@@ -49,6 +45,7 @@ var local = []string{
 	"audit_log",
 	"schema_migrations",
 	"artifacts_fts",
+	"sync_state", // per-peer changeset watermarks (Stage 3b)
 }
 
 // SyncedTables returns the tables that replicate, in CRR-conversion order.

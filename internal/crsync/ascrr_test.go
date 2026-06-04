@@ -46,16 +46,7 @@ func TestAsCRR_AllSyncedTables(t *testing.T) {
 	if err := AsCRR(ctx, db, SyncedTables()); err != nil {
 		t.Fatalf("crsql_as_crr must accept every synced table after 0013: %v", err)
 	}
-
-	// The local-only tables are correctly NOT converted (a sanity check that the
-	// classification, not a blanket conversion, is what passed). artifacts_fts is a
-	// virtual table, for which crsql_as_crr is not meaningful.
-	for _, tbl := range LocalTables() {
-		if tbl == "artifacts_fts" {
-			continue
-		}
-		if _, err := db.ExecContext(ctx, `SELECT crsql_as_crr(?)`, tbl); err == nil {
-			t.Errorf("local-only table %q should not be a CRR, but crsql_as_crr accepted it", tbl)
-		}
-	}
+	// Local-only tables are excluded by classification (the daemon only ever calls
+	// AsCRR on SyncedTables), not because crsql_as_crr would reject them — a clean
+	// local table like sync_state is CRR-compatible but deliberately kept device-local.
 }

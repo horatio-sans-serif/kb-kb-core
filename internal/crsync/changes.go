@@ -13,6 +13,7 @@ package crsync
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -57,17 +58,92 @@ func SiteID(ctx context.Context, db *sql.DB) ([]byte, error) {
 
 // Change is one row of the crsql_changes changeset — a single column write with its
 // CRDT version metadata. Callers treat it as opaque and round-trip it through
-// Changes -> transport -> Apply.
+// Changes -> transport -> Apply. PK and SiteID are genuine blobs (cr-sqlite's packed
+// primary key and the 16-byte site id); Val is a typed value (see Value).
 type Change struct {
 	Table      string `json:"table"`
 	PK         []byte `json:"pk"`
 	CID        string `json:"cid"`
-	Val        []byte `json:"val"`
+	Val        Value  `json:"val"`
 	ColVersion int64  `json:"col_version"`
 	DBVersion  int64  `json:"db_version"`
 	SiteID     []byte `json:"site_id"`
 	CL         int64  `json:"cl"`
 	Seq        int64  `json:"seq"`
+}
+
+// Value is one SQLite value from a changeset, preserving its storage class
+// (null/integer/real/text/blob) across JSON. Without this, scanning val into []byte
+// and re-applying it would store every value as a BLOB, so a TEXT like 'note' would
+// become x'6e6f7465' and fail a type-sensitive CHECK or comparison. X is one of nil,
+// int64, float64, string, or []byte (what database/sql yields for the storage class).
+type Value struct{ X any }
+
+type valueWire struct {
+	T string          `json:"t"`
+	V json.RawMessage `json:"v,omitempty"`
+}
+
+func (val Value) MarshalJSON() ([]byte, error) {
+	w := valueWire{}
+	switch x := val.X.(type) {
+	case nil:
+		w.T = "null"
+	case int64:
+		w.T, w.V = "int", mustJSON(x)
+	case float64:
+		w.T, w.V = "real", mustJSON(x)
+	case string:
+		w.T, w.V = "text", mustJSON(x)
+	case []byte:
+		w.T, w.V = "blob", mustJSON(x) // Go base64-encodes []byte
+	default:
+		return nil, fmt.Errorf("crsync: unsupported changeset value type %T", x)
+	}
+	return json.Marshal(w)
+}
+
+func (val *Value) UnmarshalJSON(data []byte) error {
+	var w valueWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	switch w.T {
+	case "null":
+		val.X = nil
+	case "int":
+		var i int64
+		if err := json.Unmarshal(w.V, &i); err != nil {
+			return err
+		}
+		val.X = i
+	case "real":
+		var f float64
+		if err := json.Unmarshal(w.V, &f); err != nil {
+			return err
+		}
+		val.X = f
+	case "text":
+		var s string
+		if err := json.Unmarshal(w.V, &s); err != nil {
+			return err
+		}
+		val.X = s
+	case "blob":
+		var b []byte
+		if err := json.Unmarshal(w.V, &b); err != nil {
+			return err
+		}
+		val.X = b
+	default:
+		return fmt.Errorf("crsync: unknown changeset value type %q", w.T)
+	}
+	return nil
+}
+
+func mustJSON(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // Changes returns every change with db_version greater than since (a peer's
@@ -87,9 +163,11 @@ func Changes(ctx context.Context, db *sql.DB, since int64) ([]Change, int64, err
 	max := since
 	for rows.Next() {
 		var c Change
-		if err := rows.Scan(&c.Table, &c.PK, &c.CID, &c.Val, &c.ColVersion, &c.DBVersion, &c.SiteID, &c.CL, &c.Seq); err != nil {
+		var val any // preserve the value's SQLite storage class (see Value)
+		if err := rows.Scan(&c.Table, &c.PK, &c.CID, &val, &c.ColVersion, &c.DBVersion, &c.SiteID, &c.CL, &c.Seq); err != nil {
 			return nil, since, fmt.Errorf("crsync: scan change: %w", err)
 		}
+		c.Val = Value{X: val}
 		if c.DBVersion > max {
 			max = c.DBVersion
 		}
@@ -118,7 +196,7 @@ func Apply(ctx context.Context, db *sql.DB, changes []Change) error {
 	}
 	defer stmt.Close()
 	for _, c := range changes {
-		if _, err := stmt.ExecContext(ctx, c.Table, c.PK, c.CID, c.Val, c.ColVersion, c.DBVersion, c.SiteID, c.CL, c.Seq); err != nil {
+		if _, err := stmt.ExecContext(ctx, c.Table, c.PK, c.CID, c.Val.X, c.ColVersion, c.DBVersion, c.SiteID, c.CL, c.Seq); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("crsync: apply change to %q: %w", c.Table, err)
 		}
