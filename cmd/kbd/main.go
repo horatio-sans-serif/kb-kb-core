@@ -37,6 +37,7 @@ import (
 	"kb/internal/ssrf"
 	"kb/internal/store"
 	"kb/internal/surface"
+	"kb/internal/topics"
 )
 
 // Version is the build version reported by /healthz (override with -ldflags).
@@ -47,6 +48,10 @@ const jobRetention = 7 * 24 * time.Hour
 
 // decayInterval is how often the relevance decay sweep re-scores all artifacts.
 const decayInterval = 6 * time.Hour
+
+// clusterInterval is how often the topic-clustering sweep groups newly-embedded
+// artifacts into topics.
+const clusterInterval = 5 * time.Minute
 
 // sourcePollInterval is how often the scheduler checks for PULL sources due to
 // refresh (each source's own schedule decides whether it actually fetches).
@@ -215,6 +220,32 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 				return
 			case <-t.C:
 				runSweep()
+			}
+		}
+	}()
+
+	// Topic clustering: periodically group ready, embedded artifacts into topics by
+	// embedding similarity (incremental leader clustering). Runs more often than the
+	// decay sweep — a freshly-enriched artifact should be clustered promptly.
+	clusterer := topics.New(st)
+	runCluster := func() {
+		switch n, err := clusterer.Sweep(ctx); {
+		case err != nil && ctx.Err() == nil:
+			logger.Warn("topic clustering sweep", "err", err)
+		case n > 0:
+			logger.Info("topic clustering sweep", "clustered", n)
+		}
+	}
+	go func() {
+		runCluster()
+		t := time.NewTicker(clusterInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runCluster()
 			}
 		}
 	}()

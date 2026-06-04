@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+
+	"kb/internal/kb"
 )
 
 // Topic is defined in internal/kb (aliased in types.go).
@@ -86,6 +88,59 @@ func (r *TopicRepo) TopicsForArtifact(ctx context.Context, artifactID string) ([
 	}
 	defer rows.Close()
 	return scanTopics(rows)
+}
+
+// ClusterCandidate is a ready, embedded, not-yet-clustered artifact — the input
+// to the topic-assignment sweep.
+type ClusterCandidate struct {
+	ArtifactID string
+	Title      string
+	Embedding  []float32
+}
+
+// UnclusteredEmbeddings returns up to limit ready, live artifacts that have an
+// embedding but no topic assignment yet, with their latest embedding vector — the
+// incremental work list for the clusterer. Oldest first (by id) so clustering is
+// deterministic and stable.
+func (r *TopicRepo) UnclusteredEmbeddings(ctx context.Context, limit int) ([]ClusterCandidate, error) {
+	if limit <= 0 {
+		limit = surfaceDefaultLimit
+	}
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT e.artifact_id, a.title, e.payload
+		 FROM enrichments e
+		 JOIN artifacts a ON a.id = e.artifact_id AND a.deleted_at IS NULL AND a.status = 'ready'
+		 WHERE e.kind = 'embedding'
+		   AND e.id = (SELECT id FROM enrichments e2
+		               WHERE e2.artifact_id = e.artifact_id AND e2.kind = 'embedding'
+		               ORDER BY created_at DESC, id DESC LIMIT 1)
+		   AND a.id NOT IN (SELECT artifact_id FROM artifact_topics)
+		 ORDER BY a.id LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("unclustered embeddings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ClusterCandidate
+	for rows.Next() {
+		var c ClusterCandidate
+		var title sql.NullString
+		var payload string
+		if err := rows.Scan(&c.ArtifactID, &title, &payload); err != nil {
+			return nil, fmt.Errorf("scan cluster candidate: %w", err)
+		}
+		var p kb.EmbeddingPayload
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			return nil, fmt.Errorf("unmarshal embedding for %q: %w", c.ArtifactID, err)
+		}
+		if len(p.Vector) == 0 {
+			continue // an empty embedding is not clusterable
+		}
+		c.Title = title.String
+		c.Embedding = p.Vector
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func scanTopics(rows *sql.Rows) ([]*Topic, error) {

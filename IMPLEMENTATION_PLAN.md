@@ -1341,6 +1341,17 @@ The topics/artifact_topics tables exist from Phase 0.
   update needs); `TopicsForArtifact`.
 - **`kb.Topic`** domain type.
 
-**Next:** Stage 2 — topic-assignment stage (incremental leader clustering: nearest
-centroid above a threshold, else a new topic; running-mean centroid update in the
-effect tx). Stage 3 — topic query API + shares_topic graph edges.
+## Stage 2: Topic-assignment sweep
+
+**Status: Complete.** `topics.Clusterer` does incremental leader clustering as a
+periodic sweep (like the decay sweeper, so centroid running-means stay
+single-threaded): `store.TopicRepo.UnclusteredEmbeddings` yields ready, embedded,
+not-yet-clustered artifacts (oldest first); each joins the nearest topic whose
+centroid cosine >= 0.75 (updating that topic's running-mean centroid) or founds a
+new topic, all in one transaction (consistent mean, exactly-once assignment).
+Different-dimension centroids (a changed embed model) are skipped, so they
+naturally start new topics. A per-artifact failure is collected and the rest
+proceed. Wired into the daemon on a 5-minute ticker + at startup.
+
+**Next:** Stage 3 — topic query API (list topics, artifacts in a topic) +
+shares_topic graph edges.
