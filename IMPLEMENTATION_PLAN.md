@@ -1525,3 +1525,47 @@ members — read before the assign so it never self-edges, capped at
 (mirroring the entity hub cap). Done in the same assignment transaction
 (exactly-once, idempotent AddLink dedup). A `GET /graph/{id}` query now reflects
 both entity- and topic-based connectivity.
+
+---
+
+# Phase 17 — cr-sqlite peer sync (§8.16 / §6.0)
+
+The design's marquee step: replicate the knowledge core conflict-free across
+devices via cr-sqlite (the tables themselves become CRRs). The schema was built
+CRDT-ready throughout (narrow column patches, tombstones, synced-vs-local
+classification); this phase is the deciding test + the replication engine.
+
+## Stage 1: Deciding test + sync engine (build-tagged)
+
+**Status: Complete.** The §8.16 / "Phase 10" deciding test was run end to end and
+the engine built and proven against the real native extension:
+
+**Deciding-test result.** cr-sqlite v0.16.3 (darwin-aarch64) loads via
+mattn/go-sqlite3's `LoadExtension` (entrypoint `sqlite3_crsqlite_init`),
+`crsql_db_version`/`crsql_as_crr`/`crsql_changes` all work, and two replicas
+converge (verified). BUT `crsql_as_crr` rejects the current schema: it requires
+each synced table to have a **NOT NULL** primary key, **no non-PK unique indexes**,
+and **unchecked** foreign keys. The DB-enforced dedup (the canonical_url /
+content_hash / (kind,name) unique indexes) and checked FKs are therefore
+incompatible. Adopting cr-sqlite needs a schema migration that drops those unique
+indexes and moves dedup to application-level reconciliation (the design's `same_as`
+merge), and declares synced-table FKs unchecked — the tracked prerequisite before
+wiring the engine to the live store.
+
+- **`crsync.SyncedTables`/`LocalTables`/`IsSynced`** (pure, always built, tested):
+  the §6.0 classification — the knowledge core syncs; jobs, audit_log,
+  schema_migrations, and the FTS index are local and rebuilt. An unclassified table
+  fails safe to not-synced.
+- **`crsync` engine** (`//go:build crsqlite`, so the default build keeps no
+  cr-sqlite dependency and runs single-node): `Open` (driver loading the extension
+  per connection), `Available` (runtime degrade check), `AsCRR`, `Changes(since)`
+  (watermark pull), `Apply` (one-tx CRDT merge), `DBVersion`/`SiteID`, `Finalize`.
+- **Engine tests** (`//go:build crsqlite`, skip unless `KB_CRSQLITE_PATH` is set to
+  a cr-sqlite binary): two replicas exchanging distinct ULID-keyed rows converge;
+  incremental watermark pulls return only changes past the watermark and still
+  converge. Verified passing against cr-sqlite v0.16.3.
+
+**Next:** Stage 2 — the CRR-compatible schema migration + dedup-by-reconciliation
+(drop unique indexes, NOT NULL PKs, unchecked FKs, app-level same_as merge). Stage
+3 — the peer transport (changeset-exchange HTTP endpoints over Tailscale) + daemon
+wiring behind the extension's availability.
