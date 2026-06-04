@@ -38,6 +38,23 @@ func (r *ClaimRepo) Create(ctx context.Context, c *Claim) error {
 	return nil
 }
 
+// Get returns a claim by id, or ErrNotFound.
+func (r *ClaimRepo) Get(ctx context.Context, id string) (*Claim, error) {
+	rows, err := r.rq.QueryContext(ctx, `SELECT `+claimCols+` FROM claims WHERE id = ?`, id)
+	if err != nil {
+		return nil, fmt.Errorf("get claim %q: %w", id, err)
+	}
+	defer rows.Close()
+	cs, err := scanClaims(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(cs) == 0 {
+		return nil, fmt.Errorf("get claim %q: %w", id, ErrNotFound)
+	}
+	return cs[0], nil
+}
+
 // ListByArtifact returns an artifact's claims, oldest first.
 func (r *ClaimRepo) ListByArtifact(ctx context.Context, artifactID string) ([]*Claim, error) {
 	rows, err := r.rq.QueryContext(ctx,

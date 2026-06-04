@@ -1306,5 +1306,18 @@ set is restricted to cloud-safe (public/personal) claims so sensitive statements
 never leave the machine (§8.17), and the stage is gated on the artifact's own tier
 like summarize. Wired into the daemon pipeline after claims.
 
-**Next:** Stage 4 — conflict resolution API (`GET /conflicts`, `POST
-/conflicts/{id}` resolve/dismiss).
+## Stage 4: Conflict resolution API
+
+**Status: Complete.** `GET /conflicts?status=` lists detected contradictions
+(default open), each joined with both claim statements (via `ClaimRepo.Get`) for
+display. `POST /conflicts/{id}` `{status: resolved|dismissed, rationale?}` moves a
+conflict out of open (404 unknown, 400 for any status other than
+resolved/dismissed). Reads/writes the store directly (no Deps interface).
+
+This completes Phase 9 (conflict detection): claims/conflicts store, claim
+extraction, contradiction detection, and the resolution API. `conflict.detected`
+flows over the existing SSE event stream.
+
+**Deferred:** source-credibility signals from conflict-resolution outcomes;
+surfacing open conflicts into the digest; topic-cluster-scoped comparison (vs the
+current global vector pre-filter).

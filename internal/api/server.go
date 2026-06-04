@@ -127,6 +127,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /review", s.requireAuth(http.HandlerFunc(s.handleReview)))
 	mux.Handle("GET /review/due", s.requireAuth(http.HandlerFunc(s.handleReviewDue)))
 	mux.Handle("GET /graph/{id}", s.requireAuth(http.HandlerFunc(s.handleGraph)))
+	mux.Handle("GET /conflicts", s.requireAuth(http.HandlerFunc(s.handleListConflicts)))
+	mux.Handle("POST /conflicts/{id}", s.requireAuth(http.HandlerFunc(s.handleResolveConflict)))
 	return mux
 }
 
@@ -770,6 +772,114 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, toRenderJSON(rec))
+}
+
+type claimJSON struct {
+	ID         string `json:"id"`
+	ArtifactID string `json:"artifact_id"`
+	Statement  string `json:"statement"`
+}
+
+type conflictJSON struct {
+	ID        string    `json:"id"`
+	Status    string    `json:"status"`
+	Rationale string    `json:"rationale,omitempty"`
+	CreatedAt string    `json:"created_at"`
+	ClaimA    claimJSON `json:"claim_a"`
+	ClaimB    claimJSON `json:"claim_b"`
+}
+
+func validConflictStatus(s string) bool {
+	switch s {
+	case "open", "resolved", "dismissed":
+		return true
+	}
+	return false
+}
+
+// handleListConflicts lists detected contradictions for human resolution (§8.13),
+// each with both claim statements. ?status defaults to open.
+func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status")
+	if status == "" {
+		status = "open"
+	} else if !validConflictStatus(status) {
+		http.Error(w, "status must be open, resolved, or dismissed", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	conflicts, err := s.deps.Store.Conflicts.ListByStatus(ctx, status, maxSurfaceLimit)
+	if err != nil {
+		s.serverError(w, "list conflicts", err)
+		return
+	}
+	out := make([]conflictJSON, 0, len(conflicts))
+	for _, cf := range conflicts {
+		out = append(out, conflictJSON{
+			ID:        cf.ID,
+			Status:    cf.Status,
+			Rationale: cf.Rationale,
+			CreatedAt: cf.CreatedAt,
+			ClaimA:    s.claimJSON(ctx, cf.ClaimA),
+			ClaimB:    s.claimJSON(ctx, cf.ClaimB),
+		})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"conflicts": out})
+}
+
+// claimJSON loads a claim's display fields; a missing claim (shouldn't happen via
+// the FK) degrades to just the id rather than failing the whole list.
+func (s *Server) claimJSON(ctx context.Context, id string) claimJSON {
+	c, err := s.deps.Store.Claims.Get(ctx, id)
+	if err != nil {
+		return claimJSON{ID: id}
+	}
+	return claimJSON{ID: c.ID, ArtifactID: c.ArtifactID, Statement: c.Statement}
+}
+
+type resolveConflictRequest struct {
+	Status    string `json:"status"` // resolved | dismissed
+	Rationale string `json:"rationale,omitempty"`
+}
+
+// handleResolveConflict moves a conflict to resolved or dismissed with an optional
+// rationale (§8.13: surfaced for human resolution).
+func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid conflict id", http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req resolveConflictRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.Status != "resolved" && req.Status != "dismissed" {
+		http.Error(w, "status must be 'resolved' or 'dismissed'", http.StatusBadRequest)
+		return
+	}
+	if len(req.Rationale) > maxTitleBytes {
+		http.Error(w, "rationale too long", http.StatusBadRequest)
+		return
+	}
+
+	err := s.deps.Store.Conflicts.SetStatus(r.Context(), id, req.Status, req.Rationale)
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "unknown conflict", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.serverError(w, "resolve conflict", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type entityJSON struct {
