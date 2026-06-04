@@ -123,6 +123,27 @@ func (r *SourceRepo) ListEnabledByKind(ctx context.Context, kind string) ([]*Sou
 	return out, rows.Err()
 }
 
+// ListWithBudget returns sources that have a storage_budget set — the work list
+// for budget enforcement.
+func (r *SourceRepo) ListWithBudget(ctx context.Context) ([]*Source, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT `+sourceCols+` FROM sources WHERE storage_budget IS NOT NULL ORDER BY created_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list budgeted sources: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Source
+	for rows.Next() {
+		s, err := scanSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // UpdateFetchState records the outcome of a poll: the new cursor, the time it ran,
 // and the health snapshot. Narrow update of the fetch-state columns only.
 func (r *SourceRepo) UpdateFetchState(ctx context.Context, id string, cursor, lastFetchedAt, health *string) error {

@@ -1389,6 +1389,16 @@ protects an artifact) and applies any tier change as a periodic sweep:
   tier. Unscored artifacts are exempt; per-artifact failures are collected.
 - `kb.ArtifactPatch` gained `LifecycleTier`; wired into the daemon on a 6h ticker.
 
-**Next:** Stage 2 — per-source storage budgets (cap a noisy feed). Stage 3 —
-compaction (hard-delete tombstoned artifacts + cascade derived rows past a grace
-period) + a lifecycle status endpoint.
+## Stage 2: Per-source storage budgets
+
+**Status: Complete.** `Sweeper.EnforceBudgets` caps how many of a source's
+artifacts stay active, so a noisy feed can't dominate (§8.12). For each source
+with a `storage_budget`, it counts the distinct live, active-tier, scored
+artifacts encountered from it and archives the lowest-relevance excess
+(active->archive, keeping the content out of the active footprint). Idempotent
+once within budget. Backed by `SourceRepo.ListWithBudget`,
+`EncounterRepo.ActiveArtifactCountForSource` / `LowestRelevanceActiveForSource`.
+Run alongside the lifecycle sweep in the daemon.
+
+**Next:** Stage 3 — compaction (hard-delete tombstoned artifacts + cascade derived
+rows past a grace period) + a lifecycle status endpoint.

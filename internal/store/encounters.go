@@ -52,6 +52,50 @@ func (r *EncounterRepo) DistinctSourceCountForArtifact(ctx context.Context, arti
 	return n, nil
 }
 
+// ActiveArtifactCountForSource counts the distinct live, active-tier, scored
+// artifacts encountered from a source — the footprint a storage budget caps.
+func (r *EncounterRepo) ActiveArtifactCountForSource(ctx context.Context, sourceID string) (int, error) {
+	var n int
+	err := r.rq.QueryRowContext(ctx,
+		`SELECT COUNT(DISTINCT e.artifact_id) FROM encounters e
+		 JOIN artifacts a ON a.id = e.artifact_id
+		   AND a.deleted_at IS NULL AND a.lifecycle_tier = 'active' AND a.relevance_score IS NOT NULL
+		 WHERE e.source_id = ?`, sourceID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("active artifact count for source %q: %w", sourceID, err)
+	}
+	return n, nil
+}
+
+// LowestRelevanceActiveForSource returns up to limit distinct live, active-tier,
+// scored artifact ids encountered from a source, lowest relevance first — the
+// excess a storage budget archives.
+func (r *EncounterRepo) LowestRelevanceActiveForSource(ctx context.Context, sourceID string, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT DISTINCT e.artifact_id, a.relevance_score FROM encounters e
+		 JOIN artifacts a ON a.id = e.artifact_id
+		   AND a.deleted_at IS NULL AND a.lifecycle_tier = 'active' AND a.relevance_score IS NOT NULL
+		 WHERE e.source_id = ?
+		 ORDER BY a.relevance_score ASC, e.artifact_id LIMIT ?`, sourceID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("lowest-relevance artifacts for source %q: %w", sourceID, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		var score float64
+		if err := rows.Scan(&id, &score); err != nil {
+			return nil, fmt.Errorf("scan budget artifact: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // MaxSourceWeightForArtifact returns the weight of the most authoritative source
 // that has encountered the artifact (the relevance source_weight factor, §8.9).
 // Defaults to 1.0 when the artifact has no encounters — a neutral weight that

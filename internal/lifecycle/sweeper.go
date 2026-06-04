@@ -111,6 +111,51 @@ func (s *Sweeper) Sweep(ctx context.Context) (Stats, error) {
 	return stats, errors.Join(errs...)
 }
 
+// EnforceBudgets archives the lowest-relevance active artifacts of any source that
+// is over its storage budget, so a noisy feed can't dominate the active set
+// (§8.12). Archiving (not purging) keeps the content but out of the active
+// footprint, and the count is of active-tier artifacts, so the budget is a cap on
+// how many of a source's artifacts stay active at once. Returns how many it
+// archived.
+func (s *Sweeper) EnforceBudgets(ctx context.Context) (int, error) {
+	srcs, err := s.st.Sources.ListWithBudget(ctx)
+	if err != nil {
+		return 0, err
+	}
+	archived := 0
+	var errs []error
+	for _, src := range srcs {
+		if src.StorageBudget == nil {
+			continue
+		}
+		count, err := s.st.Encounters.ActiveArtifactCountForSource(ctx, src.ID)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		over := count - *src.StorageBudget
+		if over <= 0 {
+			continue
+		}
+		ids, err := s.st.Encounters.LowestRelevanceActiveForSource(ctx, src.ID, over)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, id := range ids {
+			if err := s.apply(ctx, id, kb.Archive); err != nil {
+				if ctx.Err() != nil {
+					return archived, err
+				}
+				errs = append(errs, fmt.Errorf("budget archive %q: %w", id, err))
+				continue
+			}
+			archived++
+		}
+	}
+	return archived, errors.Join(errs...)
+}
+
 // apply sets an artifact's lifecycle tier; a purge also tombstones it (the tier is
 // patched first, while the row is still live, then the soft-delete lands — both in
 // one transaction).

@@ -48,6 +48,49 @@ func seedScored(t *testing.T, st *store.Store, hash string, score float64, first
 	return got.ID
 }
 
+func TestSweeper_EnforceBudgets(t *testing.T) {
+	ctx := context.Background()
+	st := storetest.New(t)
+	budget := 2
+	src := &store.Source{Kind: "PULL", Connector: "rss", StorageBudget: &budget}
+	if err := st.Sources.Create(ctx, src); err != nil {
+		t.Fatalf("source: %v", err)
+	}
+	mk := func(hash string, score float64) string {
+		id := seedScored(t, st, hash, score, store.Now())
+		_ = st.Encounters.Record(ctx, &store.Encounter{ArtifactID: id, SourceID: src.ID, SeenAt: store.Now()})
+		return id
+	}
+	lo := mk("h1", 0.1)
+	mid := mk("h2", 0.2)
+	hi1 := mk("h3", 0.8)
+	hi2 := mk("h4", 0.9)
+
+	sw := New(st)
+	n, err := sw.EnforceBudgets(ctx)
+	if err != nil {
+		t.Fatalf("enforce: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("archived %d, want 2 (the over-budget excess)", n)
+	}
+
+	tier := func(id string) kb.LifecycleTier {
+		a, _ := st.Artifacts.Get(ctx, id)
+		return a.LifecycleTier
+	}
+	if tier(lo) != kb.Archive || tier(mid) != kb.Archive {
+		t.Errorf("lowest-relevance excess should be archived: lo=%q mid=%q", tier(lo), tier(mid))
+	}
+	if tier(hi1) != kb.Active || tier(hi2) != kb.Active {
+		t.Errorf("the most relevant should stay active: hi1=%q hi2=%q", tier(hi1), tier(hi2))
+	}
+	// Re-running is a no-op now that the source is within budget.
+	if n2, _ := sw.EnforceBudgets(ctx); n2 != 0 {
+		t.Errorf("second enforce archived %d, want 0 (now within budget)", n2)
+	}
+}
+
 func TestSweeper_TransitionsTiers(t *testing.T) {
 	ctx := context.Background()
 	st := storetest.New(t)
