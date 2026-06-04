@@ -1215,14 +1215,14 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "get entity", err)
 		return
 	}
-	ids, err := s.deps.Store.Graph.ArtifactsForEntity(ctx, id)
+	refs, err := s.deps.Store.Graph.EntityArtifacts(ctx, id, maxSurfaceLimit)
 	if err != nil {
 		s.serverError(w, "entity artifacts", err)
 		return
 	}
-	out := entityDetailJSON{ID: e.ID, Kind: e.Kind, Name: e.Name, Aliases: e.Aliases, Artifacts: make([]graphNodeJSON, 0, len(ids))}
-	for _, aid := range ids {
-		out.Artifacts = append(out.Artifacts, s.graphNode(ctx, aid))
+	out := entityDetailJSON{ID: e.ID, Kind: e.Kind, Name: e.Name, Aliases: e.Aliases, Artifacts: make([]graphNodeJSON, 0, len(refs))}
+	for _, ref := range refs {
+		out.Artifacts = append(out.Artifacts, graphNodeJSON{ArtifactID: ref.ID, Title: ref.Title, URL: ref.URL})
 	}
 	s.writeJSON(w, http.StatusOK, out)
 }
@@ -1243,30 +1243,16 @@ func (s *Server) handleBacklinks(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "backlinks artifact", err)
 		return
 	}
-	links, err := s.deps.Store.Graph.Backlinks(ctx, id)
+	links, err := s.deps.Store.Graph.Backlinks(ctx, id, maxSurfaceLimit)
 	if err != nil {
 		s.serverError(w, "backlinks", err)
 		return
 	}
 	out := make([]backlinkJSON, 0, len(links))
 	for _, l := range links {
-		n := s.graphNode(ctx, l.SrcID)
-		out = append(out, backlinkJSON{ArtifactID: n.ArtifactID, Title: n.Title, URL: n.URL, Relation: l.Relation})
+		out = append(out, backlinkJSON{ArtifactID: l.ID, Title: l.Title, URL: l.URL, Relation: l.Relation})
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"backlinks": out})
-}
-
-// graphNode loads an artifact's display fields; a tombstoned/missing one degrades
-// to just its id.
-func (s *Server) graphNode(ctx context.Context, id string) graphNodeJSON {
-	n := graphNodeJSON{ArtifactID: id}
-	if a, err := s.deps.Store.Artifacts.GetLive(ctx, id); err == nil {
-		n.Title = a.Title
-		if a.CanonicalURL != nil {
-			n.URL = *a.CanonicalURL
-		}
-	}
-	return n
 }
 
 type graphNodeJSON struct {

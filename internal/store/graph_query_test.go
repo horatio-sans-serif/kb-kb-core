@@ -63,12 +63,32 @@ func TestGraph_Backlinks(t *testing.T) {
 	_ = st.Graph.AddLink(ctx, target, b, "references", 1.0)
 	_ = st.Artifacts.SoftDelete(ctx, gone)
 
-	back, err := st.Graph.Backlinks(ctx, target)
+	back, err := st.Graph.Backlinks(ctx, target, 10)
 	if err != nil {
 		t.Fatalf("backlinks: %v", err)
 	}
 	// Only a (live, incoming). gone is tombstoned; b is outgoing.
-	if len(back) != 1 || back[0].SrcID != a || back[0].Relation != "references" {
-		t.Errorf("backlinks = %+v, want [a/references]", back)
+	if len(back) != 1 || back[0].ID != a || back[0].Title != "ha" || back[0].Relation != "references" {
+		t.Errorf("backlinks = %+v, want [a/references with title]", back)
+	}
+}
+
+func TestGraph_EntityArtifactsLimit(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	id, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "technology", Name: "Go"})
+	for i := 0; i < 5; i++ {
+		a := art(t, st, "h"+string(rune('a'+i)))
+		_ = st.Graph.LinkArtifactEntity(ctx, a, id)
+	}
+	refs, err := st.Graph.EntityArtifacts(ctx, id, 3)
+	if err != nil {
+		t.Fatalf("entity artifacts: %v", err)
+	}
+	if len(refs) != 3 {
+		t.Errorf("limit 3 should cap the result, got %d", len(refs))
+	}
+	if refs[0].Title == "" {
+		t.Errorf("display fields should be joined in, got %+v", refs[0])
 	}
 }

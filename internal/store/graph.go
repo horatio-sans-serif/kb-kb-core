@@ -152,19 +152,51 @@ func (r *GraphRepo) GetEntity(ctx context.Context, id string) (*kb.Entity, error
 	return e, nil
 }
 
-// Backlink is one incoming edge: a live artifact that links TO the queried one.
+// ArtifactRef is an artifact's display fields, joined into a graph query so the
+// caller needs no per-row lookup.
+type ArtifactRef struct {
+	ID    string
+	Title string
+	URL   string
+}
+
+const graphDefaultLimit = 50
+
+// EntityArtifacts returns up to limit live artifacts that mention an entity, with
+// their display fields (id, title, url), oldest first.
+func (r *GraphRepo) EntityArtifacts(ctx context.Context, entityID string, limit int) ([]ArtifactRef, error) {
+	if limit <= 0 {
+		limit = graphDefaultLimit
+	}
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT a.id, a.title, a.canonical_url FROM artifact_entities ae
+		 JOIN artifacts a ON a.id = ae.artifact_id AND a.deleted_at IS NULL
+		 WHERE ae.entity_id = ? ORDER BY a.id LIMIT ?`, entityID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("artifacts for entity %q: %w", entityID, err)
+	}
+	defer rows.Close()
+	return scanArtifactRefs(rows)
+}
+
+// Backlink is one incoming edge: a live artifact that links TO the queried one,
+// under a relation. The same source appears once per relation (a source linking
+// under two relations yields two backlinks).
 type Backlink struct {
-	SrcID    string
+	ArtifactRef
 	Relation string
 }
 
-// Backlinks returns the live artifacts that link to artifactID (incoming edges) —
-// the reverse-direction graph query (§8.7).
-func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string) ([]Backlink, error) {
+// Backlinks returns up to limit live artifacts that link to artifactID (incoming
+// edges) with their display fields — the reverse-direction graph query (§8.7).
+func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string, limit int) ([]Backlink, error) {
+	if limit <= 0 {
+		limit = graphDefaultLimit
+	}
 	rows, err := r.rq.QueryContext(ctx,
-		`SELECT DISTINCT l.src_id, l.relation FROM links l
+		`SELECT DISTINCT l.src_id, a.title, a.canonical_url, l.relation FROM links l
 		 JOIN artifacts a ON a.id = l.src_id AND a.deleted_at IS NULL
-		 WHERE l.dst_id = ? ORDER BY l.src_id, l.relation`, artifactID)
+		 WHERE l.dst_id = ? ORDER BY l.src_id, l.relation LIMIT ?`, artifactID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("backlinks for %q: %w", artifactID, err)
 	}
@@ -173,10 +205,26 @@ func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string) ([]Backlin
 	var out []Backlink
 	for rows.Next() {
 		var b Backlink
-		if err := rows.Scan(&b.SrcID, &b.Relation); err != nil {
+		var title, u sql.NullString
+		if err := rows.Scan(&b.ID, &title, &u, &b.Relation); err != nil {
 			return nil, fmt.Errorf("scan backlink: %w", err)
 		}
+		b.Title, b.URL = title.String, u.String
 		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func scanArtifactRefs(rows *sql.Rows) ([]ArtifactRef, error) {
+	var out []ArtifactRef
+	for rows.Next() {
+		var ref ArtifactRef
+		var title, u sql.NullString
+		if err := rows.Scan(&ref.ID, &title, &u); err != nil {
+			return nil, fmt.Errorf("scan artifact ref: %w", err)
+		}
+		ref.Title, ref.URL = title.String, u.String
+		out = append(out, ref)
 	}
 	return out, rows.Err()
 }

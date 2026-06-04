@@ -68,6 +68,10 @@ func TestEntities_GetUnknownIs404(t *testing.T) {
 	if rec := doGet(h, "/entities/01HMISSING", "tok"); rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
+	// A control-character-bearing id is rejected as malformed (400) before lookup.
+	if rec := doGet(h, "/entities/%00bad", "tok"); rec.Code != http.StatusBadRequest && rec.Code != http.StatusNotFound {
+		t.Errorf("malformed id status = %d, want 400/404", rec.Code)
+	}
 }
 
 func TestEntities_Backlinks(t *testing.T) {
