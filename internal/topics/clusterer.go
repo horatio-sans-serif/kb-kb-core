@@ -139,22 +139,12 @@ func (c *Clusterer) linkSharesTopic(ctx context.Context, tx *store.Store, artifa
 		if m.ArtifactID == artifactID {
 			continue
 		}
-		src, dst := canonicalPair(artifactID, m.ArtifactID)
+		src, dst := kb.CanonicalPair(artifactID, m.ArtifactID)
 		if err := tx.Graph.AddLink(ctx, src, dst, "shares_topic", 1.0); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// canonicalPair orders two ids so the same unordered pair always yields the same
-// directed edge, letting AddLink's (src,dst,relation) dedup work regardless of
-// which artifact's assignment discovers the shared topic.
-func canonicalPair(a, b string) (string, string) {
-	if a <= b {
-		return a, b
-	}
-	return b, a
 }
 
 // nearest returns the topic whose centroid is most cosine-similar to vec, and that

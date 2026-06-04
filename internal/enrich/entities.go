@@ -160,7 +160,7 @@ func materialize(ctx context.Context, g kb.GraphTx, artifactID string, ex extrac
 		if other == artifactID {
 			continue
 		}
-		src, dst := canonicalPair(artifactID, other)
+		src, dst := kb.CanonicalPair(artifactID, other)
 		if err := g.AddLink(ctx, src, dst, "shares_entity", 1.0); err != nil {
 			return err
 		}
@@ -199,16 +199,6 @@ func (e *Entities) extract(ctx context.Context, title, body string) (entitiesOut
 		return entitiesOutput{}, fmt.Errorf("entities: parse model JSON: %w", err)
 	}
 	return out, nil
-}
-
-// canonicalPair orders two ids so the same unordered pair always yields the same
-// directed edge, letting AddLink's (src,dst,relation) dedup work no matter which
-// artifact's enrichment discovers the shared entity.
-func canonicalPair(a, b string) (string, string) {
-	if a <= b {
-		return a, b
-	}
-	return b, a
 }
 
 // normalizeAliases trims, de-duplicates, drops empties/over-long, and caps aliases.

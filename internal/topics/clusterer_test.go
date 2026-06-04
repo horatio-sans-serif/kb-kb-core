@@ -3,6 +3,7 @@ package topics
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"kb/internal/kb"
@@ -76,6 +77,47 @@ func TestClusterer_AddsSharesTopicEdges(t *testing.T) {
 	}
 	if cn, _ := st.Graph.NeighborIDs(ctx, []string{c}); len(cn) != 0 {
 		t.Errorf("a separate-topic artifact should have no co-topic edge, got %v", cn)
+	}
+}
+
+func TestClusterer_SharesTopicMultiMember(t *testing.T) {
+	// Three co-topic artifacts form a triangle of shares_topic edges (the loop +
+	// canonical dedup, exercised beyond N=1).
+	ctx := context.Background()
+	st := storetest.New(t)
+	a := seed(t, st, "ha", "A", []float32{1, 0})
+	b := seed(t, st, "hb", "B", []float32{1, 0})
+	c := seed(t, st, "hc", "C", []float32{1, 0})
+	if _, err := NewWithThreshold(st, 0.5, 100).Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	for _, id := range []string{a, b, c} {
+		nbrs, _ := st.Graph.NeighborIDs(ctx, []string{id})
+		if len(nbrs) != 2 {
+			t.Errorf("artifact %s should connect to the other 2 co-topic artifacts, got %v", id, nbrs)
+		}
+	}
+}
+
+func TestClusterer_SharesTopicFanoutCapped(t *testing.T) {
+	// A topic already at the fan-out cap must not add new pairwise edges for a
+	// further joiner (hub guard).
+	ctx := context.Background()
+	st := storetest.New(t)
+	cl := NewWithThreshold(st, 0.0, 1000)  // threshold 0 → everything joins one topic
+	for i := 0; i <= maxTopicFanout; i++ { // seed maxTopicFanout+1 members
+		seed(t, st, "h"+strconv.Itoa(i), "m", []float32{1, 0})
+		if _, err := cl.Sweep(ctx); err != nil { // sweep per insert so each clusters in turn
+			t.Fatalf("sweep %d: %v", i, err)
+		}
+	}
+	// One more joiner: the topic now exceeds the cap, so it gets no pairwise edges.
+	late := seed(t, st, "hlate", "late", []float32{1, 0})
+	if _, err := cl.Sweep(ctx); err != nil {
+		t.Fatalf("late sweep: %v", err)
+	}
+	if nbrs, _ := st.Graph.NeighborIDs(ctx, []string{late}); len(nbrs) != 0 {
+		t.Errorf("a joiner of an over-cap hub topic should get no edges, got %d", len(nbrs))
 	}
 }
 

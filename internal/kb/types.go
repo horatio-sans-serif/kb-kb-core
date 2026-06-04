@@ -273,6 +273,17 @@ func ValidRelation(rel string) bool {
 	return false
 }
 
+// CanonicalPair orders two artifact ids so an unordered pair always maps to the
+// same directed (src, dst) edge. Both the entity and topic stages use it so a
+// shared link discovered from either artifact dedups against the links unique
+// index — the one home for the graph-direction contract.
+func CanonicalPair(a, b string) (string, string) {
+	if a <= b {
+		return a, b
+	}
+	return b, a
+}
+
 // ReviewState is an artifact's spaced-repetition schedule (design §6.9): an
 // SM-2 record of when it is next due, the current interval and ease factor, and
 // how many successful reviews it has had. One row per artifact (artifact_id PK).
