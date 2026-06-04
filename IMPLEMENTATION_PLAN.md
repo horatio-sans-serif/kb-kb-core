@@ -1565,7 +1565,34 @@ wiring the engine to the live store.
   incremental watermark pulls return only changes past the watermark and still
   converge. Verified passing against cr-sqlite v0.16.3.
 
-**Next:** Stage 2 — the CRR-compatible schema migration + dedup-by-reconciliation
-(drop unique indexes, NOT NULL PKs, unchecked FKs, app-level same_as merge). Stage
-3 — the peer transport (changeset-exchange HTTP endpoints over Tailscale) + daemon
-wiring behind the extension's availability.
+## Stage 2: Dedup by reconciliation (cr-sqlite-compatible)
+
+Move dedup off the DB unique constraints (which cr-sqlite forbids on replicated
+tables) to application logic + post-sync reconciliation — duplicates may briefly
+exist across offline replicas and are merged back into one.
+
+### Stage 2a: Artifact dedup -> application-level
+
+**Status: Complete.** UpsertByCanonical/ByContentHash now find the live row
+carrying the dedup key (find-then-insert), atomic inside the ingest Tx, instead of
+INSERT ... ON CONFLICT(unique index). Migration 0011 drops the artifact unique
+indexes (non-unique ones kept for lookup). A single replica still never makes a
+duplicate; concurrent in-tx upserts of the same URL collapse to one.
+
+### Stage 2b: same_as merge + reconcile sweep
+
+**Status: Complete.** `ArtifactRepo.Merge(survivor, loser)` folds a duplicate into
+its survivor — re-points the loser's children (encounters, enrichments,
+artifact_entities/topics, review_schedule, links) with UPDATE OR IGNORE +
+drop-leftover so shared rows dedup without a PK collision, drops the loser's
+claims/conflicts, and tombstones the loser. `DuplicateGroups` finds live artifacts
+sharing a canonical_url/content_hash (id-ascending, so the survivor is
+deterministic across replicas). `reconcile.Sweeper.Sweep` merges each group into
+its lowest-id survivor — idempotent, so a re-run after sync is safe. Wired into the
+daemon on a 10-minute ticker (single-node it finds nothing).
+
+**Next:** Stage 2c — the same dedup move for entities/claims/conflicts/links (drop
+their unique indexes + reconcile or read-side dedup) and NOT NULL PKs + unchecked
+FKs on synced tables, so crsql_as_crr accepts them. Stage 3 — peer transport
+(changeset-exchange HTTP over Tailscale) + daemon wiring behind extension
+availability.

@@ -28,6 +28,7 @@ import (
 	"kb/internal/llm"
 	"kb/internal/pipeline"
 	"kb/internal/rag"
+	"kb/internal/reconcile"
 	"kb/internal/relevance"
 	"kb/internal/relsignals"
 	"kb/internal/render"
@@ -58,6 +59,10 @@ const clusterInterval = 5 * time.Minute
 // lifecycleInterval is how often the lifecycle sweep transitions artifacts
 // active -> archive -> purge.
 const lifecycleInterval = 6 * time.Hour
+
+// reconcileInterval is how often the reconcile sweep merges cross-replica
+// duplicate artifacts.
+const reconcileInterval = 10 * time.Minute
 
 // sourcePollInterval is how often the scheduler checks for PULL sources due to
 // refresh (each source's own schedule decides whether it actually fetches).
@@ -252,6 +257,32 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 				return
 			case <-t.C:
 				runCluster()
+			}
+		}
+	}()
+
+	// Reconcile: merge cross-replica duplicate artifacts (the same_as dedup after
+	// sync, §8.2/§8.16). Single-node it finds nothing; once peers sync, it collapses
+	// duplicates created offline into one survivor.
+	reconciler := reconcile.New(st)
+	runReconcile := func() {
+		switch n, err := reconciler.Sweep(ctx); {
+		case err != nil && ctx.Err() == nil:
+			logger.Warn("artifact reconcile sweep", "err", err)
+		case n > 0:
+			logger.Info("artifact reconcile sweep", "merged", n)
+		}
+	}
+	go func() {
+		runReconcile()
+		t := time.NewTicker(reconcileInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runReconcile()
 			}
 		}
 	}()

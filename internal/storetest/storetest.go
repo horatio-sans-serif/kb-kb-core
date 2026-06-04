@@ -3,6 +3,7 @@
 package storetest
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -12,6 +13,14 @@ import (
 // New opens a fresh temp SQLite store, migrates it, and returns it. The
 // underlying database is closed via t.Cleanup.
 func New(t *testing.T) *store.Store {
+	st, _ := NewWithDB(t)
+	return st
+}
+
+// NewWithDB is New but also returns the raw *sql.DB, so a test can set up state the
+// public store API deliberately prevents — e.g. inserting the cross-replica
+// duplicate artifacts the reconcile sweep merges.
+func NewWithDB(t *testing.T) (*store.Store, *sql.DB) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "kb.db"))
 	if err != nil {
@@ -21,5 +30,5 @@ func New(t *testing.T) *store.Store {
 	if _, err := store.Migrate(db); err != nil {
 		t.Fatalf("storetest: migrate: %v", err)
 	}
-	return store.New(db)
+	return store.New(db), db
 }

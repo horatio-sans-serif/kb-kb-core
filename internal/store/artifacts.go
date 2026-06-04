@@ -348,6 +348,117 @@ func (r *ArtifactRepo) EnrichingIDs(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
+// Merge folds the loser artifact into the survivor (the design's same_as dedup):
+// it re-points the loser's child rows to the survivor — UPDATE OR IGNORE then drop
+// any that would have duplicated an existing survivor row (a shared encounter
+// source, entity, topic, …) — drops the loser's claims and their conflicts (the
+// survivor keeps its own derived ones), and tombstones the loser. The caller picks
+// the survivor deterministically (lowest id) so independent replicas converge on
+// the same merge. Idempotent and live-scoped: a survivor==loser or already-merged
+// loser is a no-op. MUST run inside a Tx (the reconcile sweep wraps it).
+func (r *ArtifactRepo) Merge(ctx context.Context, survivorID, loserID string) error {
+	if survivorID == loserID {
+		return nil
+	}
+	reassign := func(table, col string) error {
+		if _, err := r.q.ExecContext(ctx, `UPDATE OR IGNORE `+table+` SET `+col+` = ? WHERE `+col+` = ?`, survivorID, loserID); err != nil {
+			return fmt.Errorf("merge re-point %s.%s: %w", table, col, err)
+		}
+		if _, err := r.q.ExecContext(ctx, `DELETE FROM `+table+` WHERE `+col+` = ?`, loserID); err != nil {
+			return fmt.Errorf("merge cleanup %s.%s: %w", table, col, err)
+		}
+		return nil
+	}
+	for _, tc := range []struct{ table, col string }{
+		{"encounters", "artifact_id"},
+		{"enrichments", "artifact_id"},
+		{"artifact_entities", "artifact_id"},
+		{"artifact_topics", "artifact_id"},
+		{"review_schedule", "artifact_id"},
+		{"links", "src_id"},
+		{"links", "dst_id"},
+	} {
+		if err := reassign(tc.table, tc.col); err != nil {
+			return err
+		}
+	}
+	// The loser's claims (and the conflicts referencing them) are dropped — the
+	// survivor keeps its own; conflicts re-detect over the merged set.
+	if _, err := r.q.ExecContext(ctx,
+		`DELETE FROM conflicts WHERE claim_a IN (SELECT id FROM claims WHERE artifact_id = ?)
+		    OR claim_b IN (SELECT id FROM claims WHERE artifact_id = ?)`, loserID, loserID); err != nil {
+		return fmt.Errorf("merge loser conflicts: %w", err)
+	}
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM claims WHERE artifact_id = ?`, loserID); err != nil {
+		return fmt.Errorf("merge loser claims: %w", err)
+	}
+	ts := now()
+	if _, err := r.q.ExecContext(ctx,
+		`UPDATE artifacts SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		ts, ts, loserID); err != nil {
+		return fmt.Errorf("merge tombstone loser %q: %w", loserID, err)
+	}
+	return r.reindexFTS(ctx, loserID) // drop the tombstoned loser from the FTS index
+}
+
+// DuplicateGroups returns the sets of live artifacts that share a dedup key (a
+// canonical_url or a content_hash) — the cross-replica duplicates the reconcile
+// sweep merges. Each group has 2+ members, id-ascending (so the caller's survivor
+// is deterministic). A group never mixes the two key kinds.
+func (r *ArtifactRepo) DuplicateGroups(ctx context.Context) ([][]string, error) {
+	var out [][]string
+	for _, keyCol := range []string{"canonical_url", "content_hash"} {
+		groups, err := r.dupGroupsByKey(ctx, keyCol)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, groups...)
+	}
+	return out, nil
+}
+
+// dupGroupsByKey returns the id groups (2+, id-ascending) of live artifacts that
+// share a value in keyCol (a trusted constant column name).
+func (r *ArtifactRepo) dupGroupsByKey(ctx context.Context, keyCol string) ([][]string, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT `+keyCol+`, id FROM artifacts
+		 WHERE `+keyCol+` IS NOT NULL AND deleted_at IS NULL
+		   AND `+keyCol+` IN (
+		     SELECT `+keyCol+` FROM artifacts
+		     WHERE `+keyCol+` IS NOT NULL AND deleted_at IS NULL
+		     GROUP BY `+keyCol+` HAVING COUNT(*) > 1)
+		 ORDER BY `+keyCol+`, id`)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate groups by %s: %w", keyCol, err)
+	}
+	defer rows.Close()
+	return groupByKey(rows)
+}
+
+// groupByKey collapses (key, id) rows (ordered by key, id) into per-key id slices.
+func groupByKey(rows *sql.Rows) ([][]string, error) {
+	var out [][]string
+	var curKey string
+	var cur []string
+	for rows.Next() {
+		var key, id string
+		if err := rows.Scan(&key, &id); err != nil {
+			return nil, fmt.Errorf("scan dup row: %w", err)
+		}
+		if key != curKey {
+			if len(cur) > 1 {
+				out = append(out, cur)
+			}
+			curKey, cur = key, nil
+		}
+		cur = append(cur, id)
+	}
+	if len(cur) > 1 {
+		out = append(out, cur)
+	}
+	return out, rows.Err()
+}
+
 // SoftDelete sets the tombstone (deleted_at). Idempotent: a no-op on an already
 // deleted row. Tombstones, not hard deletes, so the row merges cleanly under
 // cr-sqlite (design 6.0).
