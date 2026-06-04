@@ -121,6 +121,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /ask", s.requireAuth(http.HandlerFunc(s.handleAsk)))
 	mux.Handle("POST /sources", s.requireAuth(http.HandlerFunc(s.handleCreateSource)))
 	mux.Handle("GET /sources", s.requireAuth(http.HandlerFunc(s.handleListSources)))
+	mux.Handle("PATCH /sources/{id}", s.requireAuth(http.HandlerFunc(s.handleUpdateSource)))
+	mux.Handle("DELETE /sources/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteSource)))
 	mux.Handle("POST /render", s.requireAuth(http.HandlerFunc(s.handleRender)))
 	mux.Handle("GET /renders", s.requireAuth(http.HandlerFunc(s.handleListRenders)))
 	mux.Handle("GET /surface", s.requireAuth(http.HandlerFunc(s.handleSurface)))
@@ -426,6 +428,107 @@ func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toSourceJSON(src))
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"sources": out})
+}
+
+type updateSourceRequest struct {
+	Config         json.RawMessage `json:"config,omitempty"`
+	Schedule       json.RawMessage `json:"schedule,omitempty"`
+	DefaultPrivacy string          `json:"default_privacy,omitempty"`
+	StorageBudget  *int            `json:"storage_budget,omitempty"`
+	Enabled        *bool           `json:"enabled,omitempty"`
+}
+
+// handleUpdateSource applies a partial update to a source's mutable fields (config,
+// schedule, default_privacy, storage_budget, enabled). id and connector are
+// immutable. Omitted fields are unchanged.
+func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid source id", http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var req updateSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	switch {
+	case len(req.Config) > 0 && !isJSONObject(req.Config):
+		http.Error(w, "config must be a JSON object", http.StatusBadRequest)
+		return
+	case len(req.Schedule) > 0 && !isJSONObject(req.Schedule):
+		http.Error(w, "schedule must be a JSON object", http.StatusBadRequest)
+		return
+	case req.DefaultPrivacy != "" && !validPrivacy(req.DefaultPrivacy):
+		http.Error(w, "invalid default_privacy", http.StatusBadRequest)
+		return
+	case req.StorageBudget != nil && *req.StorageBudget < 0:
+		http.Error(w, "storage_budget must be non-negative", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	src, err := s.deps.Store.Sources.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown source", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "get source", err)
+		return
+	}
+	if len(req.Config) > 0 {
+		src.Config = string(req.Config)
+	}
+	if len(req.Schedule) > 0 {
+		sc := string(req.Schedule)
+		src.Schedule = &sc
+	}
+	if req.DefaultPrivacy != "" {
+		src.DefaultPrivacy = kb.PrivacyTier(req.DefaultPrivacy)
+	}
+	if req.StorageBudget != nil {
+		src.StorageBudget = req.StorageBudget
+	}
+	if req.Enabled != nil {
+		src.Enabled = *req.Enabled
+	}
+	if err := s.deps.Store.Sources.Update(ctx, src); err != nil {
+		s.serverError(w, "update source", err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, toSourceJSON(src))
+}
+
+// handleDeleteSource disables a source — the soft delete for a source (the row and
+// its encounters' FK are preserved; the scheduler skips it). Sources are never
+// hard-deleted (that would orphan encounters).
+func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid source id", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	if _, err := s.deps.Store.Sources.Get(ctx, id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown source", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "get source", err)
+		return
+	}
+	if err := s.deps.Store.Sources.SetEnabled(ctx, id, false); err != nil {
+		s.serverError(w, "disable source", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func toSourceJSON(src *store.Source) sourceJSON {

@@ -1472,3 +1472,21 @@ daemon as `hackernews`. Base URL injectable for tests.
 
 **Deferred:** GitHub/Reddit/Mastodon connectors; auth-bearing connectors +
 AuthState expiry handling.
+
+---
+
+# Phase 14 — Source management CRUD
+
+**Status: Complete.** Closes the Phase 5 gap (create-only sources):
+
+- **`PATCH /sources/{id}`**: partial update of mutable fields (config, schedule,
+  default_privacy, storage_budget, enabled); id/connector immutable; omitted
+  fields unchanged. Validates config/schedule are JSON objects, privacy tier,
+  non-negative budget. 404 unknown. Returns the updated source (with derived
+  health status).
+- **`DELETE /sources/{id}`**: disables the source (the soft delete — row +
+  encounter FKs preserved, scheduler skips it; sources are never hard-deleted to
+  avoid orphaning encounters). Re-enable via PATCH `{enabled:true}`. 404 unknown.
+
+Backed by the existing `SourceRepo.Update` / `SetEnabled`. Source management is now
+full CRUD.
