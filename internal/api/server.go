@@ -20,7 +20,7 @@ import (
 	"kb/internal/render"
 	"kb/internal/review"
 	"kb/internal/search"
-	"kb/internal/sources"
+	"kb/internal/sourcehealth"
 	"kb/internal/store"
 	"kb/internal/surface"
 )
@@ -334,7 +334,7 @@ type sourceJSON struct {
 	Enabled             bool            `json:"enabled"`
 	DefaultPrivacy      string          `json:"default_privacy"`
 	Status              string          `json:"status"` // unknown|healthy|degraded|failing
-	ConsecutiveFailures int             `json:"consecutive_failures,omitempty"`
+	ConsecutiveFailures int             `json:"consecutive_failures"`
 	LastFetchedAt       string          `json:"last_fetched_at,omitempty"`
 	NextFetchAt         string          `json:"next_fetch_at,omitempty"`
 	Health              json.RawMessage `json:"health,omitempty"`
@@ -446,8 +446,8 @@ func toSourceJSON(src *store.Source) sourceJSON {
 		_ = json.Unmarshal([]byte(*src.Health), &health)
 		j.ConsecutiveFailures = health.ConsecutiveFailures
 	}
-	j.Status = sources.DeriveStatus(health, polled)
-	if next, ok := sources.NextFetchAt(src.LastFetchedAt, src.Schedule); ok {
+	j.Status = sourcehealth.DeriveStatus(health, polled)
+	if next, ok := sourcehealth.NextFetchAt(src.LastFetchedAt, src.Schedule); ok {
 		j.NextFetchAt = next
 	}
 	return j

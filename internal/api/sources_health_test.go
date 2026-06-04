@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"testing"
 
 	"kb/internal/events"
@@ -75,5 +74,4 @@ func TestSources_DegradedStatus(t *testing.T) {
 	if list.Sources[0].Status != "degraded" {
 		t.Errorf("status = %q, want degraded (1 failure, below threshold)", list.Sources[0].Status)
 	}
-	_ = http.StatusOK
 }

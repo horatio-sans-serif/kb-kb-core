@@ -3,6 +3,7 @@ package sources
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"kb/internal/events"
 	"kb/internal/ingest"
 	"kb/internal/kb"
+	"kb/internal/sourcehealth"
 	"kb/internal/store"
 	"kb/internal/storetest"
 )
@@ -144,14 +146,17 @@ func TestScheduler_TracksConsecutiveFailuresAndAlerts(t *testing.T) {
 	}
 
 	now := time.Now()
-	// Poll directly, re-reading the source so each poll sees the prior health.
-	for i := 1; i <= failureAlertThreshold; i++ {
+	pollFail := func() {
 		cur, _ := st.Sources.Get(ctx, src.ID)
 		if _, err := sch.poll(ctx, conn, cur, now); err == nil {
-			t.Fatalf("poll %d: expected the fetch error", i)
+			t.Fatal("expected the fetch error")
 		}
+	}
+	// Poll directly, re-reading the source so each poll sees the prior health.
+	for i := 1; i <= sourcehealth.AlertThreshold; i++ {
+		pollFail()
 		got, _ := st.Sources.Get(ctx, src.ID)
-		if !strings.Contains(*got.Health, `"consecutive_failures":`+itoa(i)) {
+		if !strings.Contains(*got.Health, `"consecutive_failures":`+strconv.Itoa(i)) {
 			t.Errorf("after failure %d, health = %s, want consecutive_failures %d", i, *got.Health, i)
 		}
 	}
@@ -166,6 +171,15 @@ func TestScheduler_TracksConsecutiveFailuresAndAlerts(t *testing.T) {
 		t.Fatal("no source.failed event after reaching the failure threshold")
 	}
 
+	// Further failures (4, 5) must NOT re-fire the alert.
+	pollFail()
+	pollFail()
+	select {
+	case e := <-sub:
+		t.Errorf("alert re-fired past the threshold: %q", e.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+
 	// A success resets the consecutive-failure count.
 	conn.err = nil
 	cur, _ := st.Sources.Get(ctx, src.ID)
@@ -178,7 +192,36 @@ func TestScheduler_TracksConsecutiveFailuresAndAlerts(t *testing.T) {
 	}
 }
 
-func itoa(n int) string { return string(rune('0' + n)) }
+func TestScheduler_OscillatingFailuresNoAlert(t *testing.T) {
+	ctx := context.Background()
+	conn := &stubConnector{}
+	st := storetest.New(t)
+	reg := NewRegistry()
+	reg.Register("stub", conn)
+	bus := events.NewBus()
+	sub, cancel := bus.Subscribe()
+	defer cancel()
+	sch := NewScheduler(st, reg, ingest.New(st, nil, nil, bus), bus, nil)
+	src := &store.Source{Kind: "PULL", Connector: "stub", DefaultPrivacy: "personal"}
+	_ = st.Sources.Create(ctx, src)
+
+	now := time.Now()
+	// fail, fail, success, fail, fail — never 3 consecutive, so no alert.
+	for _, fail := range []bool{true, true, false, true, true} {
+		if fail {
+			conn.err = errors.New("flaky")
+		} else {
+			conn.err = nil
+		}
+		cur, _ := st.Sources.Get(ctx, src.ID)
+		_, _ = sch.poll(ctx, conn, cur, now)
+	}
+	select {
+	case e := <-sub:
+		t.Errorf("oscillating failures should not alert, got %q", e.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
 
 func TestScheduler_BadURLFallsBackToNote(t *testing.T) {
 	ctx := context.Background()
