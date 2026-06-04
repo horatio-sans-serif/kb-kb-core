@@ -99,6 +99,11 @@ func (c *Clusterer) assign(ctx context.Context, cand store.ClusterCandidate) err
 			if err != nil {
 				return err
 			}
+			// Connect the new artifact to its co-topic peers via shares_topic edges
+			// (read the existing members BEFORE assigning, so we don't self-edge).
+			if err := c.linkSharesTopic(ctx, tx, cand.ArtifactID, best.ID); err != nil {
+				return err
+			}
 			if err := tx.Topics.Assign(ctx, cand.ArtifactID, best.ID, sim); err != nil {
 				return err
 			}
@@ -110,6 +115,46 @@ func (c *Clusterer) assign(ctx context.Context, cand store.ClusterCandidate) err
 		}
 		return tx.Topics.Assign(ctx, cand.ArtifactID, topic.ID, 1.0)
 	})
+}
+
+// maxTopicFanout caps the shares_topic edges a single assignment creates. Past it
+// the topic is a broad cluster whose pairwise edges carry little signal and would
+// grow O(N^2), so they are skipped (the membership is still recorded) — mirroring
+// the entity stage's hub cap.
+const maxTopicFanout = 50
+
+// linkSharesTopic connects artifactID to the existing members of topicID with
+// canonical (direction-deduped) shares_topic edges, unless the topic is already a
+// hub (more than maxTopicFanout members). Members are read before the caller
+// assigns artifactID, so it never self-edges.
+func (c *Clusterer) linkSharesTopic(ctx context.Context, tx *store.Store, artifactID, topicID string) error {
+	members, err := tx.Topics.Members(ctx, topicID, maxTopicFanout+1)
+	if err != nil {
+		return err
+	}
+	if len(members) > maxTopicFanout {
+		return nil // hub topic: skip pairwise edges
+	}
+	for _, m := range members {
+		if m.ArtifactID == artifactID {
+			continue
+		}
+		src, dst := canonicalPair(artifactID, m.ArtifactID)
+		if err := tx.Graph.AddLink(ctx, src, dst, "shares_topic", 1.0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// canonicalPair orders two ids so the same unordered pair always yields the same
+// directed edge, letting AddLink's (src,dst,relation) dedup work regardless of
+// which artifact's assignment discovers the shared topic.
+func canonicalPair(a, b string) (string, string) {
+	if a <= b {
+		return a, b
+	}
+	return b, a
 }
 
 // nearest returns the topic whose centroid is most cosine-similar to vec, and that

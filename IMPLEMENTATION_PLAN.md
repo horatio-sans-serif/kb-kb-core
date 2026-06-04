@@ -1511,3 +1511,17 @@ All live-only (tombstoned artifacts/their mentions excluded). The shared
 
 **Deferred:** entity merge/edit (alias curation); filtering entities by kind;
 shares_topic edges feeding the graph.
+
+---
+
+# Phase 16 — shares_topic graph edges (§8.7)
+
+**Status: Complete.** The topic clusterer now connects co-topic artifacts in the
+knowledge graph, completing the edge vocabulary (references, shares_entity, now
+shares_topic). When the clusterer assigns an artifact to an existing topic, it adds
+canonical (direction-deduped) `shares_topic` edges to that topic's existing
+members — read before the assign so it never self-edges, capped at
+`maxTopicFanout` (50) so a broad cluster doesn't produce O(N^2) low-signal edges
+(mirroring the entity hub cap). Done in the same assignment transaction
+(exactly-once, idempotent AddLink dedup). A `GET /graph/{id}` query now reflects
+both entity- and topic-based connectivity.

@@ -58,6 +58,27 @@ func TestClusterer_GroupsSimilarSeparatesDifferent(t *testing.T) {
 	}
 }
 
+func TestClusterer_AddsSharesTopicEdges(t *testing.T) {
+	// Artifacts clustered into the same topic gain a shares_topic graph edge.
+	ctx := context.Background()
+	st := storetest.New(t)
+	a := seed(t, st, "ha", "Alpha", []float32{1, 0})
+	b := seed(t, st, "hb", "Beta", []float32{0.99, 0.01}) // joins A's topic
+	c := seed(t, st, "hc", "Gamma", []float32{0, 1})      // separate topic
+
+	if _, err := New(st).Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	// A and B (co-topic) are graph neighbors; C is not.
+	nbrs, _ := st.Graph.NeighborIDs(ctx, []string{a})
+	if len(nbrs) != 1 || nbrs[0] != b {
+		t.Errorf("co-topic artifacts should share a graph edge: A neighbors = %v, want [B]", nbrs)
+	}
+	if cn, _ := st.Graph.NeighborIDs(ctx, []string{c}); len(cn) != 0 {
+		t.Errorf("a separate-topic artifact should have no co-topic edge, got %v", cn)
+	}
+}
+
 func TestClusterer_SecondSweepIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	st := storetest.New(t)
