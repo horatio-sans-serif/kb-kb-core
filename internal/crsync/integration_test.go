@@ -172,3 +172,110 @@ func (s pagedStore) Changes(ctx context.Context, since int64) ([]Change, int64, 
 func (s pagedStore) Apply(ctx context.Context, changes []Change) error {
 	return DBChangeStore{DB: s.db}.Apply(ctx, changes)
 }
+
+// pull replicates one direction: every change on `from` is pulled into `to` (a fresh
+// watermark, so it pulls the full history — safe and idempotent).
+func pull(t *testing.T, from, to *sql.DB) {
+	t.Helper()
+	srv := httptest.NewServer(http.StripPrefix("/sync", Handler(DBChangeStore{DB: from}, testToken, discardLogger())))
+	defer srv.Close()
+	p := NewPuller(DBChangeStore{DB: to}, newFakeWatermarks(), []string{srv.URL}, testToken, srv.Client(), discardLogger())
+	p.SyncAll(context.Background())
+}
+
+func insertArtifact(t *testing.T, db *sql.DB, id, title string) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO artifacts(id, type, title, first_seen_at, last_seen_at, created_at, updated_at)
+		 VALUES (?, 'note', ?, 'ts','ts','ts','ts')`, id, title); err != nil {
+		t.Fatalf("insert %s: %v", id, err)
+	}
+}
+
+func title(t *testing.T, db *sql.DB, id string) string {
+	t.Helper()
+	var s string
+	if err := db.QueryRowContext(context.Background(), `SELECT title FROM artifacts WHERE id = ?`, id).Scan(&s); err != nil {
+		t.Fatalf("read title %s: %v", id, err)
+	}
+	return s
+}
+
+// TestSync_Bidirectional: A writes X, B writes Y; after exchanging both ways, both
+// replicas hold both rows.
+func TestSync_Bidirectional(t *testing.T) {
+	ext := extPath(t)
+	dbA := openCRR(t, ext)
+	dbB := openCRR(t, ext)
+	insertArtifact(t, dbA, "01XXXXXXXXXXXXXXXXXXXXXXXX", "x")
+	insertArtifact(t, dbB, "01YYYYYYYYYYYYYYYYYYYYYYYY", "y")
+
+	pull(t, dbA, dbB) // A -> B
+	pull(t, dbB, dbA) // B -> A
+
+	for _, db := range []*sql.DB{dbA, dbB} {
+		var n int
+		if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM artifacts`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 2 {
+			t.Errorf("replica has %d artifacts, want 2 (both X and Y)", n)
+		}
+	}
+}
+
+// TestSync_DeleteConverges: a soft-delete (tombstone) on A converges onto B. Under
+// cr-sqlite a tombstone is a normal change (the deleted_at column), so it replicates.
+func TestSync_DeleteConverges(t *testing.T) {
+	ext := extPath(t)
+	ctx := context.Background()
+	dbA := openCRR(t, ext)
+	dbB := openCRR(t, ext)
+	const id = "01DELETE0000000000000000ZZ"
+	insertArtifact(t, dbA, id, "doomed")
+	pull(t, dbA, dbB)
+
+	// Soft-delete on A (the production tombstone — deleted_at set, row kept).
+	if _, err := dbA.ExecContext(ctx,
+		`UPDATE artifacts SET deleted_at = '2026-02-02T00:00:00.000000000Z', updated_at = '2026-02-02T00:00:00.000000000Z' WHERE id = ?`, id); err != nil {
+		t.Fatalf("soft-delete on A: %v", err)
+	}
+	pull(t, dbA, dbB)
+
+	var deletedAt *string
+	if err := dbB.QueryRowContext(ctx, `SELECT deleted_at FROM artifacts WHERE id = ?`, id).Scan(&deletedAt); err != nil {
+		t.Fatalf("read B: %v", err)
+	}
+	if deletedAt == nil {
+		t.Error("tombstone did not converge onto B (deleted_at still NULL)")
+	}
+}
+
+// TestSync_ConcurrentEditConverges: A and B edit the same column offline, then
+// exchange. cr-sqlite's LWW (column-version, then site id) makes both converge on the
+// same deterministic value — the property the test asserts (it does not care which
+// side wins, only that they agree).
+func TestSync_ConcurrentEditConverges(t *testing.T) {
+	ext := extPath(t)
+	ctx := context.Background()
+	dbA := openCRR(t, ext)
+	dbB := openCRR(t, ext)
+	const id = "01CONFLICT0000000000000000"
+	insertArtifact(t, dbA, id, "orig")
+	pull(t, dbA, dbB) // both have the row
+
+	// Concurrent edits to the same column on each replica.
+	if _, err := dbA.ExecContext(ctx, `UPDATE artifacts SET title = 'from-A' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dbB.ExecContext(ctx, `UPDATE artifacts SET title = 'from-B' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	pull(t, dbA, dbB) // A -> B (B merges)
+	pull(t, dbB, dbA) // B -> A (A adopts the merged winner)
+
+	if a, b := title(t, dbA, id), title(t, dbB, id); a != b {
+		t.Errorf("replicas diverged after concurrent edit: A=%q B=%q (LWW must converge)", a, b)
+	}
+}

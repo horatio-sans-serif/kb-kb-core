@@ -159,6 +159,32 @@ func TestHandler_RejectsInvalidSince(t *testing.T) {
 	}
 }
 
+func TestPuller_PeerErrorDoesNotAdvanceOrPanic(t *testing.T) {
+	ctx := context.Background()
+	cases := map[string]http.HandlerFunc{
+		"5xx":          func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "boom", http.StatusInternalServerError) },
+		"garbage body": func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("not json")) },
+	}
+	for name, h := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+			local := &fakeChangeStore{}
+			wm := newFakeWatermarks()
+			p := NewPuller(local, wm, []string{srv.URL}, testToken, srv.Client(), discardLogger())
+
+			p.SyncAll(ctx) // must not panic
+
+			if len(local.applied) != 0 {
+				t.Errorf("applied %d changes from a failing peer, want 0", len(local.applied))
+			}
+			if v, _ := wm.Watermark(ctx, srv.URL); v != 0 {
+				t.Errorf("watermark = %d after a failed pull, want 0", v)
+			}
+		})
+	}
+}
+
 func TestPuller_WrongTokenDoesNotAdvance(t *testing.T) {
 	ctx := context.Background()
 	peerStore := &fakeChangeStore{
