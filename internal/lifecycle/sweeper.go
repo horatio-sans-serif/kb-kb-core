@@ -23,6 +23,7 @@ type Policy struct {
 	PurgeAfter   time.Duration // min age (with score < PurgeBelow) to purge
 	ArchiveBelow float64       // score below which (and old enough) an artifact archives
 	PurgeBelow   float64       // score below which (and old enough) an artifact purges
+	CompactAfter time.Duration // retention after a purge before physical hard-delete (0 = never compact)
 }
 
 // DefaultPolicy is the shipped lifecycle policy.
@@ -32,6 +33,7 @@ func DefaultPolicy() Policy {
 		PurgeAfter:   180 * 24 * time.Hour,
 		ArchiveBelow: 0.2,
 		PurgeBelow:   0.05,
+		CompactAfter: 90 * 24 * time.Hour,
 	}
 }
 
@@ -125,6 +127,37 @@ func (s *Sweeper) Sweep(ctx context.Context) (Stats, error) {
 		}
 	}
 	return stats, errors.Join(errs...)
+}
+
+// Compact physically removes purged artifacts whose tombstone is older than the
+// retention window (Policy.CompactAfter) — the byte-reclamation the GC defers past a
+// grace period. It is safe with peer sync: cr-sqlite replicates the hard delete as a
+// clean CRDT operation and retains a delete sentinel, so a late-syncing peer still
+// converges to deleted rather than resurrecting the row (§8.16). Returns how many it
+// compacted; a per-artifact failure is collected and the rest proceed. A zero
+// CompactAfter disables compaction (rows are kept indefinitely).
+func (s *Sweeper) Compact(ctx context.Context) (int, error) {
+	if s.policy.CompactAfter <= 0 {
+		return 0, nil
+	}
+	cutoff := store.FormatTime(s.now().Add(-s.policy.CompactAfter))
+	ids, err := s.st.Artifacts.PurgedBefore(ctx, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	compacted := 0
+	var errs []error
+	for _, id := range ids {
+		if err := s.st.Artifacts.HardDelete(ctx, id); err != nil {
+			if ctx.Err() != nil {
+				return compacted, err
+			}
+			errs = append(errs, fmt.Errorf("compact %q: %w", id, err))
+			continue
+		}
+		compacted++
+	}
+	return compacted, errors.Join(errs...)
 }
 
 // EnforceBudgets archives the lowest-relevance active artifacts of any source that

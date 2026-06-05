@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -25,6 +26,7 @@ type Config struct {
 	RenderDir       string   // KB_RENDER_DIR (default: a "renders" dir beside the DB)
 	CRSqlitePath    string   // KB_CRSQLITE_PATH (path to the cr-sqlite extension; empty = single-node)
 	SyncPeers       []string // KB_SYNC_PEERS (semicolon-separated peer base URLs, e.g. http://host:8087)
+	PurgeRetention  int      // KB_PURGE_RETENTION_DAYS (days a purged artifact is kept before physical compaction; 0 = never; default 90)
 }
 
 // Load reads configuration via getenv (pass os.Getenv in production). It returns
@@ -44,6 +46,14 @@ func Load(getenv func(string) string) (*Config, error) {
 		RenderDir:       getenv("KB_RENDER_DIR"),
 		CRSqlitePath:    getenv("KB_CRSQLITE_PATH"),
 		SyncPeers:       splitList(getenv("KB_SYNC_PEERS")),
+		PurgeRetention:  90,
+	}
+	if v := strings.TrimSpace(getenv("KB_PURGE_RETENTION_DAYS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid KB_PURGE_RETENTION_DAYS %q (want a non-negative integer; 0 disables compaction)", v)
+		}
+		cfg.PurgeRetention = n
 	}
 	// Renders default to a directory beside the database so output files live with
 	// the data they derive from. Use an absolute KB_DB in production: a relative

@@ -386,8 +386,12 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 
 	// Lifecycle GC: periodically transition artifacts active -> archive -> purge by
 	// relevance and age (§8.12). Runs alongside the decay sweep, which keeps the
-	// scores it acts on fresh.
-	lifeSweeper := lifecycle.New(st)
+	// scores it acts on fresh. Compaction physically reclaims purged artifacts after
+	// the retention window (KB_PURGE_RETENTION_DAYS); the hard deletes replicate
+	// cleanly under cr-sqlite (§8.16).
+	lifePolicy := lifecycle.DefaultPolicy()
+	lifePolicy.CompactAfter = time.Duration(cfg.PurgeRetention) * 24 * time.Hour
+	lifeSweeper := lifecycle.NewWithPolicy(st, lifePolicy, time.Now)
 	runLifecycle := func() {
 		switch stats, err := lifeSweeper.Sweep(ctx); {
 		case err != nil && ctx.Err() == nil:
@@ -400,6 +404,12 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 			logger.Warn("storage budget enforcement", "err", err)
 		case n > 0:
 			logger.Info("storage budget enforcement", "archived", n)
+		}
+		switch n, err := lifeSweeper.Compact(ctx); {
+		case err != nil && ctx.Err() == nil:
+			logger.Warn("purge compaction", "err", err)
+		case n > 0:
+			logger.Info("purge compaction", "reclaimed", n)
 		}
 	}
 	go func() {

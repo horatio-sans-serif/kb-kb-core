@@ -201,6 +201,49 @@ func title(t *testing.T, db *sql.DB, id string) string {
 	return s
 }
 
+// TestSync_CompactionPropagates: the production compaction path (store.HardDelete of
+// a tombstoned artifact) replicates as a clean delete — a row B already has is
+// removed on B after sync, with no resurrection.
+func TestSync_CompactionPropagates(t *testing.T) {
+	ext := extPath(t)
+	ctx := context.Background()
+	dbA := openCRR(t, ext)
+	dbB := openCRR(t, ext)
+	stA := store.New(dbA)
+	const id = "01COMPACT00000000000000ZZ"
+
+	insertArtifact(t, dbA, id, "doomed")
+	pull(t, dbA, dbB) // B has the live row
+
+	// Purge (tombstone) then hard-delete on A — the compaction sequence.
+	if _, err := dbA.ExecContext(ctx,
+		`UPDATE artifacts SET deleted_at = '2026-02-02T00:00:00.000000000Z', lifecycle_tier = 'purged' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := stA.Artifacts.HardDelete(ctx, id); err != nil {
+		t.Fatalf("hard-delete on A: %v", err)
+	}
+	pull(t, dbA, dbB)
+
+	var nB int
+	if err := dbB.QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts WHERE id = ?`, id).Scan(&nB); err != nil {
+		t.Fatal(err)
+	}
+	if nB != 0 {
+		t.Errorf("hard-delete did not propagate to B (B still has %d rows)", nB)
+	}
+
+	// B re-syncing back to A does not resurrect it.
+	pull(t, dbB, dbA)
+	var nA int
+	if err := dbA.QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts WHERE id = ?`, id).Scan(&nA); err != nil {
+		t.Fatal(err)
+	}
+	if nA != 0 {
+		t.Errorf("compacted artifact resurrected on A (%d rows)", nA)
+	}
+}
+
 // TestSync_Bidirectional: A writes X, B writes Y; after exchanging both ways, both
 // replicas hold both rows.
 func TestSync_Bidirectional(t *testing.T) {

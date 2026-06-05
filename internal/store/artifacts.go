@@ -585,6 +585,84 @@ func groupByKey(rows *sql.Rows) ([][]string, error) {
 	return out, rows.Err()
 }
 
+// PurgedBefore returns the ids of artifacts eligible for physical compaction: those
+// tombstoned (deleted_at set) AND in the purged lifecycle tier AND tombstoned before
+// cutoff (a TimeFormat string). The lifecycle GC only ever soft-deletes; compaction
+// reclaims the bytes after a retention window, once peers have had time to receive
+// the tombstone (cr-sqlite retains the delete sentinel, so a late peer still
+// converges to deleted — §8.12 / §8.16).
+func (r *ArtifactRepo) PurgedBefore(ctx context.Context, cutoff string) ([]string, error) {
+	rows, err := r.rq.QueryContext(ctx,
+		`SELECT id FROM artifacts
+		 WHERE deleted_at IS NOT NULL AND lifecycle_tier = 'purged' AND deleted_at < ?
+		 ORDER BY id`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("purged before %q: %w", cutoff, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan purged id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// HardDelete physically removes a tombstoned artifact and all its child rows — the
+// final compaction step the lifecycle GC defers (§8.12). It REFUSES a live artifact
+// (deleted_at IS NULL): only a soft-deleted row may be reclaimed, so a bug cannot
+// destroy live content. Under cr-sqlite the deletes replicate as clean CRDT delete
+// operations (verified). Atomic via inTx; a missing artifact is a no-op.
+func (r *ArtifactRepo) HardDelete(ctx context.Context, id string) error {
+	return r.inTx(ctx, func(tr *ArtifactRepo) error {
+		return tr.hardDeleteLocked(ctx, id)
+	})
+}
+
+func (r *ArtifactRepo) hardDeleteLocked(ctx context.Context, id string) error {
+	var deletedAt *string
+	err := r.q.QueryRowContext(ctx, `SELECT deleted_at FROM artifacts WHERE id = ?`, id).Scan(&deletedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // already gone
+	}
+	if err != nil {
+		return fmt.Errorf("hard-delete read %q: %w", id, err)
+	}
+	if deletedAt == nil {
+		return fmt.Errorf("hard-delete refused: artifact %q is live (not tombstoned)", id)
+	}
+	// Drop the loser's conflicts (referencing its claims) before its claims.
+	if _, err := r.q.ExecContext(ctx,
+		`DELETE FROM conflicts WHERE claim_a IN (SELECT id FROM claims WHERE artifact_id = ?)
+		    OR claim_b IN (SELECT id FROM claims WHERE artifact_id = ?)`, id, id); err != nil {
+		return fmt.Errorf("hard-delete conflicts %q: %w", id, err)
+	}
+	for _, tc := range []struct{ table, col string }{
+		{"claims", "artifact_id"},
+		{"encounters", "artifact_id"},
+		{"enrichments", "artifact_id"},
+		{"artifact_entities", "artifact_id"},
+		{"artifact_topics", "artifact_id"},
+		{"review_schedule", "artifact_id"},
+		{"engagements", "artifact_id"},
+		{"jobs", "artifact_id"},
+		{"audit_log", "artifact_id"},
+		{"links", "src_id"},
+		{"links", "dst_id"},
+	} {
+		if _, err := r.q.ExecContext(ctx, `DELETE FROM `+tc.table+` WHERE `+tc.col+` = ?`, id); err != nil {
+			return fmt.Errorf("hard-delete %s.%s for %q: %w", tc.table, tc.col, id, err)
+		}
+	}
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM artifacts WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("hard-delete artifact %q: %w", id, err)
+	}
+	return r.reindexFTS(ctx, id) // ensure no stale FTS row lingers
+}
+
 // SoftDelete sets the tombstone (deleted_at). Idempotent: a no-op on an already
 // deleted row. Tombstones, not hard deletes, so the row merges cleanly under
 // cr-sqlite (design 6.0).

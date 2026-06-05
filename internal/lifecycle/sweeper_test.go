@@ -202,3 +202,53 @@ func TestSweeper_TransitionsTiers(t *testing.T) {
 		t.Error("purged artifact should no longer be live")
 	}
 }
+
+func TestSweeper_Compact(t *testing.T) {
+	ctx := context.Background()
+	st, db := storetest.NewWithDB(t)
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	ins := func(id, tier string, deletedAt *string) {
+		ts := store.FormatTime(now)
+		var del any
+		if deletedAt != nil {
+			del = *deletedAt
+		}
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO artifacts(id,type,canonical_url,title,privacy_tier,lifecycle_tier,status,first_seen_at,last_seen_at,deleted_at,created_at,updated_at)
+			 VALUES (?, 'webpage', ?, ?, 'public', ?, 'ready', ?, ?, ?, ?, ?)`,
+			id, "u"+id, id, tier, ts, ts, del, ts, ts); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	old := store.FormatTime(now.AddDate(0, 0, -200))   // purged long ago -> compact
+	recent := store.FormatTime(now.AddDate(0, 0, -10)) // purged recently -> keep
+	ins("01PURGEDOLD0000000000000A", "purged", &old)
+	ins("01PURGEDRECENT000000000B", "purged", &recent)
+	ins("01LIVE000000000000000000C", "active", nil)
+
+	policy := DefaultPolicy()
+	policy.CompactAfter = 90 * 24 * time.Hour
+	sw := NewWithPolicy(st, policy, func() time.Time { return now })
+
+	n, err := sw.Compact(ctx)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("compacted %d, want 1 (only the long-purged artifact)", n)
+	}
+	var total int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Errorf("artifacts remaining = %d, want 2 (recent purge + live kept)", total)
+	}
+
+	// A zero retention disables compaction.
+	policy.CompactAfter = 0
+	if n2, _ := NewWithPolicy(st, policy, func() time.Time { return now }).Compact(ctx); n2 != 0 {
+		t.Errorf("compaction with zero retention reclaimed %d, want 0 (disabled)", n2)
+	}
+}

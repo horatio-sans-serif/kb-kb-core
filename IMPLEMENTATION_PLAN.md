@@ -1737,3 +1737,24 @@ realized —
   value-type preservation, watermark persistence across reopen.
 
 This completes Phase 17 — multi-device peer sync.
+
+## Phase 17 — Stage A: harden sync
+
+**Stage A1 (CRDT-correctness tests): Complete.** Locked in the sync guarantees the
+Stage 3 review left untested, all green against the real extension: bidirectional
+sync, soft-delete/tombstone convergence, concurrent-edit LWW convergence, and
+puller resilience to a peer returning 5xx / a garbage body. No production code
+changed — the implementation was already correct.
+
+**Stage A2 (tombstone compaction): Complete.** A deciding-test established that a
+cr-sqlite hard delete is a clean CRDT operation: it propagates to peers, does not
+resurrect, and the engine retains a delete sentinel (so a late-syncing peer still
+converges to deleted) while auto-collapsing the row's column-changes to that one
+sentinel. So compaction is safe with a time-based retention window — the
+sync-horizon/outbound-watermark machinery is unnecessary. `ArtifactRepo.PurgedBefore`
+selects purged+tombstoned artifacts older than a cutoff; `ArtifactRepo.HardDelete`
+physically removes a tombstoned artifact and all its children (refusing a live row, so
+a bug cannot destroy live content). `lifecycle.Sweeper.Compact` reclaims them after
+`Policy.CompactAfter` (config `KB_PURGE_RETENTION_DAYS`, default 90, 0 = never), wired
+into the daemon's lifecycle sweep. Proven end to end: a purge+hard-delete on replica A
+removes the row on B after sync with no resurrection.

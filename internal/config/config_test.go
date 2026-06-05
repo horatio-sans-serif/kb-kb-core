@@ -72,6 +72,33 @@ func TestConfig_SyncDefaultsOff(t *testing.T) {
 	if len(cfg.SyncPeers) != 0 {
 		t.Errorf("SyncPeers = %v, want none by default", cfg.SyncPeers)
 	}
+	if cfg.PurgeRetention != 90 {
+		t.Errorf("PurgeRetention = %d, want 90 days by default", cfg.PurgeRetention)
+	}
+}
+
+func TestConfig_PurgeRetention(t *testing.T) {
+	base := map[string]string{"KB_DB": "/tmp/kb.db", "KB_API_TOKEN": "0123456789abcdef0123456789abcdef"}
+	with := func(v string) map[string]string {
+		m := map[string]string{}
+		for k, val := range base {
+			m[k] = val
+		}
+		m["KB_PURGE_RETENTION_DAYS"] = v
+		return m
+	}
+	if cfg, err := Load(envFunc(with("0"))); err != nil || cfg.PurgeRetention != 0 {
+		t.Errorf("retention 0 = %v (err %v), want 0 (compaction disabled)", cfg, err)
+	}
+	if cfg, err := Load(envFunc(with("30"))); err != nil || cfg.PurgeRetention != 30 {
+		t.Errorf("retention 30 = %v (err %v), want 30", cfg, err)
+	}
+	if _, err := Load(envFunc(with("-5"))); err == nil {
+		t.Error("negative retention should fail")
+	}
+	if _, err := Load(envFunc(with("notanumber"))); err == nil {
+		t.Error("non-numeric retention should fail")
+	}
 }
 
 func TestConfig_RenderDirDefaultsBesideDB(t *testing.T) {
