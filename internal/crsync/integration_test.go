@@ -244,6 +244,97 @@ func TestSync_CompactionPropagates(t *testing.T) {
 	}
 }
 
+// TestSync_DeleteVsConcurrentEditConverges: A hard-deletes a row while B (offline)
+// edits the same row's title. After exchanging both ways, both replicas agree — the
+// permanent-delete edge must still converge (no split-brain), per cr-sqlite's
+// delete-vs-update causal resolution.
+func TestSync_DeleteVsConcurrentEditConverges(t *testing.T) {
+	ext := extPath(t)
+	ctx := context.Background()
+	dbA := openCRR(t, ext)
+	dbB := openCRR(t, ext)
+	stA := store.New(dbA)
+	const id = "01DELVSEDIT0000000000000ZZ"
+
+	insertArtifact(t, dbA, id, "orig")
+	pull(t, dbA, dbB) // both have it
+
+	// Concurrent: A purges+hard-deletes; B edits the title.
+	if _, err := dbA.ExecContext(ctx,
+		`UPDATE artifacts SET deleted_at = '2026-02-02T00:00:00.000000000Z', lifecycle_tier = 'purged' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := stA.Artifacts.HardDelete(ctx, id); err != nil {
+		t.Fatalf("hard-delete on A: %v", err)
+	}
+	if _, err := dbB.ExecContext(ctx, `UPDATE artifacts SET title = 'edited-on-B' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	pull(t, dbA, dbB)
+	pull(t, dbB, dbA)
+	// And once more each way to let any resurrection settle deterministically.
+	pull(t, dbA, dbB)
+	pull(t, dbB, dbA)
+
+	var nA, nB int
+	dbA.QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts WHERE id = ?`, id).Scan(&nA)
+	dbB.QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts WHERE id = ?`, id).Scan(&nB)
+	if nA != nB {
+		t.Errorf("replicas diverged after delete-vs-edit: A has %d, B has %d (must converge)", nA, nB)
+	}
+	if nA == 1 { // if a resurrection won, the row must be identical on both sides
+		if ta, tb := title(t, dbA, id), title(t, dbB, id); ta != tb {
+			t.Errorf("resurrected row diverged: A title=%q B title=%q", ta, tb)
+		}
+	}
+}
+
+// TestSync_CompactMixedTablesPropagates: a hard-delete whose transaction spans both
+// CRR tables (artifacts, claims, conflicts, encounters) and local tables (jobs,
+// audit_log) succeeds and the artifact delete still propagates to a peer.
+func TestSync_CompactMixedTablesPropagates(t *testing.T) {
+	ext := extPath(t)
+	ctx := context.Background()
+	dbA := openCRR(t, ext)
+	dbB := openCRR(t, ext)
+	stA := store.New(dbA)
+	const id = "01MIXED00000000000000000ZZ"
+
+	insertArtifact(t, dbA, id, "doomed")
+	exec := func(q string, args ...any) {
+		if _, err := dbA.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	// CRR-table children and local-table children, all referencing the artifact.
+	exec(`INSERT INTO sources(id,kind,connector) VALUES ('s1','PULL','rss')`)
+	exec(`INSERT INTO encounters(id,artifact_id,source_id,seen_at) VALUES ('e1',?, 's1','ts')`, id)
+	exec(`INSERT INTO claims(id,artifact_id,statement) VALUES ('c1',?, 'k')`, id)
+	exec(`INSERT INTO jobs(id,type,artifact_id,status) VALUES ('j1','fetch',?, 'pending')`, id)   // local
+	exec(`INSERT INTO audit_log(id,actor,action,artifact_id) VALUES ('a1','local','read',?)`, id) // local
+	pull(t, dbA, dbB)
+
+	exec(`UPDATE artifacts SET deleted_at = '2026-02-02T00:00:00.000000000Z', lifecycle_tier = 'purged' WHERE id = ?`, id)
+	if err := stA.Artifacts.HardDelete(ctx, id); err != nil {
+		t.Fatalf("hard-delete spanning CRR + local tables: %v", err)
+	}
+	// Local-table rows are gone locally.
+	for _, tbl := range []string{"jobs", "audit_log"} {
+		var n int
+		dbA.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+tbl+` WHERE artifact_id = ?`, id).Scan(&n)
+		if n != 0 {
+			t.Errorf("local %s row not deleted (%d)", tbl, n)
+		}
+	}
+	pull(t, dbA, dbB)
+	var nB int
+	dbB.QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts WHERE id = ?`, id).Scan(&nB)
+	if nB != 0 {
+		t.Errorf("artifact delete did not propagate to B (%d)", nB)
+	}
+}
+
 // TestSync_Bidirectional: A writes X, B writes Y; after exchanging both ways, both
 // replicas hold both rows.
 func TestSync_Bidirectional(t *testing.T) {

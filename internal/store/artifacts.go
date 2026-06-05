@@ -591,6 +591,12 @@ func groupByKey(rows *sql.Rows) ([][]string, error) {
 // reclaims the bytes after a retention window, once peers have had time to receive
 // the tombstone (cr-sqlite retains the delete sentinel, so a late peer still
 // converges to deleted — §8.12 / §8.16).
+//
+// CONTRACT: only tombstones with lifecycle_tier='purged' are reclaimable. A plain
+// SoftDelete (a Merge loser, or a future user-initiated artifact delete) sets
+// deleted_at but not the purged tier, so it is never compacted and lingers — which
+// for a Merge loser is harmless (its children were re-pointed). Any future delete
+// path that wants its rows reclaimed MUST also set lifecycle_tier='purged'.
 func (r *ArtifactRepo) PurgedBefore(ctx context.Context, cutoff string) ([]string, error) {
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT id FROM artifacts
@@ -611,11 +617,20 @@ func (r *ArtifactRepo) PurgedBefore(ctx context.Context, cutoff string) ([]strin
 	return out, rows.Err()
 }
 
-// HardDelete physically removes a tombstoned artifact and all its child rows — the
-// final compaction step the lifecycle GC defers (§8.12). It REFUSES a live artifact
-// (deleted_at IS NULL): only a soft-deleted row may be reclaimed, so a bug cannot
-// destroy live content. Under cr-sqlite the deletes replicate as clean CRDT delete
-// operations (verified). Atomic via inTx; a missing artifact is a no-op.
+// HardDelete physically removes a purged artifact and all its child rows — the final
+// compaction step the lifecycle GC defers (§8.12). It REFUSES anything that is not a
+// GC purge — a live row (deleted_at IS NULL) or a tombstone whose lifecycle_tier is
+// not 'purged' (e.g. a Merge loser). Only a GC-purged row may be reclaimed, so a bug
+// cannot destroy live content or a still-meaningful tombstone. Under cr-sqlite the
+// deletes replicate as clean CRDT delete operations (verified). Atomic via inTx; a
+// missing artifact is a no-op.
+//
+// Note: orphaned entities/topics (no longer referenced by any artifact_entities/
+// artifact_topics after this delete) are intentionally NOT garbage-collected here.
+// Under multi-device sync a locally-orphaned entity may still be referenced by an
+// artifact on a peer this replica has not yet received, so deleting it would lose
+// data on that peer. Orphaned graph nodes are accepted dead weight (every read joins
+// through the link tables, so they never surface); global entity GC is deferred.
 func (r *ArtifactRepo) HardDelete(ctx context.Context, id string) error {
 	return r.inTx(ctx, func(tr *ArtifactRepo) error {
 		return tr.hardDeleteLocked(ctx, id)
@@ -624,15 +639,16 @@ func (r *ArtifactRepo) HardDelete(ctx context.Context, id string) error {
 
 func (r *ArtifactRepo) hardDeleteLocked(ctx context.Context, id string) error {
 	var deletedAt *string
-	err := r.q.QueryRowContext(ctx, `SELECT deleted_at FROM artifacts WHERE id = ?`, id).Scan(&deletedAt)
+	var tier string
+	err := r.q.QueryRowContext(ctx, `SELECT deleted_at, lifecycle_tier FROM artifacts WHERE id = ?`, id).Scan(&deletedAt, &tier)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // already gone
 	}
 	if err != nil {
 		return fmt.Errorf("hard-delete read %q: %w", id, err)
 	}
-	if deletedAt == nil {
-		return fmt.Errorf("hard-delete refused: artifact %q is live (not tombstoned)", id)
+	if deletedAt == nil || tier != "purged" {
+		return fmt.Errorf("hard-delete refused: artifact %q is not a purged tombstone (deleted_at set=%t, tier=%q)", id, deletedAt != nil, tier)
 	}
 	// Drop the loser's conflicts (referencing its claims) before its claims.
 	if _, err := r.q.ExecContext(ctx,
