@@ -477,7 +477,7 @@ func TestIngest_FetchSummarizeEmbed_EndToEnd(t *testing.T) {
 	p.Register(enrich.NewRelevance(relsignals.New(st), profile))
 	p.RegisterHandlers(st, runner, bus)
 	searcher := search.NewSearcher(st, model, "fake-embed", true)
-	asker := rag.NewEngine(searcher, st, model, "fake-model", true)
+	asker := rag.NewEngine(searcher, st, model, model, "fake-model", "fake-embed", true)
 	srv := NewServer(Deps{Store: st, Bus: bus, Token: "tok", DefaultPrivacy: "personal", Logger: discardLogger(), Enqueue: p, Search: searcher, Ask: asker})
 	h := srv.Handler()
 

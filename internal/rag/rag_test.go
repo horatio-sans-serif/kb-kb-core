@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -12,6 +13,25 @@ import (
 	"kb/internal/store"
 	"kb/internal/storetest"
 )
+
+type fakeEmbedder struct{ vec []float32 }
+
+func (f fakeEmbedder) Embed(_ context.Context, _ llm.EmbedRequest) ([]float32, error) {
+	return f.vec, nil
+}
+
+func seedEmbedding(t *testing.T, st *store.Store, artifactID string, vec []float32) {
+	t.Helper()
+	payload, err := json.Marshal(kb.EmbeddingPayload{Model: "embed", Dim: len(vec), Vector: vec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Enrichments.Create(context.Background(), &kb.Enrichment{
+		ArtifactID: artifactID, Kind: "embedding", Payload: string(payload), Model: "embed", PromptVersion: "v1",
+	}); err != nil {
+		t.Fatalf("seed embedding: %v", err)
+	}
+}
 
 type fakeRetriever struct {
 	hits []search.Result
@@ -52,7 +72,7 @@ func TestAnswer_SynthesizesWithSources(t *testing.T) {
 
 	llmc := &fakeLLM{resp: "Tokio powers async Rust [1]."}
 	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1, Score: 0.9}, {ArtifactID: a2, Score: 0.4}}},
-		st, llmc, "model", true)
+		st, llmc, nil, "model", "embed", true)
 
 	ans, err := e.Answer(context.Background(), "what is tokio", 5)
 	if err != nil {
@@ -73,7 +93,7 @@ func TestAnswer_SynthesizesWithSources(t *testing.T) {
 func TestAnswer_EmptyModelAnswerIsError(t *testing.T) {
 	st := storetest.New(t)
 	a1 := seed(t, st, "h1", "T", "some body text")
-	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}}}, st, &fakeLLM{resp: "   "}, "model", true)
+	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}}}, st, &fakeLLM{resp: "   "}, nil, "model", "embed", true)
 	if _, err := e.Answer(context.Background(), "q", 5); err == nil {
 		t.Error("an empty/whitespace model answer must be an error, not a 200 with sources and no text")
 	}
@@ -88,7 +108,7 @@ func TestAnswer_SkipsTombstonedSource(t *testing.T) {
 	}
 	llmc := &fakeLLM{resp: "answer [1]"}
 	// Both ranked (a stale ranking), but the tombstoned one must not reach the prompt.
-	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}, {ArtifactID: gone}}}, st, llmc, "model", true)
+	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}, {ArtifactID: gone}}}, st, llmc, nil, "model", "embed", true)
 	ans, err := e.Answer(context.Background(), "q", 5)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
@@ -103,7 +123,7 @@ func TestAnswer_SkipsTombstonedSource(t *testing.T) {
 
 func TestAnswer_RemoteEndpointRefused(t *testing.T) {
 	st := storetest.New(t)
-	e := NewEngine(fakeRetriever{}, st, &fakeLLM{}, "model", false) // not local
+	e := NewEngine(fakeRetriever{}, st, &fakeLLM{}, nil, "model", "embed", false) // not local
 	if _, err := e.Answer(context.Background(), "q", 5); !errors.Is(err, ErrLocalRequired) {
 		t.Errorf("err = %v, want ErrLocalRequired (bodies + query must stay on-device)", err)
 	}
@@ -111,7 +131,7 @@ func TestAnswer_RemoteEndpointRefused(t *testing.T) {
 
 func TestAnswer_EmptyQueryIsError(t *testing.T) {
 	st := storetest.New(t)
-	e := NewEngine(fakeRetriever{}, st, &fakeLLM{}, "model", true)
+	e := NewEngine(fakeRetriever{}, st, &fakeLLM{}, nil, "model", "embed", true)
 	if _, err := e.Answer(context.Background(), "   ", 5); err == nil {
 		t.Error("an empty query should be an error")
 	}
@@ -120,7 +140,7 @@ func TestAnswer_EmptyQueryIsError(t *testing.T) {
 func TestAnswer_NoHitsSkipsLLM(t *testing.T) {
 	st := storetest.New(t)
 	llmc := &fakeLLM{resp: "should not be called"}
-	e := NewEngine(fakeRetriever{hits: nil}, st, llmc, "model", true)
+	e := NewEngine(fakeRetriever{hits: nil}, st, llmc, nil, "model", "embed", true)
 	ans, err := e.Answer(context.Background(), "q", 5)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
@@ -136,7 +156,7 @@ func TestAnswer_NoHitsSkipsLLM(t *testing.T) {
 func TestAnswer_LLMErrorPropagates(t *testing.T) {
 	st := storetest.New(t)
 	a1 := seed(t, st, "h1", "T", "body")
-	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}}}, st, &fakeLLM{err: errors.New("model down")}, "model", true)
+	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}}}, st, &fakeLLM{err: errors.New("model down")}, nil, "model", "embed", true)
 	if _, err := e.Answer(context.Background(), "q", 5); err == nil {
 		t.Error("an LLM error must propagate")
 	}
@@ -144,8 +164,93 @@ func TestAnswer_LLMErrorPropagates(t *testing.T) {
 
 func TestAnswer_RetrieverErrorPropagates(t *testing.T) {
 	st := storetest.New(t)
-	e := NewEngine(fakeRetriever{err: errors.New("search down")}, st, &fakeLLM{}, "model", true)
+	e := NewEngine(fakeRetriever{err: errors.New("search down")}, st, &fakeLLM{}, nil, "model", "embed", true)
 	if _, err := e.Answer(context.Background(), "q", 5); err == nil {
 		t.Error("a retriever error must propagate")
+	}
+}
+
+func TestAnswer_MMRRerankPrefersDiversity(t *testing.T) {
+	st := storetest.New(t)
+	// A and B are near-duplicates (same vector); C is relevant on a different axis.
+	a := seed(t, st, "ha", "A", "alpha body")
+	b := seed(t, st, "hb", "B", "bravo body")
+	c := seed(t, st, "hc", "C", "charlie body")
+	seedEmbedding(t, st, a, []float32{1, 0, 0})
+	seedEmbedding(t, st, b, []float32{1, 0, 0}) // duplicate of A
+	seedEmbedding(t, st, c, []float32{0, 1, 0}) // diverse, equally relevant to the query
+
+	llmc := &fakeLLM{resp: "answer [1] [2]"}
+	// Retrieval order A, B, C (B ranked above C). Query embedding covers both axes.
+	e := NewEngine(
+		fakeRetriever{hits: []search.Result{{ArtifactID: a, Score: 0.9}, {ArtifactID: b, Score: 0.8}, {ArtifactID: c, Score: 0.7}}},
+		st, llmc, fakeEmbedder{vec: []float32{1, 1, 0}}, "model", "embed", true)
+
+	ans, err := e.Answer(context.Background(), "q", 2)
+	if err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	if len(ans.Sources) != 2 {
+		t.Fatalf("sources = %d, want 2", len(ans.Sources))
+	}
+	// MMR must drop the near-duplicate B in favor of the diverse C, even though B
+	// outranked C in retrieval.
+	got := []string{ans.Sources[0].ArtifactID, ans.Sources[1].ArtifactID}
+	if got[0] != a || got[1] != c {
+		t.Errorf("reranked sources = %v, want [A C] (diversity beats the near-duplicate B)", got)
+	}
+}
+
+func TestAnswer_NilEmbedderKeepsRetrievalOrder(t *testing.T) {
+	st := storetest.New(t)
+	a := seed(t, st, "ha", "A", "alpha")
+	b := seed(t, st, "hb", "B", "bravo")
+	c := seed(t, st, "hc", "C", "charlie")
+	llmc := &fakeLLM{resp: "answer [1] [2]"}
+	// nil embedder → no rerank → top-k of the retrieval order.
+	e := NewEngine(
+		fakeRetriever{hits: []search.Result{{ArtifactID: a}, {ArtifactID: b}, {ArtifactID: c}}},
+		st, llmc, nil, "model", "embed", true)
+	ans, err := e.Answer(context.Background(), "q", 2)
+	if err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	if len(ans.Sources) != 2 || ans.Sources[0].ArtifactID != a || ans.Sources[1].ArtifactID != b {
+		t.Errorf("sources = %+v, want the retrieval-order top 2 [A B]", ans.Sources)
+	}
+}
+
+func TestAnswer_CitationValidation(t *testing.T) {
+	st := storetest.New(t)
+	a := seed(t, st, "ha", "A", "alpha")
+	b := seed(t, st, "hb", "B", "bravo")
+	// The answer cites source 1 (valid), source 3 (out of range → hallucinated), and 1 again.
+	llmc := &fakeLLM{resp: "Per [1], yes; also [3]; see [1]."}
+	e := NewEngine(
+		fakeRetriever{hits: []search.Result{{ArtifactID: a}, {ArtifactID: b}}},
+		st, llmc, nil, "model", "embed", true)
+
+	ans, err := e.Answer(context.Background(), "q", 2)
+	if err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	if !ans.Sources[0].Cited {
+		t.Error("source 1 was cited ([1]) but Cited=false")
+	}
+	if ans.Sources[1].Cited {
+		t.Error("source 2 was never cited but Cited=true")
+	}
+	if len(ans.InvalidCitations) != 1 || ans.InvalidCitations[0] != 3 {
+		t.Errorf("InvalidCitations = %v, want [3] (out-of-range reference)", ans.InvalidCitations)
+	}
+}
+
+func TestParseCitations(t *testing.T) {
+	cited, invalid := parseCitations("uses [1] and [2], plus a bogus [9] and [2] again", 3)
+	if !cited[1] || !cited[2] || cited[3] {
+		t.Errorf("cited = %v, want {1,2} in-range used", cited)
+	}
+	if len(invalid) != 1 || invalid[0] != 9 {
+		t.Errorf("invalid = %v, want [9]", invalid)
 	}
 }

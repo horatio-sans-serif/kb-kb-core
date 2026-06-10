@@ -1758,3 +1758,27 @@ a bug cannot destroy live content). `lifecycle.Sweeper.Compact` reclaims them af
 `Policy.CompactAfter` (config `KB_PURGE_RETENTION_DAYS`, default 90, 0 = never), wired
 into the daemon's lifecycle sweep. Proven end to end: a purge+hard-delete on replica A
 removes the row on B after sync with no resurrection.
+
+## Phase B — Retrieval at scale
+
+**Stage B2 (RAG rerank + citation validation): Complete.** The RAG engine now
+retrieves a larger candidate pool (k×3, capped) and reranks it with Maximal Marginal
+Relevance before synthesis: MMR trades relevance to the query against novelty versus
+already-selected sources, so the few sources that reach the context-bounded synthesis
+are diverse rather than near-duplicates. It is best-effort — without an embedder, a
+usable query embedding, or stored candidate embeddings it falls back to the retrieval
+order (so the single-node path and the existing tests are unchanged). Candidate
+vectors come from the stored `embedding` enrichments; the query is embedded via the
+same on-device Ollama client (now passed to NewEngine as both client and embedder).
+
+Citation validation: after synthesis the engine parses the answer's inline [n]
+references, marks which sources were actually used (`Source.Cited`), and reports any
+out-of-range [n] — a hallucinated reference — in `Answer.InvalidCitations`. Proven by
+tests: MMR drops a near-duplicate in favor of a diverse source; citation parsing marks
+cited/uncited and flags out-of-range references.
+
+**Next: Stage B1** — the `vec0` (sqlite-vec) ANN index to replace the O(n) brute-force
+embedding scan in search.Semantic with sublinear nearest-neighbor retrieval. The
+extension is available (vec0.dylib + asg017/sqlite-vec-go-bindings); the vec0 virtual
+table is a local, rebuilt index over the synced `embedding` enrichments, with graceful
+fallback to the brute-force scan when the extension is absent.

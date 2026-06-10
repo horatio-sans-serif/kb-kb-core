@@ -477,7 +477,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Logger:         logger,
 		Enqueue:        enrichment,
 		Search:         searcher,
-		Ask:            rag.NewEngine(searcher, st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal),
+		Ask:            rag.NewEngine(searcher, st, llmClient, llmClient, cfg.SummarizeModel, cfg.EmbedModel, cfg.OllamaIsLocal),
 		Rescore:        rescore,
 		Connectors:     registry,
 		Render:         renderSvc,

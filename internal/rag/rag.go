@@ -1,10 +1,18 @@
 // Package rag is retrieval-augmented question answering over the knowledge base
-// (design §8.8): retrieve relevant artifacts, ground a local LLM on their content,
-// and synthesize an answer that cites the source artifacts inline.
+// (design §8.8): retrieve a candidate pool, rerank it for relevance-and-diversity,
+// ground a local LLM on the selected sources, synthesize an answer that cites them
+// inline, and validate those citations.
 //
-// Citations are *instructed*, not yet *verified*: the prompt requires inline [n]
-// references but the engine does not validate that the answer's [n] are in range
-// or present. Post-hoc citation validation is deferred to the rerank stage.
+// Rerank (MMR): the hybrid retriever is recall-oriented and can return several
+// near-duplicate sources; Maximal Marginal Relevance reorders the pool to balance
+// relevance to the query against novelty versus already-selected sources, so the few
+// sources that reach the (expensive, context-bounded) synthesis are diverse. It is
+// best-effort: without an embedder or stored candidate embeddings it falls back to
+// the retrieval order.
+//
+// Citation validation: the prompt instructs inline [n] references; after synthesis
+// the engine parses them, marks which sources the answer actually used (Source.Cited)
+// and reports any out-of-range [n] (a hallucinated reference) in Answer.InvalidCitations.
 //
 // Source bodies (some attacker-influenced, e.g. fetched web pages) are fenced and
 // the model is told to treat them as data, not instructions — a cheap mitigation,
@@ -20,11 +28,17 @@ package rag
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
+	"kb/internal/kb"
 	"kb/internal/llm"
+	"kb/internal/relevance"
 	"kb/internal/search"
 	"kb/internal/store"
 	"kb/internal/textutil"
@@ -36,6 +50,12 @@ const (
 	// maxExcerptBytes caps each source's body in the prompt so a few long
 	// artifacts don't blow the context window. Trimmed on a rune boundary.
 	maxExcerptBytes = 4000
+	// mmrLambda weights relevance (to the query) against diversity (novelty vs the
+	// already-selected sources) in the MMR rerank. 0.7 leans toward relevance.
+	mmrLambda = 0.7
+	// rerankPoolFactor is how many more candidates than k the retriever is asked
+	// for, so the rerank has a pool to diversify over. Capped at maxK.
+	rerankPoolFactor = 3
 )
 
 // ErrLocalRequired is returned when the LLM endpoint is not on-device: answering
@@ -49,40 +69,58 @@ type Retriever interface {
 }
 
 // Source is one artifact the answer is grounded on; its position in Answer.Sources
-// (1-based) is the [n] the synthesized answer cites.
+// (1-based) is the [n] the synthesized answer cites. Cited reports whether the answer
+// actually referenced that [n].
 type Source struct {
 	ArtifactID string  `json:"artifact_id"`
 	Title      string  `json:"title,omitempty"`
 	URL        string  `json:"url,omitempty"`
 	Score      float64 `json:"score"`
+	Cited      bool    `json:"cited"`
 }
 
-// Answer is a synthesized response plus the sources it cites.
+// Answer is a synthesized response plus the sources it cites. InvalidCitations holds
+// any [n] the answer emitted that point at no source (out of range) — a
+// hallucinated-reference signal; empty when every citation is valid.
 type Answer struct {
-	Query   string   `json:"query"`
-	Answer  string   `json:"answer"`
-	Sources []Source `json:"sources"`
+	Query            string   `json:"query"`
+	Answer           string   `json:"answer"`
+	Sources          []Source `json:"sources"`
+	InvalidCitations []int    `json:"invalid_citations,omitempty"`
+}
+
+// candidate is a retrieved, live artifact under consideration before rerank.
+type candidate struct {
+	id    string
+	title string
+	body  string
+	url   string
+	score float64
 }
 
 // Engine answers questions over retrieved artifacts.
 type Engine struct {
-	retriever Retriever
-	store     *store.Store
-	client    llm.Client
-	model     string
-	local     bool
+	retriever  Retriever
+	store      *store.Store
+	client     llm.Client
+	embedder   llm.Embedder // for the MMR rerank; nil disables rerank
+	model      string
+	embedModel string
+	local      bool
 }
 
 // NewEngine builds a RAG engine. local must reflect whether the LLM endpoint is
 // on-device (see config.Config.OllamaIsLocal); it governs whether answering is
-// permitted at all.
-func NewEngine(retriever Retriever, st *store.Store, client llm.Client, model string, local bool) *Engine {
-	return &Engine{retriever: retriever, store: st, client: client, model: model, local: local}
+// permitted at all. embedder (with embedModel) powers the MMR rerank; pass nil to
+// disable reranking (the retrieval order is then used directly).
+func NewEngine(retriever Retriever, st *store.Store, client llm.Client, embedder llm.Embedder, model, embedModel string, local bool) *Engine {
+	return &Engine{retriever: retriever, store: st, client: client, embedder: embedder, model: model, embedModel: embedModel, local: local}
 }
 
-// Answer retrieves the top-k artifacts for the query, grounds the local LLM on
-// their content, and returns the synthesized answer with its cited sources. With
-// no relevant sources it returns a stock answer and never calls the model.
+// Answer retrieves a candidate pool for the query, reranks it (MMR) to the top k,
+// grounds the local LLM on those sources, and returns the synthesized answer with
+// its cited sources and any invalid citations. With no relevant sources it returns a
+// stock answer and never calls the model.
 func (e *Engine) Answer(ctx context.Context, query string, k int) (Answer, error) {
 	if !e.local {
 		return Answer{}, ErrLocalRequired
@@ -98,13 +136,17 @@ func (e *Engine) Answer(ctx context.Context, query string, k int) (Answer, error
 		k = maxK
 	}
 
-	hits, err := e.retriever.Hybrid(ctx, query, k)
+	// Retrieve a larger pool so the rerank has candidates to diversify over.
+	pool := k * rerankPoolFactor
+	if pool > maxK {
+		pool = maxK
+	}
+	hits, err := e.retriever.Hybrid(ctx, query, pool)
 	if err != nil {
 		return Answer{}, err
 	}
 
-	var sources []Source
-	var prompt strings.Builder
+	var candidates []candidate
 	for _, h := range hits {
 		// GetLive (not Get) so a delete racing ranking can't feed a tombstoned
 		// artifact's body into the prompt.
@@ -112,20 +154,26 @@ func (e *Engine) Answer(ctx context.Context, query string, k int) (Answer, error
 		if err != nil {
 			continue // artifact deleted/gone between ranking and load — drop it
 		}
-		n := len(sources) + 1
-		src := Source{ArtifactID: a.ID, Title: a.Title, Score: h.Score}
+		c := candidate{id: a.ID, title: a.Title, body: a.BodyMarkdown, score: h.Score}
 		if a.CanonicalURL != nil {
-			src.URL = *a.CanonicalURL
+			c.url = *a.CanonicalURL
 		}
-		sources = append(sources, src)
+		candidates = append(candidates, c)
+	}
+
+	selected := e.rerank(ctx, query, candidates, k)
+	if len(selected) == 0 {
+		return Answer{Query: query, Answer: "I don't have any relevant sources to answer that.", Sources: nil}, nil
+	}
+
+	sources := make([]Source, len(selected))
+	var prompt strings.Builder
+	for i, c := range selected {
+		sources[i] = Source{ArtifactID: c.id, Title: c.title, URL: c.url, Score: c.score}
 		// Fence each source so injected text in a (possibly attacker-controlled)
 		// body can't impersonate the prompt scaffold.
 		fmt.Fprintf(&prompt, "<<<SOURCE %d: %s>>>\n%s\n<<<END SOURCE %d>>>\n\n",
-			n, a.Title, textutil.TruncateBytes(a.BodyMarkdown, maxExcerptBytes), n)
-	}
-
-	if len(sources) == 0 {
-		return Answer{Query: query, Answer: "I don't have any relevant sources to answer that.", Sources: nil}, nil
+			i+1, c.title, textutil.TruncateBytes(c.body, maxExcerptBytes), i+1)
 	}
 
 	answer, err := e.synthesize(ctx, query, prompt.String())
@@ -135,7 +183,118 @@ func (e *Engine) Answer(ctx context.Context, query string, k int) (Answer, error
 	if strings.TrimSpace(answer) == "" {
 		return Answer{}, fmt.Errorf("rag: model returned an empty answer")
 	}
-	return Answer{Query: query, Answer: answer, Sources: sources}, nil
+
+	cited, invalid := parseCitations(answer, len(sources))
+	for i := range sources {
+		sources[i].Cited = cited[i+1]
+	}
+	return Answer{Query: query, Answer: answer, Sources: sources, InvalidCitations: invalid}, nil
+}
+
+// rerank reorders candidates by Maximal Marginal Relevance and returns the top k.
+// Best-effort: without an embedder, a usable query embedding, or candidate
+// embeddings it returns the head of the retrieval order. Candidates that have a
+// stored embedding are MMR-ordered (relevance to the query traded against novelty
+// vs the already-selected set); candidates without one keep the retrieval order
+// after them, so a keyword-only hit is never dropped.
+func (e *Engine) rerank(ctx context.Context, query string, candidates []candidate, k int) []candidate {
+	if k > len(candidates) {
+		k = len(candidates)
+	}
+	if e.embedder == nil || len(candidates) <= 1 {
+		return candidates[:k]
+	}
+	qvec, err := e.embedder.Embed(ctx, llm.EmbedRequest{Model: e.embedModel, Input: query})
+	if err != nil || len(qvec) == 0 {
+		return candidates[:k]
+	}
+
+	type withVec struct {
+		c   candidate
+		vec []float32
+	}
+	var embedded []withVec
+	var unembedded []candidate
+	for _, c := range candidates {
+		v := e.candidateVector(ctx, c.id, len(qvec))
+		if v != nil {
+			embedded = append(embedded, withVec{c, v})
+		} else {
+			unembedded = append(unembedded, c)
+		}
+	}
+	if len(embedded) == 0 {
+		return candidates[:k]
+	}
+
+	// MMR selection over the embedded candidates.
+	ordered := make([]candidate, 0, len(embedded))
+	selectedVecs := make([][]float32, 0, len(embedded))
+	used := make([]bool, len(embedded))
+	for len(ordered) < len(embedded) {
+		best, bestScore := -1, 0.0
+		for i, e := range embedded {
+			if used[i] {
+				continue
+			}
+			rel := relevance.Cosine(qvec, e.vec)
+			div := 0.0
+			for _, sv := range selectedVecs {
+				if d := relevance.Cosine(e.vec, sv); d > div {
+					div = d
+				}
+			}
+			score := mmrLambda*rel - (1-mmrLambda)*div
+			if best == -1 || score > bestScore {
+				best, bestScore = i, score
+			}
+		}
+		used[best] = true
+		ordered = append(ordered, embedded[best].c)
+		selectedVecs = append(selectedVecs, embedded[best].vec)
+	}
+	ordered = append(ordered, unembedded...) // keyword-only hits keep their order, after
+	return ordered[:k]
+}
+
+// candidateVector returns the artifact's latest embedding vector, or nil if it has
+// none, the payload is corrupt, or its dimension does not match dim.
+func (e *Engine) candidateVector(ctx context.Context, artifactID string, dim int) []float32 {
+	en, err := e.store.Enrichments.LatestByKind(ctx, artifactID, "embedding")
+	if err != nil {
+		return nil
+	}
+	var ep kb.EmbeddingPayload
+	if json.Unmarshal([]byte(en.Payload), &ep) != nil || len(ep.Vector) != dim {
+		return nil
+	}
+	return ep.Vector
+}
+
+// citationRe matches an inline [n] citation.
+var citationRe = regexp.MustCompile(`\[(\d+)\]`)
+
+// parseCitations extracts the [n] references in answer: cited is the set of in-range
+// source numbers the answer used (1-based), invalid is the sorted distinct list of
+// out-of-range numbers (references to sources that do not exist).
+func parseCitations(answer string, nSources int) (cited map[int]bool, invalid []int) {
+	cited = map[int]bool{}
+	seen := map[int]bool{}
+	for _, m := range citationRe.FindAllStringSubmatch(answer, -1) {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		switch {
+		case n >= 1 && n <= nSources:
+			cited[n] = true
+		case !seen[n]:
+			seen[n] = true
+			invalid = append(invalid, n)
+		}
+	}
+	sort.Ints(invalid)
+	return cited, invalid
 }
 
 func (e *Engine) synthesize(ctx context.Context, query, sources string) (string, error) {
