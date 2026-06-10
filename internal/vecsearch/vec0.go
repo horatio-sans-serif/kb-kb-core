@@ -43,6 +43,11 @@ func New(write, read *sql.DB, dim int) (Index, error) {
 	if dim <= 0 {
 		return nil, fmt.Errorf("vecsearch: invalid embedding dimension %d", dim)
 	}
+	if write == read {
+		// Reconcile streams from read inside a write transaction; on a single shared
+		// pool that deadlocks the one writer. Enforce the contract, don't just document.
+		return nil, fmt.Errorf("vecsearch: write and read pools must be distinct")
+	}
 	ix := &vecIndex{write: write, read: read, dim: dim}
 	// cosine distance so 1-distance is the cosine similarity the brute-force scan
 	// reports; a fixed FLOAT[dim] vector column keyed by the artifact ULID.
@@ -57,7 +62,10 @@ func New(write, read *sql.DB, dim int) (Index, error) {
 
 // Reconcile rebuilds the index from src in one transaction when the embedding
 // population has changed since the last rebuild. The cheap count guard makes a
-// no-change reconcile a single COUNT query, so it is fine to call on a ticker.
+// no-change reconcile a single COUNT query, so it is fine to call on a ticker. The
+// rebuild is O(total vectors) and holds the single write connection for its duration
+// (blocking other writers); at personal scale it is sub-second, but a very large
+// corpus would make this the scaling ceiling of reconcile-based maintenance.
 func (ix *vecIndex) Reconcile(ctx context.Context, src EmbeddingSource) (int, error) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -125,7 +133,10 @@ func (ix *vecIndex) Search(ctx context.Context, qvec []float32, k int) ([]Hit, e
 	}
 	// The KNN runs in a subquery (pure vec0 scan of the nearest k+buffer), then the
 	// outer query joins to artifacts to drop tombstoned hits. The buffer compensates
-	// for those drops so k live results remain in the common case.
+	// for those drops so k live results remain in the common case; under heavy
+	// un-reconciled deletion (>liveBuffer tombstoned among the nearest neighbors) this
+	// can return fewer than k — best-effort, and search.Semantic falls back to the
+	// exact brute-force scan when the index returns nothing.
 	rows, err := ix.read.QueryContext(ctx,
 		`SELECT knn.artifact_id, knn.distance
 		 FROM (

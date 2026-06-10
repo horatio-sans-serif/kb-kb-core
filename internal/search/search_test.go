@@ -305,3 +305,20 @@ func TestSemantic_FallsBackOnIndexError(t *testing.T) {
 		t.Errorf("results = %+v, want the brute-force scan to find %s", res, a)
 	}
 }
+
+func TestSemantic_FallsBackOnEmptyIndex(t *testing.T) {
+	st := storetest.New(t)
+	// An embedding exists, but the index returns empty (e.g. not yet reconciled at
+	// startup); search must fall through to brute force, not return nothing.
+	a := seedNoteWithEmbedding(t, st, "h1", "T", "body", []float32{1, 0, 0})
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0, 0}}, "m", true)
+	s.SetIndex(&fakeIndex{hits: nil}) // success, but no hits
+
+	res, err := s.Semantic(context.Background(), "q", 5)
+	if err != nil {
+		t.Fatalf("semantic: %v", err)
+	}
+	if len(res) != 1 || res[0].ArtifactID != a {
+		t.Errorf("an empty index must fall back to brute force; results = %+v, want %s", res, a)
+	}
+}

@@ -233,14 +233,14 @@ func (e *Engine) rerank(ctx context.Context, query string, candidates []candidat
 	used := make([]bool, len(embedded))
 	for len(ordered) < len(embedded) {
 		best, bestScore := -1, 0.0
-		for i, e := range embedded {
+		for i, ec := range embedded {
 			if used[i] {
 				continue
 			}
-			rel := relevance.Cosine(qvec, e.vec)
+			rel := relevance.Cosine(qvec, ec.vec)
 			div := 0.0
 			for _, sv := range selectedVecs {
-				if d := relevance.Cosine(e.vec, sv); d > div {
+				if d := relevance.Cosine(ec.vec, sv); d > div {
 					div = d
 				}
 			}
@@ -271,26 +271,53 @@ func (e *Engine) candidateVector(ctx context.Context, artifactID string, dim int
 	return ep.Vector
 }
 
-// citationRe matches an inline [n] citation.
-var citationRe = regexp.MustCompile(`\[(\d+)\]`)
+// citationRe matches a bracketed citation whose content is only digits, commas,
+// spaces, and hyphens — covering the formats models actually emit: [1], [1][2],
+// [1,2], [1-3], [1, 2-4]. A bracket containing any letter (e.g. a relation name) does
+// not match. citationNum then splits the content into single numbers and ranges.
+var (
+	citationRe  = regexp.MustCompile(`\[([\d,\s-]+)\]`)
+	citationNum = regexp.MustCompile(`(\d+)(?:\s*-\s*(\d+))?`)
+)
 
-// parseCitations extracts the [n] references in answer: cited is the set of in-range
-// source numbers the answer used (1-based), invalid is the sorted distinct list of
-// out-of-range numbers (references to sources that do not exist).
+// rangeCap bounds an expanded citation range so a date-like "[2024-01]" cannot
+// balloon into thousands of phantom citations.
+const rangeCap = 100
+
+// parseCitations extracts the citation references in answer: cited is the set of
+// in-range source numbers the answer used (1-based), invalid is the sorted distinct
+// list of out-of-range numbers (references to sources that do not exist).
 func parseCitations(answer string, nSources int) (cited map[int]bool, invalid []int) {
 	cited = map[int]bool{}
 	seen := map[int]bool{}
-	for _, m := range citationRe.FindAllStringSubmatch(answer, -1) {
-		n, err := strconv.Atoi(m[1])
-		if err != nil {
-			continue
-		}
+	record := func(n int) {
 		switch {
 		case n >= 1 && n <= nSources:
 			cited[n] = true
 		case !seen[n]:
 			seen[n] = true
 			invalid = append(invalid, n)
+		}
+	}
+	for _, m := range citationRe.FindAllStringSubmatch(answer, -1) {
+		for _, part := range citationNum.FindAllStringSubmatch(m[1], -1) {
+			lo, err := strconv.Atoi(part[1])
+			if err != nil {
+				continue
+			}
+			hi := lo
+			if part[2] != "" {
+				if h, err := strconv.Atoi(part[2]); err == nil {
+					hi = h
+				}
+			}
+			if hi < lo || hi-lo > rangeCap {
+				record(lo) // inverted or absurd "range" — treat as a single reference
+				continue
+			}
+			for n := lo; n <= hi; n++ {
+				record(n)
+			}
 		}
 	}
 	sort.Ints(invalid)

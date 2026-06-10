@@ -254,3 +254,23 @@ func TestParseCitations(t *testing.T) {
 		t.Errorf("invalid = %v, want [9]", invalid)
 	}
 }
+
+func TestParseCitations_CombinedAndRangeFormats(t *testing.T) {
+	// Models emit [1,2] (comma) and [1-3] (range), not only [1][2].
+	cited, invalid := parseCitations("see [1, 2] and [3-5]; bogus [8]", 5)
+	for _, n := range []int{1, 2, 3, 4, 5} {
+		if !cited[n] {
+			t.Errorf("source %d should be cited (from a combined/range reference)", n)
+		}
+	}
+	if len(invalid) != 1 || invalid[0] != 8 {
+		t.Errorf("invalid = %v, want [8]", invalid)
+	}
+
+	// A bracket with letters is not a citation; an inverted/absurd range is treated
+	// as a single reference, not expanded.
+	cited, _ = parseCitations("relation [derived-from] and [2024-2025]", 3)
+	if len(cited) != 0 {
+		t.Errorf("cited = %v, want none (letters are not citations; the year range is out of range)", cited)
+	}
+}

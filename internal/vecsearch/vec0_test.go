@@ -30,18 +30,25 @@ func (f *fakeSource) ForEachLatestEmbedding(_ context.Context, fn func(id, paylo
 }
 func (f *fakeSource) CountByKind(_ context.Context, _ string) (int, error) { return f.count, nil }
 
-func openWithVec(t *testing.T) *sql.DB {
+// openWithVec returns distinct write and read pools (as New requires).
+func openWithVec(t *testing.T) (write, read *sql.DB) {
 	t.Helper()
-	Enable() // before opening the pool, so its connections carry the extension
-	db, err := store.Open(filepath.Join(t.TempDir(), "kb.db"))
+	Enable() // before opening the pools, so their connections carry the extension
+	path := filepath.Join(t.TempDir(), "kb.db")
+	w, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-	if _, err := store.Migrate(db); err != nil {
+	t.Cleanup(func() { _ = w.Close() })
+	if _, err := store.Migrate(w); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return db
+	r, err := store.OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("open read: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	return w, r
 }
 
 func rawArtifact(t *testing.T, db *sql.DB, id string) {
@@ -54,11 +61,11 @@ func rawArtifact(t *testing.T, db *sql.DB, id string) {
 
 func TestVecIndex_ReconcileAndSearchNearestLiveFirst(t *testing.T) {
 	ctx := context.Background()
-	db := openWithVec(t)
+	w, r := openWithVec(t)
 	for _, id := range []string{"01A", "01B", "01C"} {
-		rawArtifact(t, db, id)
+		rawArtifact(t, w, id)
 	}
-	ix, err := New(db, db, 3)
+	ix, err := New(w, r, 3)
 	if err != nil {
 		t.Fatalf("new index: %v", err)
 	}
@@ -85,7 +92,7 @@ func TestVecIndex_ReconcileAndSearchNearestLiveFirst(t *testing.T) {
 	}
 
 	// Tombstone the nearest; it drops out of the live-filtered results.
-	if _, err := db.ExecContext(ctx, `UPDATE artifacts SET deleted_at = 'now' WHERE id = '01A'`); err != nil {
+	if _, err := w.ExecContext(ctx, `UPDATE artifacts SET deleted_at = 'now' WHERE id = '01A'`); err != nil {
 		t.Fatal(err)
 	}
 	hits, _ = ix.Search(ctx, []float32{1, 0, 0}, 2)
@@ -99,11 +106,21 @@ func TestVecIndex_ReconcileAndSearchNearestLiveFirst(t *testing.T) {
 	}
 }
 
+func TestNew_RejectsSamePool(t *testing.T) {
+	w, _ := openWithVec(t)
+	if _, err := New(w, w, 3); err == nil {
+		t.Error("New must reject write == read (Reconcile would deadlock the single writer)")
+	}
+	if _, err := New(w, w, 0); err == nil {
+		t.Error("New must reject a non-positive dimension")
+	}
+}
+
 func TestVecIndex_ReconcileCountGuard(t *testing.T) {
 	ctx := context.Background()
-	db := openWithVec(t)
-	rawArtifact(t, db, "01A")
-	ix, err := New(db, db, 3)
+	w, r := openWithVec(t)
+	rawArtifact(t, w, "01A")
+	ix, err := New(w, r, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +134,7 @@ func TestVecIndex_ReconcileCountGuard(t *testing.T) {
 	}
 	// Count changed → rebuilds.
 	src.count = 2
-	rawArtifact(t, db, "01B")
+	rawArtifact(t, w, "01B")
 	src.rows["01B"] = []float32{0, 1, 0}
 	if n, _ := ix.Reconcile(ctx, src); n != 2 {
 		t.Errorf("changed reconcile indexed %d, want 2", n)
@@ -126,10 +143,10 @@ func TestVecIndex_ReconcileCountGuard(t *testing.T) {
 
 func TestVecIndex_ReconcileSkipsBadDim(t *testing.T) {
 	ctx := context.Background()
-	db := openWithVec(t)
-	rawArtifact(t, db, "01A")
-	rawArtifact(t, db, "01B")
-	ix, err := New(db, db, 3)
+	w, r := openWithVec(t)
+	rawArtifact(t, w, "01A")
+	rawArtifact(t, w, "01B")
+	ix, err := New(w, r, 3)
 	if err != nil {
 		t.Fatal(err)
 	}

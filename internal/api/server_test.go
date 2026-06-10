@@ -1005,9 +1005,13 @@ func (f fakeAsker) Answer(_ context.Context, _ string, _ int) (rag.Answer, error
 func TestAsk_ReturnsAnswer(t *testing.T) {
 	st := newStore(t)
 	asker := fakeAsker{ans: rag.Answer{
-		Query:   "what is tokio",
-		Answer:  "Tokio is an async runtime [1].",
-		Sources: []rag.Source{{ArtifactID: "01ABC", Title: "Rust async", Score: 0.9}},
+		Query:  "what is tokio",
+		Answer: "Tokio is an async runtime [1].",
+		Sources: []rag.Source{
+			{ArtifactID: "01ABC", Title: "Rust async", Score: 0.9, Cited: true},
+			{ArtifactID: "01DEF", Title: "Unused", Score: 0.3, Cited: false},
+		},
+		InvalidCitations: []int{5},
 	}}
 	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "tok", Logger: discardLogger(), Ask: asker}).Handler()
 
@@ -1020,13 +1024,22 @@ func TestAsk_ReturnsAnswer(t *testing.T) {
 		Sources []struct {
 			ArtifactID string `json:"artifact_id"`
 			Title      string `json:"title"`
+			Cited      bool   `json:"cited"`
 		} `json:"sources"`
+		InvalidCitations []int `json:"invalid_citations"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Answer != "Tokio is an async runtime [1]." || len(resp.Sources) != 1 || resp.Sources[0].Title != "Rust async" {
-		t.Errorf("response = %+v, want the synthesized answer + cited source", resp)
+	if resp.Answer != "Tokio is an async runtime [1]." || len(resp.Sources) != 2 || resp.Sources[0].Title != "Rust async" {
+		t.Errorf("response = %+v, want the synthesized answer + sources", resp)
+	}
+	// Citation-validation fields must reach the wire.
+	if !resp.Sources[0].Cited || resp.Sources[1].Cited {
+		t.Errorf("Cited flags not serialized: %+v", resp.Sources)
+	}
+	if len(resp.InvalidCitations) != 1 || resp.InvalidCitations[0] != 5 {
+		t.Errorf("InvalidCitations = %v, want [5] serialized", resp.InvalidCitations)
 	}
 }
 

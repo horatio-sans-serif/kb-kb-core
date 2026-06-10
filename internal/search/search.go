@@ -102,11 +102,14 @@ func (s *Searcher) Semantic(ctx context.Context, query string, k int) ([]Result,
 		return nil, fmt.Errorf("search: empty query embedding")
 	}
 
-	// Sublinear path: when the vec0 ANN index is present, use it. On any index error
-	// (e.g. a query-dimension mismatch) fall back to the exact brute-force scan rather
-	// than failing the query.
+	// Sublinear path: when the vec0 ANN index is present and returns hits, use it. Fall
+	// back to the exact brute-force scan on an index error (e.g. a query-dimension
+	// mismatch) OR an empty result — the index may not have been reconciled yet (the
+	// startup window before the first rebuild), so an empty index must not shadow
+	// matches the brute-force scan would find. A genuinely empty corpus makes both
+	// paths return nothing, so the fallback only costs a wasted scan in that rare case.
 	if s.index != nil {
-		if hits, err := s.index.Search(ctx, qvec, k); err == nil {
+		if hits, err := s.index.Search(ctx, qvec, k); err == nil && len(hits) > 0 {
 			out := make([]Result, len(hits))
 			for i, h := range hits {
 				out[i] = Result{ArtifactID: h.ArtifactID, Score: h.Score}
