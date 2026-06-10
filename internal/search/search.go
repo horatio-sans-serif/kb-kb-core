@@ -19,6 +19,7 @@ import (
 	"kb/internal/llm"
 	"kb/internal/relevance"
 	"kb/internal/store"
+	"kb/internal/vecsearch"
 )
 
 const (
@@ -62,6 +63,7 @@ type Searcher struct {
 	embedder llm.Embedder
 	model    string
 	local    bool
+	index    vecsearch.Index // optional vec0 ANN index; nil → brute-force scan
 }
 
 // NewSearcher builds a Searcher over the store and an embed client. model is the
@@ -71,6 +73,10 @@ type Searcher struct {
 func NewSearcher(st *store.Store, embedder llm.Embedder, model string, local bool) *Searcher {
 	return &Searcher{st: st, embedder: embedder, model: model, local: local}
 }
+
+// SetIndex installs the vec0 ANN index so Semantic uses sublinear nearest-neighbor
+// retrieval instead of the O(n) brute-force scan. nil (the default) keeps brute force.
+func (s *Searcher) SetIndex(index vecsearch.Index) { s.index = index }
 
 // Semantic embeds the query and returns up to k artifacts by descending cosine
 // similarity to their latest embedding. k <= 0 uses a default; k is capped.
@@ -94,6 +100,19 @@ func (s *Searcher) Semantic(ctx context.Context, query string, k int) ([]Result,
 	}
 	if len(qvec) == 0 {
 		return nil, fmt.Errorf("search: empty query embedding")
+	}
+
+	// Sublinear path: when the vec0 ANN index is present, use it. On any index error
+	// (e.g. a query-dimension mismatch) fall back to the exact brute-force scan rather
+	// than failing the query.
+	if s.index != nil {
+		if hits, err := s.index.Search(ctx, qvec, k); err == nil {
+			out := make([]Result, len(hits))
+			for i, h := range hits {
+				out[i] = Result{ArtifactID: h.ArtifactID, Score: h.Score}
+			}
+			return out, nil
+		}
 	}
 
 	h := &resultHeap{}

@@ -75,6 +75,30 @@ func TestConfig_SyncDefaultsOff(t *testing.T) {
 	if cfg.PurgeRetention != 90 {
 		t.Errorf("PurgeRetention = %d, want 90 days by default", cfg.PurgeRetention)
 	}
+	if cfg.EmbedDim != 768 {
+		t.Errorf("EmbedDim = %d, want 768 by default", cfg.EmbedDim)
+	}
+}
+
+func TestConfig_EmbedDim(t *testing.T) {
+	base := map[string]string{"KB_DB": "/tmp/kb.db", "KB_API_TOKEN": "0123456789abcdef0123456789abcdef"}
+	with := func(v string) map[string]string {
+		m := map[string]string{}
+		for k, val := range base {
+			m[k] = val
+		}
+		m["KB_EMBED_DIM"] = v
+		return m
+	}
+	if cfg, err := Load(envFunc(with("1024"))); err != nil || cfg.EmbedDim != 1024 {
+		t.Errorf("EmbedDim 1024 = %v (err %v), want 1024", cfg, err)
+	}
+	if _, err := Load(envFunc(with("0"))); err == nil {
+		t.Error("zero embed dim should fail (must be positive)")
+	}
+	if _, err := Load(envFunc(with("nope"))); err == nil {
+		t.Error("non-numeric embed dim should fail")
+	}
 }
 
 func TestConfig_PurgeRetention(t *testing.T) {

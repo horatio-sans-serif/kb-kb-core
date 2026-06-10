@@ -151,6 +151,17 @@ func (r *EnrichmentRepo) EngagedEmbeddings(ctx context.Context, excludeID string
 	return out, rows.Err()
 }
 
+// CountByKind returns the number of enrichment rows of a kind — a cheap change
+// detector for the vec0 index (a new or re-run embedding adds a row, so the count
+// moves whenever the index would need rebuilding).
+func (r *EnrichmentRepo) CountByKind(ctx context.Context, kind string) (int, error) {
+	var n int
+	if err := r.rq.QueryRowContext(ctx, `SELECT COUNT(*) FROM enrichments WHERE kind = ?`, kind).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count %q enrichments: %w", kind, err)
+	}
+	return n, nil
+}
+
 // Get returns the enrichment by id, or ErrNotFound.
 func (r *EnrichmentRepo) Get(ctx context.Context, id string) (*Enrichment, error) {
 	var e Enrichment

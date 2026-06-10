@@ -45,6 +45,7 @@ import (
 	"kb/internal/store"
 	"kb/internal/surface"
 	"kb/internal/topics"
+	"kb/internal/vecsearch"
 )
 
 // Version is the build version reported by /healthz (override with -ldflags).
@@ -71,6 +72,10 @@ const reconcileInterval = 10 * time.Minute
 // syncPullInterval is how often the puller pulls changesets from configured peers
 // (when multi-device sync is enabled).
 const syncPullInterval = 30 * time.Second
+
+// vecReconcileInterval is how often the vec0 ANN index is reconciled from the
+// embeddings (a count guard makes a no-change reconcile cheap).
+const vecReconcileInterval = 2 * time.Minute
 
 // sourcePollInterval is how often the scheduler checks for PULL sources due to
 // refresh (each source's own schedule decides whether it actually fetches).
@@ -180,6 +185,10 @@ func isTailscale(ip net.IP) bool {
 // testable) and runs until ctx is cancelled, then shuts the HTTP server down
 // gracefully.
 func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slog.Logger) error {
+	// Register the vec0 ANN extension (no-op in a default build) BEFORE any pool
+	// opens, so every connection — read, write, and the cr-sqlite driver — carries it.
+	vecsearch.Enable()
+
 	db, syncEnabled, err := openWriteDB(cfg, logger)
 	if err != nil {
 		return err
@@ -213,6 +222,41 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	defer rdb.Close()
 
 	st := store.NewWithReadPool(db, rdb)
+
+	// vec0 ANN index (when built with the `vec0` tag): a local, rebuilt KNN index over
+	// the embedding enrichments that makes semantic search sublinear. Absent it,
+	// search uses the exact brute-force scan. The index is reconciled from the
+	// embeddings at startup and on a ticker (a count guard skips no-change rebuilds).
+	var vecIndex vecsearch.Index
+	if idx, err := vecsearch.New(db, rdb, cfg.EmbedDim); err != nil {
+		if !errors.Is(err, vecsearch.ErrUnavailable) {
+			return fmt.Errorf("vec0 index: %w", err)
+		}
+	} else {
+		vecIndex = idx
+		logger.Info("vec0 ANN index enabled", "embed_dim", cfg.EmbedDim)
+		runVecReconcile := func() {
+			switch n, err := vecIndex.Reconcile(ctx, st.Enrichments); {
+			case err != nil && ctx.Err() == nil:
+				logger.Warn("vec0 reconcile", "err", err)
+			case n > 0:
+				logger.Info("vec0 reconcile", "indexed", n)
+			}
+		}
+		go func() {
+			runVecReconcile()
+			t := time.NewTicker(vecReconcileInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					runVecReconcile()
+				}
+			}
+		}()
+	}
 	bus := events.NewBus()
 
 	runner := jobs.NewRunner(st, jobs.WithLogger(logger))
@@ -439,6 +483,9 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// take the daemon's locality so the privacy gate extends to query embedding
 	// (search) and answer synthesis (rag).
 	searcher := search.NewSearcher(st, llmClient, cfg.EmbedModel, cfg.OllamaIsLocal)
+	if vecIndex != nil {
+		searcher.SetIndex(vecIndex)
+	}
 
 	// Output/render layer (§8.14): one Renderer per format over the same assembled
 	// Markdown. The Markdown renderer is dependency-free; the pandoc-backed formats

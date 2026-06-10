@@ -1782,3 +1782,25 @@ embedding scan in search.Semantic with sublinear nearest-neighbor retrieval. The
 extension is available (vec0.dylib + asg017/sqlite-vec-go-bindings); the vec0 virtual
 table is a local, rebuilt index over the synced `embedding` enrichments, with graceful
 fallback to the brute-force scan when the extension is absent.
+
+**Stage B1 (vec0 ANN index): Complete.** The optional `internal/vecsearch` package
+backs semantic search with a sqlite-vec (vec0) approximate-nearest-neighbor index,
+replacing the O(n) brute-force cosine scan with a sublinear KNN lookup. It is gated
+behind the `vec0` build tag (compiles the native sqlite-vec via the cgo bindings);
+the default build has no vec0 and search uses the brute-force scan. A deciding-test
+proved sqlite-vec loads via mattn (sqlite_vec.Auto, so every pool — read, write, and
+the cr-sqlite driver — carries it), a TEXT-PRIMARY-KEY vec0 table keys directly by
+artifact ULID, and cosine distance round-trips to the same similarity score the
+brute-force path reports.
+
+The vec0 table is a LOCAL, rebuilt index over the embedding enrichments. Maintenance
+is reconcile-based (not incremental): the embed stage runs inside the pipeline's
+write transaction and cannot open its own, so a count-guarded Reconcile (full rebuild
+in one transaction, skipped via a cheap COUNT when the embedding population is
+unchanged) runs at startup and on a 2-minute ticker. Search live-filters tombstoned
+hits via a join, over-fetching a buffer to still return k live results. Config
+KB_EMBED_DIM (default 768) sets the index dimension. search.Searcher.SetIndex installs
+it; Semantic uses the index when present and falls back to the exact brute-force scan
+on any index error. Proven end to end against the real extension: the Searcher backed
+by a real vec0 index returns the nearest live artifact first; default, vec0, and
+vec0+crsqlite builds all compile and pass.

@@ -11,6 +11,7 @@ import (
 	"kb/internal/llm"
 	"kb/internal/store"
 	"kb/internal/storetest"
+	"kb/internal/vecsearch"
 )
 
 // queryEmbedder returns a fixed query vector regardless of input.
@@ -255,5 +256,52 @@ func TestHybrid_CancelledContextPropagates(t *testing.T) {
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
 	if _, err := s.Hybrid(ctx, "beta", 10); err == nil {
 		t.Error("a cancelled context must propagate as an error, not a degraded 200")
+	}
+}
+
+type fakeIndex struct {
+	hits  []vecsearch.Hit
+	err   error
+	calls int
+}
+
+func (f *fakeIndex) Search(_ context.Context, _ []float32, _ int) ([]vecsearch.Hit, error) {
+	f.calls++
+	return f.hits, f.err
+}
+func (f *fakeIndex) Reconcile(_ context.Context, _ vecsearch.EmbeddingSource) (int, error) {
+	return 0, nil
+}
+
+func TestSemantic_UsesIndexWhenSet(t *testing.T) {
+	st := storetest.New(t)
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0, 0}}, "m", true)
+	idx := &fakeIndex{hits: []vecsearch.Hit{{ArtifactID: "01A", Score: 0.95}, {ArtifactID: "01B", Score: 0.5}}}
+	s.SetIndex(idx)
+
+	res, err := s.Semantic(context.Background(), "q", 5)
+	if err != nil {
+		t.Fatalf("semantic: %v", err)
+	}
+	if idx.calls != 1 {
+		t.Errorf("index Search called %d times, want 1 (the ANN path)", idx.calls)
+	}
+	if len(res) != 2 || res[0].ArtifactID != "01A" || res[0].Score != 0.95 {
+		t.Errorf("results = %+v, want the index hits passed through", res)
+	}
+}
+
+func TestSemantic_FallsBackOnIndexError(t *testing.T) {
+	st := storetest.New(t)
+	a := seedNoteWithEmbedding(t, st, "h1", "T", "body", []float32{1, 0, 0})
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0, 0}}, "m", true)
+	s.SetIndex(&fakeIndex{err: errors.New("index down")})
+
+	res, err := s.Semantic(context.Background(), "q", 5)
+	if err != nil {
+		t.Fatalf("an index error must fall back to brute force, not fail: %v", err)
+	}
+	if len(res) != 1 || res[0].ArtifactID != a {
+		t.Errorf("results = %+v, want the brute-force scan to find %s", res, a)
 	}
 }

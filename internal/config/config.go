@@ -27,6 +27,7 @@ type Config struct {
 	CRSqlitePath    string   // KB_CRSQLITE_PATH (path to the cr-sqlite extension; empty = single-node)
 	SyncPeers       []string // KB_SYNC_PEERS (semicolon-separated peer base URLs, e.g. http://host:8087)
 	PurgeRetention  int      // KB_PURGE_RETENTION_DAYS (days a purged artifact is kept before physical compaction; 0 = never; default 90)
+	EmbedDim        int      // KB_EMBED_DIM (embedding dimension for the vec0 ANN index; must match the embed model; default 768)
 }
 
 // Load reads configuration via getenv (pass os.Getenv in production). It returns
@@ -54,6 +55,15 @@ func Load(getenv func(string) string) (*Config, error) {
 			return nil, fmt.Errorf("invalid KB_PURGE_RETENTION_DAYS %q (want a non-negative integer; 0 disables compaction)", v)
 		}
 		cfg.PurgeRetention = n
+	}
+
+	cfg.EmbedDim = 768
+	if v := strings.TrimSpace(getenv("KB_EMBED_DIM")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid KB_EMBED_DIM %q (want a positive integer matching the embed model)", v)
+		}
+		cfg.EmbedDim = n
 	}
 	// Renders default to a directory beside the database so output files live with
 	// the data they derive from. Use an absolute KB_DB in production: a relative
