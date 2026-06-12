@@ -1045,6 +1045,60 @@ func TestReadToken_SearchEndToEndFiltersTiers(t *testing.T) {
 	}
 }
 
+func TestReadToken_GraphTraversalFiltersTiers(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	// pub -- mid (public), pub -- sens (sensitive), sens -- far (public).
+	// far is reachable from pub within 2 hops ONLY through the sensitive node.
+	pub := seedReady(t, st, "h1", "start", kb.Public, 0.5)
+	mid := seedReady(t, st, "h2", "mid", kb.Public, 0.5)
+	sens := seedReady(t, st, "h3", "secret", kb.Sensitive, 0.5)
+	far := seedReady(t, st, "h4", "far", kb.Public, 0.5)
+	for _, e := range [][2]string{{pub, mid}, {pub, sens}, {sens, far}} {
+		if err := st.Graph.AddLink(ctx, e[0], e[1], "references", 1.0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger()})
+	h := srv.Handler()
+
+	connected := func(token string) (map[string]bool, string) {
+		rec := doGet(h, "/graph/"+pub+"?hops=2", token)
+		var out struct {
+			Connected []struct {
+				ArtifactID string `json:"artifact_id"`
+			} `json:"connected"`
+		}
+		mustJSON(t, rec, &out)
+		set := map[string]bool{}
+		for _, c := range out.Connected {
+			set[c.ArtifactID] = true
+		}
+		return set, rec.Body.String()
+	}
+
+	// The owner reaches all three: mid, sens (1 hop), and far (2 hops via sens).
+	if got, _ := connected("owner-token-xxxxxxxxxxxx"); !got[mid] || !got[sens] || !got[far] {
+		t.Errorf("owner graph connected = %v, want mid+sens+far", got)
+	}
+	// The read token reaches only mid: sens is above ceiling (excluded), and far is
+	// unreachable because the traversal does not expand through the hidden node.
+	got, body := connected("read-token-yyyyyyyyyyyyyy")
+	if !got[mid] || got[sens] || got[far] {
+		t.Errorf("read-token graph connected = %v, want only mid (sens hidden, far unreachable)", got)
+	}
+	if strings.Contains(body, sens) || strings.Contains(body, "secret") || strings.Contains(body, far) {
+		t.Errorf("hidden node leaked into the read-token graph: %s", body)
+	}
+
+	// The graph of an above-ceiling artifact is a uniform 404 for the read token.
+	if rec := doGet(h, "/graph/"+sens, "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusNotFound {
+		t.Errorf("read-token GET /graph of sensitive artifact = %d, want 404", rec.Code)
+	}
+}
+
 func TestReadCeiling_FailsClosedWhenUntagged(t *testing.T) {
 	// A context with no ceiling (a handler reached without requireAuth/requireRead —
 	// a bug) must fail closed to the least-sensitive floor, never open to Restricted.

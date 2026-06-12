@@ -71,11 +71,11 @@ func TestClusterer_AddsSharesTopicEdges(t *testing.T) {
 		t.Fatalf("sweep: %v", err)
 	}
 	// A and B (co-topic) are graph neighbors; C is not.
-	nbrs, _ := st.Graph.NeighborIDs(ctx, []string{a})
+	nbrs, _ := st.Graph.NeighborIDs(ctx, []string{a}, kb.Restricted)
 	if len(nbrs) != 1 || nbrs[0] != b {
 		t.Errorf("co-topic artifacts should share a graph edge: A neighbors = %v, want [B]", nbrs)
 	}
-	if cn, _ := st.Graph.NeighborIDs(ctx, []string{c}); len(cn) != 0 {
+	if cn, _ := st.Graph.NeighborIDs(ctx, []string{c}, kb.Restricted); len(cn) != 0 {
 		t.Errorf("a separate-topic artifact should have no co-topic edge, got %v", cn)
 	}
 }
@@ -92,7 +92,7 @@ func TestClusterer_SharesTopicMultiMember(t *testing.T) {
 		t.Fatalf("sweep: %v", err)
 	}
 	for _, id := range []string{a, b, c} {
-		nbrs, _ := st.Graph.NeighborIDs(ctx, []string{id})
+		nbrs, _ := st.Graph.NeighborIDs(ctx, []string{id}, kb.Restricted)
 		if len(nbrs) != 2 {
 			t.Errorf("artifact %s should connect to the other 2 co-topic artifacts, got %v", id, nbrs)
 		}
@@ -116,7 +116,7 @@ func TestClusterer_SharesTopicFanoutCapped(t *testing.T) {
 	if _, err := cl.Sweep(ctx); err != nil {
 		t.Fatalf("late sweep: %v", err)
 	}
-	if nbrs, _ := st.Graph.NeighborIDs(ctx, []string{late}); len(nbrs) != 0 {
+	if nbrs, _ := st.Graph.NeighborIDs(ctx, []string{late}, kb.Restricted); len(nbrs) != 0 {
 		t.Errorf("a joiner of an over-cap hub topic should get no edges, got %d", len(nbrs))
 	}
 }

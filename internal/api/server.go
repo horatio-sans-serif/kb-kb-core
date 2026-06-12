@@ -134,7 +134,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /digest", s.requireAuth(http.HandlerFunc(s.handleDigest)))
 	mux.Handle("POST /review", s.requireAuth(http.HandlerFunc(s.handleReview)))
 	mux.Handle("GET /review/due", s.requireAuth(http.HandlerFunc(s.handleReviewDue)))
-	mux.Handle("GET /graph/{id}", s.requireAuth(http.HandlerFunc(s.handleGraph)))
+	mux.Handle("GET /graph/{id}", s.requireRead(http.HandlerFunc(s.handleGraph)))
 	mux.Handle("GET /entities", s.requireRead(http.HandlerFunc(s.handleListEntities)))
 	mux.Handle("GET /entities/{id}", s.requireRead(http.HandlerFunc(s.handleGetEntity)))
 	mux.Handle("GET /artifacts/{id}/backlinks", s.requireRead(http.HandlerFunc(s.handleBacklinks)))
@@ -1375,7 +1375,10 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	start, err := s.deps.Store.Artifacts.GetLive(ctx, id)
+	ceiling := readCeiling(ctx)
+	// The start artifact must itself be within the ceiling, or it is a 404 (a read
+	// token cannot probe the graph of an above-ceiling artifact).
+	start, err := s.deps.Store.Artifacts.GetLiveWithin(ctx, id, ceiling)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "unknown artifact", http.StatusNotFound)
@@ -1385,12 +1388,14 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The entities are those the (in-ceiling) start artifact mentions, so they carry
+	// no above-ceiling signal; the connected set is ceiling-filtered in the traversal.
 	ents, err := s.deps.Store.Graph.EntitiesForArtifact(ctx, id)
 	if err != nil {
 		s.serverError(w, "graph entities", err)
 		return
 	}
-	connectedIDs, err := s.deps.Store.Graph.ConnectedWithin(ctx, id, hops)
+	connectedIDs, err := s.deps.Store.Graph.ConnectedWithin(ctx, id, hops, ceiling)
 	if err != nil {
 		s.serverError(w, "graph connected", err)
 		return
@@ -1406,9 +1411,9 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		out.Entities = append(out.Entities, entityJSON{Kind: e.Kind, Name: e.Name, Aliases: e.Aliases})
 	}
 	for _, cid := range connectedIDs {
-		a, err := s.deps.Store.Artifacts.GetLive(ctx, cid)
+		a, err := s.deps.Store.Artifacts.GetLiveWithin(ctx, cid, ceiling)
 		if err != nil {
-			continue // tombstoned between traversal and load — drop
+			continue // tombstoned or moved above ceiling between traversal and load — drop
 		}
 		node := graphNodeJSON{ArtifactID: cid, Title: a.Title}
 		if a.CanonicalURL != nil {

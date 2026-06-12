@@ -406,10 +406,11 @@ const neighborChunk = 500
 const maxConnectedNodes = 5000
 
 // NeighborIDs returns the distinct artifact ids adjacent to any id in the frontier,
-// treating edges as undirected (an edge in either direction is a neighbor). Live
-// artifacts only. The frontier is chunked so an arbitrarily wide frontier never
-// exceeds the bind-variable ceiling.
-func (r *GraphRepo) NeighborIDs(ctx context.Context, frontier []string) ([]string, error) {
+// treating edges as undirected (an edge in either direction is a neighbor). Live,
+// in-ceiling artifacts only (pass kb.Restricted for the owner / no filter). The
+// frontier is chunked so an arbitrarily wide frontier never exceeds the
+// bind-variable ceiling.
+func (r *GraphRepo) NeighborIDs(ctx context.Context, frontier []string, ceiling kb.PrivacyTier) ([]string, error) {
 	seen := make(map[string]bool)
 	var out []string
 	for start := 0; start < len(frontier); start += neighborChunk {
@@ -417,7 +418,7 @@ func (r *GraphRepo) NeighborIDs(ctx context.Context, frontier []string) ([]strin
 		if end > len(frontier) {
 			end = len(frontier)
 		}
-		ids, err := r.neighborsOf(ctx, frontier[start:end])
+		ids, err := r.neighborsOf(ctx, frontier[start:end], ceiling)
 		if err != nil {
 			return nil, err
 		}
@@ -432,8 +433,10 @@ func (r *GraphRepo) NeighborIDs(ctx context.Context, frontier []string) ([]strin
 	return out, nil
 }
 
-// neighborsOf runs the adjacency query for one bounded chunk of the frontier.
-func (r *GraphRepo) neighborsOf(ctx context.Context, chunk []string) ([]string, error) {
+// neighborsOf runs the adjacency query for one bounded chunk of the frontier,
+// returning only neighbors within the read ceiling (an above-ceiling artifact is
+// neither returned nor traversed through).
+func (r *GraphRepo) neighborsOf(ctx context.Context, chunk []string, ceiling kb.PrivacyTier) ([]string, error) {
 	if len(chunk) == 0 {
 		return nil, nil
 	}
@@ -445,11 +448,13 @@ func (r *GraphRepo) neighborsOf(ctx context.Context, chunk []string) ([]string, 
 	}
 	in := strings.Join(ph, ", ")
 	args = append(args, args...) // src-side and dst-side IN lists bind the same ids
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
+	args = append(args, tierArgs...) // the tier placeholder follows both IN lists
 	q := `SELECT DISTINCT n FROM (
 	        SELECT dst_id AS n FROM links WHERE src_id IN (` + in + `)
 	        UNION
 	        SELECT src_id AS n FROM links WHERE dst_id IN (` + in + `)
-	      ) JOIN artifacts a ON a.id = n AND a.deleted_at IS NULL
+	      ) JOIN artifacts a ON a.id = n AND a.deleted_at IS NULL AND ` + tier + `
 	      ORDER BY n`
 	rows, err := r.rq.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -463,11 +468,16 @@ func (r *GraphRepo) neighborsOf(ctx context.Context, chunk []string) ([]string, 
 // (undirected), excluding start itself, sorted. A breadth-first expansion bounded
 // by hops; the visited set prevents cycles, and the traversal stops once
 // maxConnectedNodes have been reached so a hub node cannot expand without limit.
-func (r *GraphRepo) ConnectedWithin(ctx context.Context, start string, hops int) ([]string, error) {
+//
+// The traversal respects the read ceiling: an above-ceiling artifact is never
+// returned and is never expanded through, so a lower-trust reader cannot reach a
+// far node that is only connected via a hidden intermediary. Pass kb.Restricted for
+// the owner (no filter).
+func (r *GraphRepo) ConnectedWithin(ctx context.Context, start string, hops int, ceiling kb.PrivacyTier) ([]string, error) {
 	visited := map[string]bool{start: true}
 	frontier := []string{start}
 	for h := 0; h < hops && len(frontier) > 0 && len(visited) < maxConnectedNodes; h++ {
-		nbrs, err := r.NeighborIDs(ctx, frontier)
+		nbrs, err := r.NeighborIDs(ctx, frontier, ceiling)
 		if err != nil {
 			return nil, err
 		}

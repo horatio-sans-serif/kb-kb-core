@@ -70,7 +70,7 @@ func TestGraph_AddLinkDedup(t *testing.T) {
 			t.Fatalf("add link: %v", err)
 		}
 	}
-	nbrs, err := st.Graph.NeighborIDs(ctx, []string{a1})
+	nbrs, err := st.Graph.NeighborIDs(ctx, []string{a1}, kb.Restricted)
 	if err != nil {
 		t.Fatalf("neighbors: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestGraph_ConnectedWithinHops(t *testing.T) {
 	}
 
 	// 1 hop from a: just b.
-	one, err := st.Graph.ConnectedWithin(ctx, a, 1)
+	one, err := st.Graph.ConnectedWithin(ctx, a, 1, kb.Restricted)
 	if err != nil {
 		t.Fatalf("connected 1: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestGraph_ConnectedWithinHops(t *testing.T) {
 	}
 
 	// 2 hops from a: b and c (via the reverse edge c->b).
-	two, err := st.Graph.ConnectedWithin(ctx, a, 2)
+	two, err := st.Graph.ConnectedWithin(ctx, a, 2, kb.Restricted)
 	if err != nil {
 		t.Fatalf("connected 2: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestGraph_TombstonedExcluded(t *testing.T) {
 	if len(arts) != 1 || arts[0] != a {
 		t.Errorf("ArtifactsForEntity should exclude the tombstoned b: %v", arts)
 	}
-	nbrs, _ := st.Graph.NeighborIDs(ctx, []string{a})
+	nbrs, _ := st.Graph.NeighborIDs(ctx, []string{a}, kb.Restricted)
 	if len(nbrs) != 0 {
 		t.Errorf("NeighborIDs should exclude the tombstoned b: %v", nbrs)
 	}
@@ -165,10 +165,10 @@ func TestGraph_ConnectedZeroHopsAndCycle(t *testing.T) {
 	_ = st.Graph.AddLink(ctx, a, b, "references", 1.0)
 	_ = st.Graph.AddLink(ctx, b, a, "references", 1.0)
 
-	if z, _ := st.Graph.ConnectedWithin(ctx, a, 0); len(z) != 0 {
+	if z, _ := st.Graph.ConnectedWithin(ctx, a, 0, kb.Restricted); len(z) != 0 {
 		t.Errorf("0 hops should be empty, got %v", z)
 	}
-	got, err := st.Graph.ConnectedWithin(ctx, a, 5)
+	got, err := st.Graph.ConnectedWithin(ctx, a, 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("connected: %v", err)
 	}

@@ -77,7 +77,7 @@ func TestEntities_ExtractsLinksAndSharesEdge(t *testing.T) {
 	}
 
 	// A shares_entity edge connects a and b (both mention Go).
-	nbrs, _ := st.Graph.NeighborIDs(ctx, []string{a.ID})
+	nbrs, _ := st.Graph.NeighborIDs(ctx, []string{a.ID}, kb.Restricted)
 	if len(nbrs) != 1 || nbrs[0] != b.ID {
 		t.Errorf("expected a shares_entity edge to b, neighbors = %v", nbrs)
 	}
@@ -158,7 +158,7 @@ func TestEntities_HubFanoutCapped(t *testing.T) {
 	if arts, _ := st.Graph.ArtifactsForEntity(ctx, hub); len(arts) != maxSharesEntityFanout+6 {
 		t.Errorf("newcomer should still be linked to the hub entity, got %d members", len(arts))
 	}
-	if nbrs, _ := st.Graph.NeighborIDs(ctx, []string{newcomer.ID}); len(nbrs) != 0 {
+	if nbrs, _ := st.Graph.NeighborIDs(ctx, []string{newcomer.ID}, kb.Restricted); len(nbrs) != 0 {
 		t.Errorf("a hub entity must not create pairwise edges, got %d neighbors", len(nbrs))
 	}
 }
