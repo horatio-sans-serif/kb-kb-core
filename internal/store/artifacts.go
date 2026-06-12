@@ -17,6 +17,13 @@ import (
 // predicate that matches nothing (fail closed), so a misconfigured ceiling can never
 // expose content.
 func tierClause(col string, ceiling kb.PrivacyTier) (string, []any) {
+	if ceiling == kb.Restricted {
+		// The owner sees everything: no tier filter. Simpler and faster than an IN-list
+		// of all four tiers, and robust — should a non-standard privacy_tier ever exist
+		// (the schema CHECK normally prevents it), the owner still sees it rather than
+		// being silently filtered out. Lower ceilings filter to the known tiers below.
+		return "1 = 1", nil
+	}
 	tiers := kb.TiersAtMost(ceiling)
 	if len(tiers) == 0 {
 		return "1 = 0", nil // fail closed
@@ -275,7 +282,10 @@ func (r *ArtifactRepo) GetLiveWithin(ctx context.Context, id string, ceiling kb.
 	if err != nil {
 		return nil, err
 	}
-	if !a.PrivacyTier.AtMost(ceiling) {
+	// The owner (Restricted) sees every live artifact, including one with a corrupt
+	// tier; a lower ceiling hides anything above it (and a corrupt tier, which ranks
+	// above restricted, from everyone but the owner).
+	if ceiling != kb.Restricted && !a.PrivacyTier.AtMost(ceiling) {
 		return nil, fmt.Errorf("get artifact %q: %w", id, ErrNotFound)
 	}
 	return a, nil

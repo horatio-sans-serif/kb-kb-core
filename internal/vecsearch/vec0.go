@@ -20,6 +20,9 @@ import (
 // (fail closed). Kept local so vecsearch does not depend on the store package for a
 // string helper.
 func tierClause(col string, ceiling kb.PrivacyTier) (string, []any) {
+	if ceiling == kb.Restricted {
+		return "1 = 1", nil // owner: no filter (see store.tierClause for the corrupt-tier rationale)
+	}
 	tiers := kb.TiersAtMost(ceiling)
 	if len(tiers) == 0 {
 		return "1 = 0", nil

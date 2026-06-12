@@ -40,6 +40,20 @@ func TestSearchKeyword_TierCeiling(t *testing.T) {
 	}
 }
 
+func TestTierCeiling_InvalidCeilingFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	_ = seedTiered(t, st, "h1", "apple", "public")
+	// An invalid read ceiling must see nothing (not everything).
+	hits, err := st.Artifacts.SearchKeyword(ctx, `"apple"`, 10, kb.PrivacyTier("bogus"))
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("invalid ceiling returned %d hits, want 0 (fail closed)", len(hits))
+	}
+}
+
 func TestGetLiveWithin_Ceiling(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

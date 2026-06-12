@@ -101,17 +101,19 @@ func Load(getenv func(string) string) (*Config, error) {
 	// token (else it would grant full access). Its ceiling defaults to public.
 	cfg.ReadToken = getenv("KB_READ_TOKEN")
 	cfg.ReadTier = orDefault(getenv("KB_READ_TIER"), "public")
+	// The tier is validated unconditionally (it always has a value), so a typo in
+	// KB_READ_TIER fails loudly even if KB_READ_TOKEN was forgotten.
+	switch cfg.ReadTier {
+	case "public", "personal", "sensitive", "restricted":
+	default:
+		return nil, fmt.Errorf("invalid KB_READ_TIER %q (want public|personal|sensitive|restricted)", cfg.ReadTier)
+	}
 	if cfg.ReadToken != "" {
 		if len(cfg.ReadToken) < minTokenLen {
 			return nil, fmt.Errorf("KB_READ_TOKEN must be at least %d characters", minTokenLen)
 		}
 		if cfg.ReadToken == cfg.APIToken {
 			return nil, fmt.Errorf("KB_READ_TOKEN must differ from KB_API_TOKEN (it grants only ceiling-limited read access)")
-		}
-		switch cfg.ReadTier {
-		case "public", "personal", "sensitive", "restricted":
-		default:
-			return nil, fmt.Errorf("invalid KB_READ_TIER %q (want public|personal|sensitive|restricted)", cfg.ReadTier)
 		}
 	}
 

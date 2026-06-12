@@ -979,6 +979,60 @@ func TestReadToken_RejectedOnNonReadRoutes(t *testing.T) {
 	}
 }
 
+func TestReadToken_SearchEndToEndFiltersTiers(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	seed := func(hash, title, tier string) string {
+		a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{
+			Type: "note", Title: title, BodyMarkdown: title, ContentHash: &hash, PrivacyTier: kb.PrivacyTier(tier)})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		return a.ID
+	}
+	pub := seed("h1", "public apple", "public")
+	sens := seed("h2", "secret apple", "sensitive")
+
+	searcher := search.NewSearcher(st, staticLLM{}, "m", false) // keyword mode needs no embedder
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger(), Search: searcher})
+	h := srv.Handler()
+
+	ids := func(token string) (out []string, body string) {
+		rec := doGet(h, "/search?mode=keyword&q=apple", token)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("search status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Results []struct {
+				ArtifactID string `json:"artifact_id"`
+				Title      string `json:"title"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range resp.Results {
+			out = append(out, r.ArtifactID)
+		}
+		return out, rec.Body.String()
+	}
+
+	// The owner sees both artifacts.
+	if got, _ := ids("owner-token-xxxxxxxxxxxx"); len(got) != 2 {
+		t.Errorf("owner search = %v, want both artifacts", got)
+	}
+	// The read token (public ceiling) sees only the public one; the sensitive id and
+	// title never appear in the response body.
+	got, body := ids("read-token-yyyyyyyyyyyyyy")
+	if len(got) != 1 || got[0] != pub {
+		t.Errorf("read-token search = %v, want only the public artifact %s", got, pub)
+	}
+	if strings.Contains(body, sens) || strings.Contains(body, "secret") {
+		t.Errorf("sensitive artifact leaked into the read-token response: %s", body)
+	}
+}
+
 func TestReadToken_NotConfiguredRejects(t *testing.T) {
 	st := newStore(t)
 	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",

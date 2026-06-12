@@ -116,6 +116,37 @@ func TestNew_RejectsSamePool(t *testing.T) {
 	}
 }
 
+func TestVecIndex_SearchCeiling(t *testing.T) {
+	ctx := context.Background()
+	w, r := openWithVec(t)
+	exec := func(q string) {
+		if _, err := w.ExecContext(ctx, q); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	exec(`INSERT INTO artifacts(id, type, privacy_tier, first_seen_at, last_seen_at) VALUES ('01A','note','public','ts','ts')`)
+	exec(`INSERT INTO artifacts(id, type, privacy_tier, first_seen_at, last_seen_at) VALUES ('01B','note','sensitive','ts','ts')`)
+	ix, err := New(w, r, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both vectors are the nearest to the query; the ceiling decides who is returned.
+	if _, err := ix.Reconcile(ctx, &fakeSource{count: 2, rows: map[string][]float32{
+		"01A": {1, 0, 0}, "01B": {1, 0, 0},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	pub, _ := ix.Search(ctx, []float32{1, 0, 0}, 5, kb.Public)
+	if len(pub) != 1 || pub[0].ArtifactID != "01A" {
+		t.Errorf("public ceiling = %+v, want only the public artifact 01A", pub)
+	}
+	owner, _ := ix.Search(ctx, []float32{1, 0, 0}, 5, kb.Restricted)
+	if len(owner) != 2 {
+		t.Errorf("owner ceiling = %d hits, want both", len(owner))
+	}
+}
+
 func TestVecIndex_ReconcileCountGuard(t *testing.T) {
 	ctx := context.Background()
 	w, r := openWithVec(t)

@@ -161,7 +161,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		// The owner sees everything; set the ceiling explicitly so any read handler on
+		// an owner route gets Restricted from context rather than the bare default.
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ceilingKey{}, kb.Restricted)))
 	})
 }
 

@@ -165,6 +165,11 @@ func (e *Engine) Answer(ctx context.Context, query string, k int, ceiling kb.Pri
 
 	selected := e.rerank(ctx, query, candidates, k)
 	if len(selected) == 0 {
+		// Note: this stock answer distinguishes "nothing at/below your ceiling matched"
+		// from "something matched", so a lower-trust reader can probe (query by query)
+		// whether content exists only above its ceiling. No above-ceiling id/title/body
+		// ever leaks — only the existence signal, which is inherent to answering over a
+		// filtered corpus and accepted for a semi-trusted reader (§8.17).
 		return Answer{Query: query, Answer: "I don't have any relevant sources to answer that.", Sources: nil}, nil
 	}
 
