@@ -835,13 +835,40 @@ _Gap 11. New. From: shelf (AutoMerge / Tailscale)._
 
 ### 8.17 Privacy and Access Control
 
-_Gap 12. Partial today (shelf ACL)._
+_Implemented (Phase C). Audit log still deferred._
 
-- Four tiers: public, personal, sensitive, restricted; default per source; per-
-  artifact override.
-- LLM routing rule: sensitive/restricted -> local Ollama only, never cloud.
-- Export/API filter middleware enforces tiers on every response and render.
-- Audit log records access to sensitive artifacts.
+- Four tiers: public, personal, sensitive, restricted; default per source
+  (`KB_DEFAULT_PRIVACY`); per-artifact override. `PrivacyTier.Rank`/`AtMost`
+  give the ordering; a schema CHECK constrains the stored values.
+- LLM routing rule: sensitive/restricted -> local Ollama only, never cloud
+  (the summarize stage skips them unless `KB_ALLOW_REMOTE_OLLAMA`).
+- **Two principals, one read ceiling.** The owner (`KB_API_TOKEN`) has the
+  `restricted` ceiling and sees everything. An optional lower-trust read token
+  (`KB_READ_TOKEN`, ceiling `KB_READ_TIER` ∈ {public, personal, sensitive};
+  `restricted` is rejected) reaches only the read routes and only artifacts at
+  or below its ceiling.
+- **Enforcement is a SQL filter, not post-load redaction.** Each read method
+  takes an explicit `ceiling` parameter expanded by `kb.TierClause` into the
+  query (`tier IN (...)`); owner = `1 = 1` (no filter), invalid = `1 = 0` (fail
+  closed). Above-ceiling rows are never loaded. The `requireRead` middleware
+  authenticates the principal and tags the request context with its ceiling;
+  each handler reads it via `readCeiling(ctx)` and threads it into the store.
+  Adding a new read route means mounting it under `requireRead` and passing the
+  ceiling — the invariant the design rests on.
+- **Existence hiding.** An above-ceiling artifact, entity, topic, or graph node
+  returns 404, identical to a non-existent one — a lower-trust reader cannot
+  distinguish "forbidden" from "absent." Entities/topics carry no tier of their
+  own; their visibility is derived from in-ceiling artifact membership (an
+  entity name is exposed only because an artifact the reader can already read
+  mentions it). `/ask` and `/search` over a ceiling-filtered corpus remain a
+  bounded existence oracle (empty answer) by construction; no id/title/body
+  leaks.
+- Export/render filter enforces tiers on every rendered artifact (pre-Phase-C).
+- _Deferred:_ audit log of access to sensitive artifacts (schema stub exists in
+  migration 0001; no read/export path writes to it yet). The cross-tier
+  relevance-score influence (an engaged sensitive artifact shapes the score of
+  public ones) is a known limitation — acceptable because the score is never
+  serialized out to a read token.
 
 ---
 
