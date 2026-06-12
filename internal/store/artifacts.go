@@ -285,15 +285,17 @@ func (r *ArtifactRepo) ListIncludingDeleted(ctx context.Context) ([]*Artifact, e
 
 // SurfaceQuery selects and ranks artifacts for the surfacing engine (§8.11):
 // live, scored artifacts ordered by relevance (then recency), with optional
-// filters. Tiers is a privacy whitelist (empty = all); Since bounds first_seen_at
-// (new arrivals); Status filters the pipeline state ("" = any); MinScore floors
-// the relevance score; Limit caps the result (<=0 applies a default cap).
+// filters. PrivacyCeiling applies the read-ceiling filter via tierClause — it fails
+// closed (an empty/invalid ceiling surfaces nothing; pass kb.Restricted for all
+// tiers). Since bounds first_seen_at (new arrivals); Status filters the pipeline
+// state ("" = any); MinScore floors the relevance score; Limit caps the result
+// (<=0 applies a default cap).
 type SurfaceQuery struct {
-	Status   string
-	Since    string
-	MinScore float64
-	Tiers    []string
-	Limit    int
+	Status         string
+	Since          string
+	MinScore       float64
+	PrivacyCeiling kb.PrivacyTier
+	Limit          int
 }
 
 const surfaceDefaultLimit = 50
@@ -313,14 +315,9 @@ func (r *ArtifactRepo) Surface(ctx context.Context, q SurfaceQuery) ([]*Artifact
 		where = append(where, "first_seen_at >= ?")
 		args = append(args, q.Since)
 	}
-	if len(q.Tiers) > 0 {
-		ph := make([]string, len(q.Tiers))
-		for i, t := range q.Tiers {
-			ph[i] = "?"
-			args = append(args, t)
-		}
-		where = append(where, "privacy_tier IN ("+strings.Join(ph, ", ")+")")
-	}
+	tier, tierArgs := tierClause("privacy_tier", q.PrivacyCeiling)
+	where = append(where, tier)
+	args = append(args, tierArgs...)
 	limit := q.Limit
 	if limit <= 0 {
 		limit = surfaceDefaultLimit

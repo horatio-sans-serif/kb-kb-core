@@ -48,10 +48,17 @@ func TestSurfacer_CeilingAndReadyOnly(t *testing.T) {
 		t.Errorf("sensitive ceiling = %v, want [High, Sensitive, Low]", titles(got2))
 	}
 
-	// No ceiling = all tiers.
-	got3, _ := s.Surface(ctx, Options{Limit: 10})
-	if len(got3) != 3 {
-		t.Errorf("no ceiling should include all tiers, got %d", len(got3))
+	// The owner ceiling (Restricted) = all tiers.
+	all, _ := s.Surface(ctx, Options{PrivacyCeiling: kb.Restricted, Limit: 10})
+	if len(all) != 3 {
+		t.Errorf("restricted ceiling should include all tiers, got %d", len(all))
+	}
+
+	// No / invalid ceiling now fails CLOSED (surfaces nothing) — it must not fall open
+	// to all tiers. A read path that forgets the ceiling shows too little, never too much.
+	none, _ := s.Surface(ctx, Options{Limit: 10})
+	if len(none) != 0 {
+		t.Errorf("an unset ceiling must fail closed (0 artifacts), got %d", len(none))
 	}
 }
 

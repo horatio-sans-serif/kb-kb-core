@@ -35,7 +35,7 @@ func TestSurface_RanksByRelevanceAndFilters(t *testing.T) {
 	_ = scored(t, st, "hd", "D not ready", kb.Public, 0.95, "ingested", "") // excluded by status
 
 	// Ranked by score desc, ready only: A(0.9), C(0.7), B(0.5).
-	got, err := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", Limit: 10})
+	got, err := st.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", Limit: 10})
 	if err != nil {
 		t.Fatalf("surface: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestSurface_RanksByRelevanceAndFilters(t *testing.T) {
 	}
 
 	// Privacy tier whitelist excludes the sensitive one.
-	pub, err := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", Tiers: []string{"public", "personal"}, Limit: 10})
+	pub, err := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", PrivacyCeiling: kb.Personal, Limit: 10})
 	if err != nil {
 		t.Fatalf("surface tiers: %v", err)
 	}
@@ -53,13 +53,13 @@ func TestSurface_RanksByRelevanceAndFilters(t *testing.T) {
 	}
 
 	// Limit caps the result.
-	top, _ := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", Limit: 1})
+	top, _ := st.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", Limit: 1})
 	if len(top) != 1 || top[0].ID != a {
 		t.Errorf("limit wrong: %v", ids(top))
 	}
 
 	// MinScore floors the result.
-	hi, _ := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", MinScore: 0.8, Limit: 10})
+	hi, _ := st.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", MinScore: 0.8, Limit: 10})
 	if len(hi) != 1 || hi[0].ID != a {
 		t.Errorf("min-score wrong: %v", ids(hi))
 	}
@@ -71,7 +71,7 @@ func TestSurface_SinceFiltersNewArrivals(t *testing.T) {
 	scored(t, st, "old", "Old", kb.Public, 0.9, "ready", "2020-01-01T00:00:00.000000000Z")
 	newID := scored(t, st, "new", "New", kb.Public, 0.5, "ready", "2030-01-01T00:00:00.000000000Z")
 
-	got, err := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", Since: "2025-01-01T00:00:00.000000000Z", Limit: 10})
+	got, err := st.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", Since: "2025-01-01T00:00:00.000000000Z", Limit: 10})
 	if err != nil {
 		t.Fatalf("surface since: %v", err)
 	}
@@ -96,12 +96,12 @@ func TestSurface_ZeroScoreVsNull(t *testing.T) {
 
 	// Default min_score 0 includes the explicitly-0-scored artifact but never the
 	// unscored (NULL) one.
-	got, _ := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", Limit: 10})
+	got, _ := st.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", Limit: 10})
 	if len(got) != 1 || got[0].ID != zero {
 		t.Errorf("min_score 0 should surface the 0-scored artifact only, got %v", ids(got))
 	}
 	// A positive floor excludes the 0-scored one.
-	hi, _ := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", MinScore: 0.0001, Limit: 10})
+	hi, _ := st.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", MinScore: 0.0001, Limit: 10})
 	if len(hi) != 0 {
 		t.Errorf("min_score 0.0001 should exclude a 0-scored artifact, got %v", ids(hi))
 	}
@@ -126,7 +126,7 @@ func TestSurface_DeterministicTiebreak(t *testing.T) {
 			t.Fatalf("patch %s: %v", a.Title, err)
 		}
 	}
-	got, _ := st.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", Limit: 10})
+	got, _ := st.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", Limit: 10})
 	if len(got) != 2 || got[0].ID != newer.ID || got[1].ID != older.ID {
 		t.Errorf("equal score should order newer first_seen first: %v", ids(got))
 	}
@@ -145,7 +145,7 @@ func TestSurface_DeterministicTiebreak(t *testing.T) {
 			t.Fatalf("patch %s: %v", a.Title, err)
 		}
 	}
-	got2, _ := st2.Artifacts.Surface(ctx, SurfaceQuery{Status: "ready", Limit: 10})
+	got2, _ := st2.Artifacts.Surface(ctx, SurfaceQuery{PrivacyCeiling: kb.Restricted, Status: "ready", Limit: 10})
 	if len(got2) != 2 || got2[0].ID != a1.ID || got2[1].ID != a2.ID {
 		t.Errorf("equal score+first_seen should order by id asc: %v", ids(got2))
 	}
