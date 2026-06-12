@@ -1045,6 +1045,24 @@ func TestReadToken_SearchEndToEndFiltersTiers(t *testing.T) {
 	}
 }
 
+func TestReadCeiling_FailsClosedWhenUntagged(t *testing.T) {
+	// A context with no ceiling (a handler reached without requireAuth/requireRead —
+	// a bug) must fail closed to the least-sensitive floor, never open to Restricted.
+	if got := readCeiling(context.Background()); got != kb.Public {
+		t.Errorf("untagged readCeiling = %q, want public (fail closed)", got)
+	}
+	// An invalid tagged value (corrupt) also fails closed, not to its Rank-4 self.
+	ctx := context.WithValue(context.Background(), ceilingKey{}, kb.PrivacyTier("bogus"))
+	if got := readCeiling(ctx); got != kb.Public {
+		t.Errorf("invalid-tagged readCeiling = %q, want public (fail closed)", got)
+	}
+	// A valid tagged value is returned as-is.
+	ctx = context.WithValue(context.Background(), ceilingKey{}, kb.Sensitive)
+	if got := readCeiling(ctx); got != kb.Sensitive {
+		t.Errorf("valid-tagged readCeiling = %q, want sensitive", got)
+	}
+}
+
 func TestReadToken_TopicsFilterTiers(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()

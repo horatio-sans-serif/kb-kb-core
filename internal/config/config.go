@@ -102,11 +102,17 @@ func Load(getenv func(string) string) (*Config, error) {
 	cfg.ReadToken = getenv("KB_READ_TOKEN")
 	cfg.ReadTier = orDefault(getenv("KB_READ_TIER"), "public")
 	// The tier is validated unconditionally (it always has a value), so a typo in
-	// KB_READ_TIER fails loudly even if KB_READ_TOKEN was forgotten.
+	// KB_READ_TIER fails loudly even if KB_READ_TOKEN was forgotten. "restricted" is
+	// rejected on purpose: it is the owner's own ceiling, so accepting it would
+	// collapse the read token to unfiltered owner-equivalent access (tierClause
+	// returns "1 = 1" for Restricted) and silently void the entire read ceiling. The
+	// read token must sit strictly below the owner.
 	switch cfg.ReadTier {
-	case "public", "personal", "sensitive", "restricted":
+	case "public", "personal", "sensitive":
+	case "restricted":
+		return nil, fmt.Errorf("KB_READ_TIER=restricted is not allowed: it is the owner's ceiling and would grant the read token unfiltered access; use public|personal|sensitive")
 	default:
-		return nil, fmt.Errorf("invalid KB_READ_TIER %q (want public|personal|sensitive|restricted)", cfg.ReadTier)
+		return nil, fmt.Errorf("invalid KB_READ_TIER %q (want public|personal|sensitive)", cfg.ReadTier)
 	}
 	if cfg.ReadToken != "" {
 		if len(cfg.ReadToken) < minTokenLen {

@@ -115,6 +115,11 @@ func TestConfig_ReadToken(t *testing.T) {
 	if _, err := Load(envFunc(with("KB_READ_TOKEN", "readonly-token-1234567890", "KB_READ_TIER", "bogus"))); err == nil {
 		t.Error("an invalid read tier should fail")
 	}
+	// "restricted" is the owner's ceiling; accepting it for the read token would void
+	// the read ceiling entirely, so it must be rejected.
+	if _, err := Load(envFunc(with("KB_READ_TOKEN", "readonly-token-1234567890", "KB_READ_TIER", "restricted"))); err == nil {
+		t.Error("KB_READ_TIER=restricted must be rejected (it grants the read token unfiltered access)")
+	}
 }
 
 func TestConfig_EmbedDim(t *testing.T) {

@@ -201,13 +201,21 @@ type ceilingKey struct{}
 
 // readCeiling returns the request's read ceiling — the most sensitive tier the caller
 // may see. The owner's full token grants Restricted (everything); a lower-trust read
-// token a lower ceiling. Absent it defaults to Restricted, so a request that was not
-// tagged with a ceiling (single-owner deployments) sees everything, unchanged.
+// token its configured ceiling. Both requireAuth and requireRead tag the context
+// explicitly, so a tagged value is always present on a real request.
+//
+// The absent case is a programming error (a read handler mounted without one of those
+// middlewares). It fails CLOSED to Public — the least-sensitive floor — rather than
+// open to Restricted: every other tier fail-path in the system denies (tierClause →
+// "1 = 0", TiersAtMost → nil), and a privacy boundary must not silently widen to full
+// access on a future refactor that drops the value. Public is chosen over an invalid
+// tier because an invalid tier ranks ABOVE Restricted (Rank 4) and would make the
+// surface clamp fail open; Public (Rank 0) is consistently the most restrictive.
 func readCeiling(ctx context.Context) kb.PrivacyTier {
 	if c, ok := ctx.Value(ceilingKey{}).(kb.PrivacyTier); ok && c.Valid() {
 		return c
 	}
-	return kb.Restricted
+	return kb.Public
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
