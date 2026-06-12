@@ -102,14 +102,22 @@ func (s *Searcher) Semantic(ctx context.Context, query string, k int, ceiling kb
 		return nil, fmt.Errorf("search: empty query embedding")
 	}
 
-	// Sublinear path: when the vec0 ANN index is present and returns hits, use it. Fall
-	// back to the exact brute-force scan on an index error (e.g. a query-dimension
-	// mismatch) OR an empty result — the index may not have been reconciled yet (the
-	// startup window before the first rebuild), so an empty index must not shadow
-	// matches the brute-force scan would find. A genuinely empty corpus makes both
-	// paths return nothing, so the fallback only costs a wasted scan in that rare case.
+	// Sublinear path: when the vec0 ANN index is present and returns a FULL k hits, use
+	// it. Fall back to the exact brute-force scan on an index error (e.g. a
+	// query-dimension mismatch) OR a short result (fewer than k hits).
+	//
+	// Short results have two causes, and the fallback is correct for both. (1) The index
+	// may not have been reconciled yet (the startup window before the first rebuild), so
+	// an empty/partial index must not shadow matches the brute-force scan would find.
+	// (2) The index applies the read-ceiling and live filters AFTER the k-NN over-fetch
+	// (LIMIT k+liveBuffer), so when many of the nearest neighbors are above the caller's
+	// ceiling or tombstoned, the index can return fewer than k in-ceiling results even
+	// though k exist — the brute-force scan filters BEFORE scoring (ForEachLatestEmbedding
+	// Within streams only in-ceiling rows), so it is exact and complete. A genuinely small
+	// corpus makes both paths return the same <k set, so the fallback only costs a wasted
+	// scan in that case.
 	if s.index != nil {
-		if hits, err := s.index.Search(ctx, qvec, k, ceiling); err == nil && len(hits) > 0 {
+		if hits, err := s.index.Search(ctx, qvec, k, ceiling); err == nil && len(hits) >= k {
 			out := make([]Result, len(hits))
 			for i, h := range hits {
 				out[i] = Result{ArtifactID: h.ArtifactID, Score: h.Score}

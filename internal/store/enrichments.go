@@ -76,9 +76,9 @@ func (r *EnrichmentRepo) LatestByKind(ctx context.Context, artifactID, kind stri
 // scan. The vec0 ANN index (deferred) replaces the full scan for sublinear
 // retrieval at scale.
 //
-// Privacy: this intentionally does not filter by privacy_tier — search serves the
-// single owner behind the bearer token, so all live tiers are searchable. A
-// future lower-trust read path (see KB_LISTEN_ADDR) must add a tier ceiling here.
+// Privacy: this is the owner-ceiling (unfiltered) entry point. The lower-trust read
+// path (§8.17) goes through ForEachLatestEmbeddingWithin with its configured ceiling;
+// this wrapper passes kb.Restricted, which streams every tier.
 func (r *EnrichmentRepo) ForEachLatestEmbedding(ctx context.Context, fn func(artifactID, payload string) error) error {
 	// Unfiltered (owner ceiling): the vec0 index builds over every embedding; the read
 	// ceiling is applied at query time, not at index-build time.
@@ -128,13 +128,15 @@ type EmbeddingRow struct {
 // recently-engaged content shapes what scores as relevant. excludeID keeps the
 // artifact currently being scored out of its own profile (no self-match).
 //
-// Privacy: like ForEachLatestEmbedding this does not filter by privacy_tier — and
-// the rule is sharper here. A sensitive/restricted engaged artifact's embedding
-// influences the stored relevance_score of OTHER (possibly public) artifacts, so
-// a future lower-trust read path (see KB_LISTEN_ADDR) cannot sanitize the leak by
-// filtering output alone; it must filter engaged rows by a tier ceiling, or
-// segregate scores per ceiling. Acceptable now (single owner, relevance_score is
-// never serialized out).
+// Privacy: this does not filter by privacy_tier, and the rule is sharper here than
+// for ForEachLatestEmbedding. A sensitive/restricted engaged artifact's embedding
+// influences the stored relevance_score of OTHER (possibly public) artifacts. The
+// read-ceiling read path (§8.17) does NOT close this channel — it filters reads by
+// tier, but the cross-tier influence is baked into relevance_score at scoring time,
+// upstream of any read filter. This is a known §8.17 limitation, acceptable now
+// because relevance_score is never serialized out to a read token (the read surface
+// exposes ranked artifacts, not the score itself). Closing it would require filtering
+// engaged rows by a tier ceiling, or segregating scores per ceiling.
 func (r *EnrichmentRepo) EngagedEmbeddings(ctx context.Context, excludeID string, limit int) ([]EmbeddingRow, error) {
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT artifact_id, payload FROM (

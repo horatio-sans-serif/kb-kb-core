@@ -54,6 +54,107 @@ func TestTierCeiling_InvalidCeilingFailsClosed(t *testing.T) {
 	}
 }
 
+func TestTierCeiling_InvalidCeiling_AllQueryFamilies(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	bogus := kb.PrivacyTier("bogus")
+
+	// Wire one public artifact (and a second it links to) into every read structure,
+	// then assert each ceiling-aware query family returns nothing for an invalid ceiling
+	// — the "1 = 0" fail-closed path, not "1 = 1" (see all uses of tierClause).
+	a := seedTiered(t, st, "h1", "alpha apple", "public")
+	b := seedTiered(t, st, "h2", "beta", "public")
+	if err := st.Graph.AddLink(ctx, a, b, "references", 1.0); err != nil { // a -> b: b's backlink, a's neighbor
+		t.Fatal(err)
+	}
+	ent, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "concept", Name: "Topic"})
+	if err := st.Graph.LinkArtifactEntity(ctx, a, ent); err != nil {
+		t.Fatal(err)
+	}
+	top := &Topic{Label: "T"}
+	if err := st.Topics.Create(ctx, top); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Topics.Assign(ctx, a, top.ID, 0.9); err != nil {
+		t.Fatal(err)
+	}
+	ca := &Claim{ArtifactID: a, Statement: "P"}
+	cb := &Claim{ArtifactID: b, Statement: "not P"}
+	if err := st.Claims.Create(ctx, ca); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claims.Create(ctx, cb); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Conflicts.Create(ctx, &Conflict{ClaimA: ca.ID, ClaimB: cb.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each family: invalid ceiling returns zero rows and no error (fail closed, not a
+	// query failure). The named sub-test makes a regression point at the exact family.
+	checks := []struct {
+		name string
+		run  func() (int, error)
+	}{
+		{"SearchKeyword", func() (int, error) { h, e := st.Artifacts.SearchKeyword(ctx, `"alpha"`, 10, bogus); return len(h), e }},
+		{"ListEntities", func() (int, error) { x, e := st.Graph.ListEntities(ctx, 10, bogus); return len(x), e }},
+		{"EntityArtifacts", func() (int, error) { x, e := st.Graph.EntityArtifacts(ctx, ent, 10, bogus); return len(x), e }},
+		{"Backlinks", func() (int, error) { x, e := st.Graph.Backlinks(ctx, b, 10, bogus); return len(x), e }},
+		{"ConnectedWithin", func() (int, error) { x, e := st.Graph.ConnectedWithin(ctx, a, 2, bogus); return len(x), e }},
+		{"ListWithCounts", func() (int, error) { x, e := st.Topics.ListWithCounts(ctx, 10, bogus); return len(x), e }},
+		{"Members", func() (int, error) { x, e := st.Topics.Members(ctx, top.ID, 10, bogus); return len(x), e }},
+		{"ListByStatus", func() (int, error) { x, e := st.Conflicts.ListByStatus(ctx, "open", 10, bogus); return len(x), e }},
+	}
+	for _, c := range checks {
+		t.Run(c.name, func(t *testing.T) {
+			n, err := c.run()
+			if err != nil {
+				t.Fatalf("%s with invalid ceiling errored: %v", c.name, err)
+			}
+			if n != 0 {
+				t.Errorf("%s with invalid ceiling returned %d rows, want 0 (fail closed)", c.name, n)
+			}
+		})
+	}
+
+	// Sanity: the owner ceiling sees the wired structures (proves the test wired them).
+	if h, _ := st.Artifacts.SearchKeyword(ctx, `"alpha"`, 10, kb.Restricted); len(h) == 0 {
+		t.Error("owner SearchKeyword found nothing — the fixture is not wired")
+	}
+}
+
+func TestConnectedWithin_CeilingHidesAndDoesNotExpandThrough(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	// pub -> sens -> far. far is reachable from pub within 2 hops ONLY through the
+	// sensitive node, so a public ceiling must not reach it (no expansion through a
+	// hidden node), while the owner reaches both.
+	pub := seedTiered(t, st, "h1", "p", "public")
+	sens := seedTiered(t, st, "h2", "s", "sensitive")
+	far := seedTiered(t, st, "h3", "f", "public")
+	if err := st.Graph.AddLink(ctx, pub, sens, "references", 1.0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Graph.AddLink(ctx, sens, far, "references", 1.0); err != nil {
+		t.Fatal(err)
+	}
+
+	owner, err := st.Graph.ConnectedWithin(ctx, pub, 2, kb.Restricted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owner) != 2 {
+		t.Errorf("owner ConnectedWithin = %v, want both sens and far", owner)
+	}
+	pubSet, err := st.Graph.ConnectedWithin(ctx, pub, 2, kb.Public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pubSet) != 0 {
+		t.Errorf("public ConnectedWithin = %v, want empty (sens hidden, far unreachable through it)", pubSet)
+	}
+}
+
 func TestGetLiveWithin_Ceiling(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

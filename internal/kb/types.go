@@ -4,6 +4,8 @@
 // against it without importing the storage layer (design §7).
 package kb
 
+import "strings"
+
 // PrivacyTier classifies how sensitive an artifact is (design §8.17).
 type PrivacyTier string
 
@@ -85,6 +87,36 @@ func TiersAtMost(ceiling PrivacyTier) []PrivacyTier {
 		}
 	}
 	return out
+}
+
+// TierClause builds a SQL predicate restricting a read to artifacts at or below a
+// privacy ceiling (§8.17), plus its positional bind args. col is the qualified
+// privacy_tier column (e.g. "a.privacy_tier"). It is the single canonical expansion
+// of the ceiling into SQL, shared by the store and the optional vec0 search satellite
+// so the fail-direction is defined exactly once.
+//
+// An owner ceiling (Restricted) admits every tier with no filter — "1 = 1", simpler
+// and faster than an IN-list of all four, and robust: a non-standard privacy_tier
+// (the schema CHECK normally prevents one) stays visible to the owner rather than
+// being silently filtered out. A lower ceiling drops the more sensitive tiers. An
+// invalid ceiling yields "1 = 0" (fail closed), so a misconfigured ceiling can never
+// expose content. It is pure string/arg construction — no database/sql dependency —
+// which is why it lives here beside TiersAtMost rather than in the store.
+func TierClause(col string, ceiling PrivacyTier) (string, []any) {
+	if ceiling == Restricted {
+		return "1 = 1", nil
+	}
+	tiers := TiersAtMost(ceiling)
+	if len(tiers) == 0 {
+		return "1 = 0", nil // fail closed
+	}
+	ph := make([]string, len(tiers))
+	args := make([]any, len(tiers))
+	for i, t := range tiers {
+		ph[i] = "?"
+		args[i] = string(t)
+	}
+	return col + " IN (" + strings.Join(ph, ", ") + ")", args
 }
 
 // SourceKind is how a source delivers content (design §7).

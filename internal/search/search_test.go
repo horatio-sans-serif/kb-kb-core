@@ -279,7 +279,9 @@ func TestSemantic_UsesIndexWhenSet(t *testing.T) {
 	idx := &fakeIndex{hits: []vecsearch.Hit{{ArtifactID: "01A", Score: 0.95}, {ArtifactID: "01B", Score: 0.5}}}
 	s.SetIndex(idx)
 
-	res, err := s.Semantic(context.Background(), "q", 5, kb.Restricted)
+	// k == the number of hits the index returns: a FULL result, so the ANN path is
+	// trusted and passed through (no fallback).
+	res, err := s.Semantic(context.Background(), "q", 2, kb.Restricted)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}
@@ -288,6 +290,31 @@ func TestSemantic_UsesIndexWhenSet(t *testing.T) {
 	}
 	if len(res) != 2 || res[0].ArtifactID != "01A" || res[0].Score != 0.95 {
 		t.Errorf("results = %+v, want the index hits passed through", res)
+	}
+}
+
+func TestSemantic_FallsBackOnShortIndexResult(t *testing.T) {
+	st := storetest.New(t)
+	// The store has a match the brute-force scan finds, but the index returns fewer
+	// than k hits (it filters the read ceiling and tombstones AFTER the k-NN over-fetch,
+	// so a ceiling-restricted reader can get a truncated result even when k matches
+	// exist). A short result must fall back to the exact scan, not be returned as-is.
+	a := seedNoteWithEmbedding(t, st, "h1", "T", "body", []float32{1, 0, 0})
+	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0, 0}}, "m", true)
+	idx := &fakeIndex{hits: []vecsearch.Hit{{ArtifactID: "01X", Score: 0.9}}} // 1 hit, k will be 5
+	s.SetIndex(idx)
+
+	res, err := s.Semantic(context.Background(), "q", 5, kb.Restricted)
+	if err != nil {
+		t.Fatalf("semantic: %v", err)
+	}
+	if idx.calls != 1 {
+		t.Errorf("index Search called %d times, want 1", idx.calls)
+	}
+	// The brute-force scan ran and returned the real store match, not the index's single
+	// (here decoupled) hit.
+	if len(res) != 1 || res[0].ArtifactID != a {
+		t.Errorf("a short index result must fall back to brute force; results = %+v, want %s", res, a)
 	}
 }
 

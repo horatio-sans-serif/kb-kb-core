@@ -10,31 +10,12 @@ import (
 	"kb/internal/kb"
 )
 
-// tierClause builds a SQL predicate restricting a read to artifacts at or below a
-// privacy ceiling (§8.17), plus its bind args. col is the qualified privacy_tier
-// column (e.g. "a.privacy_tier"). An owner ceiling (Restricted) admits all four
-// tiers; a lower ceiling drops the more sensitive ones; an invalid ceiling yields a
-// predicate that matches nothing (fail closed), so a misconfigured ceiling can never
-// expose content.
+// tierClause is the store-local alias for kb.TierClause — the single canonical
+// expansion of a privacy ceiling into a SQL predicate + bind args (§8.17). It lives
+// in kb so the store and the vec0 search satellite share one fail-direction; this
+// thin wrapper keeps the unexported call sites in this package terse.
 func tierClause(col string, ceiling kb.PrivacyTier) (string, []any) {
-	if ceiling == kb.Restricted {
-		// The owner sees everything: no tier filter. Simpler and faster than an IN-list
-		// of all four tiers, and robust — should a non-standard privacy_tier ever exist
-		// (the schema CHECK normally prevents it), the owner still sees it rather than
-		// being silently filtered out. Lower ceilings filter to the known tiers below.
-		return "1 = 1", nil
-	}
-	tiers := kb.TiersAtMost(ceiling)
-	if len(tiers) == 0 {
-		return "1 = 0", nil // fail closed
-	}
-	ph := make([]string, len(tiers))
-	args := make([]any, len(tiers))
-	for i, t := range tiers {
-		ph[i] = "?"
-		args[i] = string(t)
-	}
-	return col + " IN (" + strings.Join(ph, ", ") + ")", args
+	return kb.TierClause(col, ceiling)
 }
 
 // Artifact is defined in internal/kb (aliased in types.go).

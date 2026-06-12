@@ -957,11 +957,20 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	// Clamp to the caller's read ceiling, exactly as handleSurface does. /digest is an
+	// owner-only (requireAuth) route today, so this is a no-op for the owner — but it
+	// keeps the handler correct independent of the middleware it is mounted under, so a
+	// future move to requireRead can never let a read token raise its export ceiling.
+	effective := kb.PrivacyTier(ceiling)
+	if pc := readCeiling(ctx); pc.Rank() < effective.Rank() {
+		effective = pc
+	}
+
 	arts, err := s.deps.Surface.Surface(ctx, surface.Options{
 		Limit:          req.Limit,
 		Since:          since,
 		MinScore:       req.MinScore,
-		PrivacyCeiling: kb.PrivacyTier(ceiling),
+		PrivacyCeiling: effective,
 	})
 	if err != nil {
 		s.serverError(w, "digest surface", err)

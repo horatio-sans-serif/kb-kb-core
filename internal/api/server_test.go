@@ -1117,6 +1117,99 @@ func TestReadCeiling_FailsClosedWhenUntagged(t *testing.T) {
 	}
 }
 
+func TestReadToken_PersonalCeilingMidLattice(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	seed := func(hash, title, tier string) string {
+		a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{
+			Type: "note", Title: title, BodyMarkdown: title, ContentHash: &hash, PrivacyTier: kb.PrivacyTier(tier)})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		return a.ID
+	}
+	pub := seed("h1", "alpha pub", "public")
+	per := seed("h2", "alpha per", "personal")
+	sens := seed("h3", "alpha sens", "sensitive")
+
+	searcher := search.NewSearcher(st, staticLLM{}, "m", false)
+	// A read token whose ceiling is the MIDDLE of the lattice (personal): it must see
+	// public+personal and exclude sensitive — exercises the `<` boundary, not just public-vs-all.
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Personal, Logger: discardLogger(), Search: searcher})
+	h := srv.Handler()
+
+	ids := func(token string) (map[string]bool, string) {
+		rec := doGet(h, "/search?mode=keyword&q=alpha", token)
+		var resp struct {
+			Results []struct {
+				ArtifactID string `json:"artifact_id"`
+			} `json:"results"`
+		}
+		mustJSON(t, rec, &resp)
+		set := map[string]bool{}
+		for _, r := range resp.Results {
+			set[r.ArtifactID] = true
+		}
+		return set, rec.Body.String()
+	}
+
+	if got, _ := ids("owner-token-xxxxxxxxxxxx"); len(got) != 3 {
+		t.Errorf("owner search = %v, want all three tiers", got)
+	}
+	got, body := ids("read-token-yyyyyyyyyyyyyy")
+	if !got[pub] || !got[per] || got[sens] {
+		t.Errorf("personal-ceiling search = %v, want public+personal, NOT sensitive", got)
+	}
+	if strings.Contains(body, sens) || strings.Contains(body, "sens") {
+		t.Errorf("sensitive artifact leaked at personal ceiling: %s", body)
+	}
+}
+
+func TestReadToken_Hidden404MatchesMissing(t *testing.T) {
+	// The existence-oracle guarantee: a hidden (above-ceiling) entity/topic returns the
+	// EXACT same 404 body as a genuinely non-existent one, so a read token cannot
+	// distinguish "exists but hidden" from "does not exist".
+	st := newStore(t)
+	ctx := context.Background()
+	hash := "h1"
+	sens, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{
+		Type: "note", Title: "secret", BodyMarkdown: "secret", ContentHash: &hash, PrivacyTier: kb.Sensitive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entID, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "concept", Name: "Hidden"})
+	_ = st.Graph.LinkArtifactEntity(ctx, sens.ID, entID)
+	top := &store.Topic{Label: "Hidden"}
+	if err := st.Topics.Create(ctx, top); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Topics.Assign(ctx, sens.ID, top.ID, 0.9)
+
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger()})
+	h := srv.Handler()
+	const rt = "read-token-yyyyyyyyyyyyyy"
+
+	hiddenEnt := doGet(h, "/entities/"+entID, rt)
+	missingEnt := doGet(h, "/entities/01HZZZZZZZZZZZZZZZZZZZZZZZZ", rt)
+	if hiddenEnt.Code != http.StatusNotFound || missingEnt.Code != http.StatusNotFound {
+		t.Fatalf("entity codes: hidden=%d missing=%d, want both 404", hiddenEnt.Code, missingEnt.Code)
+	}
+	if hiddenEnt.Body.String() != missingEnt.Body.String() {
+		t.Errorf("hidden entity 404 body %q != missing 404 body %q (existence oracle)", hiddenEnt.Body.String(), missingEnt.Body.String())
+	}
+
+	hiddenTop := doGet(h, "/topics/"+top.ID, rt)
+	missingTop := doGet(h, "/topics/01HZZZZZZZZZZZZZZZZZZZZZZZZ", rt)
+	if hiddenTop.Code != http.StatusNotFound || missingTop.Code != http.StatusNotFound {
+		t.Fatalf("topic codes: hidden=%d missing=%d, want both 404", hiddenTop.Code, missingTop.Code)
+	}
+	if hiddenTop.Body.String() != missingTop.Body.String() {
+		t.Errorf("hidden topic 404 body %q != missing 404 body %q (existence oracle)", hiddenTop.Body.String(), missingTop.Body.String())
+	}
+}
+
 func TestReadToken_TopicsFilterTiers(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -1450,10 +1543,39 @@ func TestSearch_ModeRouting(t *testing.T) {
 type fakeAsker struct {
 	ans rag.Answer
 	err error
+	// gotCeiling, when non-nil, captures the ceiling the handler passed — the only link
+	// between requireRead's context tag and the retrieval layer for the /ask path.
+	gotCeiling *kb.PrivacyTier
 }
 
-func (f fakeAsker) Answer(_ context.Context, _ string, _ int, _ kb.PrivacyTier) (rag.Answer, error) {
+func (f fakeAsker) Answer(_ context.Context, _ string, _ int, ceiling kb.PrivacyTier) (rag.Answer, error) {
+	if f.gotCeiling != nil {
+		*f.gotCeiling = ceiling
+	}
 	return f.ans, f.err
+}
+
+func TestReadToken_AskAppliesConfiguredCeiling(t *testing.T) {
+	st := newStore(t)
+	var got kb.PrivacyTier
+	asker := fakeAsker{ans: rag.Answer{Answer: "x"}, gotCeiling: &got}
+	h := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger(), Ask: asker}).Handler()
+
+	// The owner gets the full (Restricted) ceiling.
+	if rec := doGet(h, "/ask?q=hi", "owner-token-xxxxxxxxxxxx"); rec.Code != http.StatusOK {
+		t.Fatalf("owner /ask = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got != kb.Restricted {
+		t.Errorf("owner ceiling passed to asker = %q, want restricted", got)
+	}
+	// The read token gets exactly its configured ceiling, not Restricted.
+	if rec := doGet(h, "/ask?q=hi", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusOK {
+		t.Fatalf("read-token /ask = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got != kb.Public {
+		t.Errorf("read-token ceiling passed to asker = %q, want public", got)
+	}
 }
 
 func TestAsk_ReturnsAnswer(t *testing.T) {

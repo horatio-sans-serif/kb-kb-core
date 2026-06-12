@@ -306,7 +306,11 @@ func (r *ConflictRepo) ListByStatus(ctx context.Context, status string, limit in
 	// above-ceiling artifact to a lower-trust reader.
 	tierA, argsA := tierClause("aa.privacy_tier", ceiling)
 	tierB, argsB := tierClause("ab.privacy_tier", ceiling)
-	args := append(append(append(append([]any{}, argsA...), argsB...), status), limit)
+	// Placeholder order follows the SQL text: aa's tier args, then ab's, then status, limit.
+	args := make([]any, 0, len(argsA)+len(argsB)+2)
+	args = append(args, argsA...)
+	args = append(args, argsB...)
+	args = append(args, status, limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT cf.id, cf.claim_a, cf.claim_b, cf.status, cf.rationale, cf.created_at FROM conflicts cf
 		 JOIN claims ca ON ca.id = cf.claim_a

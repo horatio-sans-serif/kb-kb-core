@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
@@ -15,25 +14,12 @@ import (
 	"kb/internal/kb"
 )
 
-// tierClause builds a "privacy_tier IN (...)" read-ceiling filter and its args from
-// the pure kb.TiersAtMost primitive (§8.17). An invalid ceiling matches nothing
-// (fail closed). Kept local so vecsearch does not depend on the store package for a
-// string helper.
+// tierClause is the vecsearch-local alias for kb.TierClause — the single canonical
+// read-ceiling SQL predicate (§8.17), shared with the store. It lives in kb (which
+// vecsearch already imports and which carries no database/sql dependency), so this
+// satellite needs neither a copy nor an edge to the store package.
 func tierClause(col string, ceiling kb.PrivacyTier) (string, []any) {
-	if ceiling == kb.Restricted {
-		return "1 = 1", nil // owner: no filter (see store.tierClause for the corrupt-tier rationale)
-	}
-	tiers := kb.TiersAtMost(ceiling)
-	if len(tiers) == 0 {
-		return "1 = 0", nil
-	}
-	ph := make([]string, len(tiers))
-	args := make([]any, len(tiers))
-	for i, t := range tiers {
-		ph[i] = "?"
-		args[i] = string(t)
-	}
-	return col + " IN (" + strings.Join(ph, ", ") + ")", args
+	return kb.TierClause(col, ceiling)
 }
 
 // liveBuffer is how many extra neighbors the KNN fetches beyond k, so tombstoned
