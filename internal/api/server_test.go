@@ -914,26 +914,79 @@ func doGet(h http.Handler, path, token string) *httptest.ResponseRecorder {
 }
 
 type fakeSearcher struct {
-	results []search.Result
-	err     error
-	gotQ    string
-	gotK    int
-	gotMode string
+	results    []search.Result
+	err        error
+	gotQ       string
+	gotK       int
+	gotMode    string
+	gotCeiling kb.PrivacyTier
 }
 
-func (f *fakeSearcher) Semantic(_ context.Context, query string, k int, _ kb.PrivacyTier) ([]search.Result, error) {
-	f.gotQ, f.gotK, f.gotMode = query, k, "semantic"
+func (f *fakeSearcher) Semantic(_ context.Context, query string, k int, ceiling kb.PrivacyTier) ([]search.Result, error) {
+	f.gotQ, f.gotK, f.gotMode, f.gotCeiling = query, k, "semantic", ceiling
 	return f.results, f.err
 }
 
-func (f *fakeSearcher) Keyword(_ context.Context, query string, k int, _ kb.PrivacyTier) ([]search.Result, error) {
-	f.gotQ, f.gotK, f.gotMode = query, k, "keyword"
+func (f *fakeSearcher) Keyword(_ context.Context, query string, k int, ceiling kb.PrivacyTier) ([]search.Result, error) {
+	f.gotQ, f.gotK, f.gotMode, f.gotCeiling = query, k, "keyword", ceiling
 	return f.results, f.err
 }
 
-func (f *fakeSearcher) Hybrid(_ context.Context, query string, k int, _ kb.PrivacyTier) ([]search.Result, error) {
-	f.gotQ, f.gotK, f.gotMode = query, k, "hybrid"
+func (f *fakeSearcher) Hybrid(_ context.Context, query string, k int, ceiling kb.PrivacyTier) ([]search.Result, error) {
+	f.gotQ, f.gotK, f.gotMode, f.gotCeiling = query, k, "hybrid", ceiling
 	return f.results, f.err
+}
+
+func TestReadToken_SearchAppliesConfiguredCeiling(t *testing.T) {
+	st := newStore(t)
+	fs := &fakeSearcher{}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger(), Search: fs})
+	h := srv.Handler()
+
+	// The owner token grants the Restricted ceiling (sees everything).
+	if rec := doGet(h, "/search?q=x", "owner-token-xxxxxxxxxxxx"); rec.Code != http.StatusOK {
+		t.Fatalf("owner search status = %d", rec.Code)
+	}
+	if fs.gotCeiling != kb.Restricted {
+		t.Errorf("owner ceiling = %q, want restricted", fs.gotCeiling)
+	}
+	// The read token grants only its configured ceiling.
+	if rec := doGet(h, "/search?q=x", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusOK {
+		t.Fatalf("read-token search status = %d", rec.Code)
+	}
+	if fs.gotCeiling != kb.Public {
+		t.Errorf("read-token ceiling = %q, want public", fs.gotCeiling)
+	}
+}
+
+func TestReadToken_RejectedOnNonReadRoutes(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger(), Search: &fakeSearcher{}})
+	h := srv.Handler()
+
+	// A write route and a management route must reject the read token (owner-only).
+	if rec := doIngest(h, `{"source_id":"x","url":"https://e.com"}`, "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("read token on POST /ingest = %d, want 401", rec.Code)
+	}
+	if rec := doGet(h, "/sources", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("read token on GET /sources = %d, want 401", rec.Code)
+	}
+	// But it IS accepted on a read route.
+	if rec := doGet(h, "/search?q=x", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusOK {
+		t.Errorf("read token on GET /search = %d, want 200", rec.Code)
+	}
+}
+
+func TestReadToken_NotConfiguredRejects(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		Logger: discardLogger(), Search: &fakeSearcher{}}) // no ReadToken
+	h := srv.Handler()
+	if rec := doGet(h, "/search?q=x", "some-other-token-zzzzzzzz"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("unknown token with no read token configured = %d, want 401", rec.Code)
+	}
 }
 
 func TestSearch_ReturnsRankedResultsWithMetadata(t *testing.T) {

@@ -78,7 +78,9 @@ type ReviewService interface {
 type Deps struct {
 	Store          *store.Store
 	Bus            *events.Bus
-	Token          string
+	Token          string         // owner token: full read/write, Restricted ceiling
+	ReadToken      string         // optional lower-trust read-only token; empty = single-owner
+	ReadCeiling    kb.PrivacyTier // the read token's privacy ceiling (§8.17)
 	DefaultPrivacy string
 	Build          BuildInfo
 	Logger         *slog.Logger
@@ -117,8 +119,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /events", s.requireAuth(SSEHandler(s.deps.Bus)))
 	mux.Handle("POST /ingest", s.requireAuth(http.HandlerFunc(s.handleIngest)))
 	mux.Handle("POST /engage", s.requireAuth(http.HandlerFunc(s.handleEngage)))
-	mux.Handle("GET /search", s.requireAuth(http.HandlerFunc(s.handleSearch)))
-	mux.Handle("GET /ask", s.requireAuth(http.HandlerFunc(s.handleAsk)))
+	// Read endpoints accept the owner token (Restricted ceiling) OR the lower-trust
+	// read token (its configured ceiling). They are the only routes a read token may
+	// reach, and they enforce the ceiling (C1); every other route is owner-only.
+	mux.Handle("GET /search", s.requireRead(http.HandlerFunc(s.handleSearch)))
+	mux.Handle("GET /ask", s.requireRead(http.HandlerFunc(s.handleAsk)))
 	mux.Handle("POST /sources", s.requireAuth(http.HandlerFunc(s.handleCreateSource)))
 	mux.Handle("GET /sources", s.requireAuth(http.HandlerFunc(s.handleListSources)))
 	mux.Handle("PATCH /sources/{id}", s.requireAuth(http.HandlerFunc(s.handleUpdateSource)))
@@ -160,7 +165,35 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 	})
 }
 
-// ceilingKey is the context key under which requireAuth records the authenticated
+// requireRead authenticates a read request as either the owner (full token, Restricted
+// ceiling) or the lower-trust read token (its configured ceiling), and records the
+// resulting ceiling in the request context (§8.17). The owner token is checked first;
+// the read token only when configured. Used on the ceiling-enforcing read routes;
+// write and management routes use requireAuth (owner-only).
+func (s *Server) requireRead(next http.Handler) http.Handler {
+	const prefix = "Bearer "
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		if !strings.HasPrefix(h, prefix) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		token := []byte(h[len(prefix):])
+		var ceiling kb.PrivacyTier
+		switch {
+		case s.deps.Token != "" && subtle.ConstantTimeCompare(token, []byte(s.deps.Token)) == 1:
+			ceiling = kb.Restricted
+		case s.deps.ReadToken != "" && subtle.ConstantTimeCompare(token, []byte(s.deps.ReadToken)) == 1:
+			ceiling = s.deps.ReadCeiling
+		default:
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ceilingKey{}, ceiling)))
+	})
+}
+
+// ceilingKey is the context key under which requireRead records the authenticated
 // principal's privacy read ceiling (§8.17).
 type ceilingKey struct{}
 

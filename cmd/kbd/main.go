@@ -28,6 +28,7 @@ import (
 	"kb/internal/fetch"
 	"kb/internal/ingest"
 	"kb/internal/jobs"
+	"kb/internal/kb"
 	"kb/internal/lifecycle"
 	"kb/internal/llm"
 	"kb/internal/pipeline"
@@ -519,6 +520,8 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 		Store:          st,
 		Bus:            bus,
 		Token:          cfg.APIToken,
+		ReadToken:      cfg.ReadToken,
+		ReadCeiling:    kb.PrivacyTier(cfg.ReadTier),
 		DefaultPrivacy: cfg.DefaultPrivacy,
 		Build:          api.BuildInfo{Version: Version},
 		Logger:         logger,

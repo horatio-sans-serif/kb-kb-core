@@ -28,6 +28,8 @@ type Config struct {
 	SyncPeers       []string // KB_SYNC_PEERS (semicolon-separated peer base URLs, e.g. http://host:8087)
 	PurgeRetention  int      // KB_PURGE_RETENTION_DAYS (days a purged artifact is kept before physical compaction; 0 = never; default 90)
 	EmbedDim        int      // KB_EMBED_DIM (embedding dimension for the vec0 ANN index; must match the embed model; default 768)
+	ReadToken       string   // KB_READ_TOKEN (optional lower-trust read-only token; empty = single-owner)
+	ReadTier        string   // KB_READ_TIER (the privacy ceiling for the read token; default public)
 }
 
 // Load reads configuration via getenv (pass os.Getenv in production). It returns
@@ -92,6 +94,25 @@ func Load(getenv func(string) string) (*Config, error) {
 	case "public", "personal", "sensitive", "restricted":
 	default:
 		return nil, fmt.Errorf("invalid KB_DEFAULT_PRIVACY %q (want public|personal|sensitive|restricted)", cfg.DefaultPrivacy)
+	}
+
+	// Optional lower-trust read-only token (§8.17). When set it is a network
+	// credential, so it must meet the same length floor and differ from the owner
+	// token (else it would grant full access). Its ceiling defaults to public.
+	cfg.ReadToken = getenv("KB_READ_TOKEN")
+	cfg.ReadTier = orDefault(getenv("KB_READ_TIER"), "public")
+	if cfg.ReadToken != "" {
+		if len(cfg.ReadToken) < minTokenLen {
+			return nil, fmt.Errorf("KB_READ_TOKEN must be at least %d characters", minTokenLen)
+		}
+		if cfg.ReadToken == cfg.APIToken {
+			return nil, fmt.Errorf("KB_READ_TOKEN must differ from KB_API_TOKEN (it grants only ceiling-limited read access)")
+		}
+		switch cfg.ReadTier {
+		case "public", "personal", "sensitive", "restricted":
+		default:
+			return nil, fmt.Errorf("invalid KB_READ_TIER %q (want public|personal|sensitive|restricted)", cfg.ReadTier)
+		}
 	}
 
 	// The local-LLM privacy guarantee (Principle 7 / §8.17) rests on Ollama being

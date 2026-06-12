@@ -80,6 +80,43 @@ func TestConfig_SyncDefaultsOff(t *testing.T) {
 	}
 }
 
+func TestConfig_ReadToken(t *testing.T) {
+	const owner = "0123456789abcdef0123456789abcdef"
+	base := map[string]string{"KB_DB": "/tmp/kb.db", "KB_API_TOKEN": owner}
+	with := func(kv ...string) map[string]string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	// No read token → single-owner, defaults.
+	if cfg, err := Load(envFunc(base)); err != nil || cfg.ReadToken != "" {
+		t.Errorf("no read token: cfg=%+v err=%v, want empty ReadToken", cfg, err)
+	}
+	// Configured read token + tier.
+	if cfg, err := Load(envFunc(with("KB_READ_TOKEN", "readonly-token-1234567890", "KB_READ_TIER", "personal"))); err != nil || cfg.ReadToken == "" || cfg.ReadTier != "personal" {
+		t.Errorf("read token: cfg=%+v err=%v, want token + personal tier", cfg, err)
+	}
+	// Default tier is public.
+	if cfg, err := Load(envFunc(with("KB_READ_TOKEN", "readonly-token-1234567890"))); err != nil || cfg.ReadTier != "public" {
+		t.Errorf("default read tier = %q (err %v), want public", cfg.ReadTier, err)
+	}
+	// Rejections: too short, equal to owner, invalid tier.
+	if _, err := Load(envFunc(with("KB_READ_TOKEN", "short"))); err == nil {
+		t.Error("a too-short read token should fail")
+	}
+	if _, err := Load(envFunc(with("KB_READ_TOKEN", owner))); err == nil {
+		t.Error("a read token equal to the owner token should fail")
+	}
+	if _, err := Load(envFunc(with("KB_READ_TOKEN", "readonly-token-1234567890", "KB_READ_TIER", "bogus"))); err == nil {
+		t.Error("an invalid read tier should fail")
+	}
+}
+
 func TestConfig_EmbedDim(t *testing.T) {
 	base := map[string]string{"KB_DB": "/tmp/kb.db", "KB_API_TOKEN": "0123456789abcdef0123456789abcdef"}
 	with := func(v string) map[string]string {
