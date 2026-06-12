@@ -130,7 +130,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /sources/{id}", s.requireAuth(http.HandlerFunc(s.handleDeleteSource)))
 	mux.Handle("POST /render", s.requireAuth(http.HandlerFunc(s.handleRender)))
 	mux.Handle("GET /renders", s.requireAuth(http.HandlerFunc(s.handleListRenders)))
-	mux.Handle("GET /surface", s.requireAuth(http.HandlerFunc(s.handleSurface)))
+	mux.Handle("GET /surface", s.requireRead(http.HandlerFunc(s.handleSurface)))
 	mux.Handle("POST /digest", s.requireAuth(http.HandlerFunc(s.handleDigest)))
 	mux.Handle("POST /review", s.requireAuth(http.HandlerFunc(s.handleReview)))
 	mux.Handle("GET /review/due", s.requireAuth(http.HandlerFunc(s.handleReviewDue)))
@@ -848,11 +848,19 @@ func (s *Server) handleSurface(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clamp the requested export ceiling down to the caller's read ceiling (§8.17): a
+	// read token can never surface content above its tier, whatever privacy_ceiling it
+	// asks for. The owner's Restricted ceiling never lowers it.
+	effective := kb.PrivacyTier(ceiling)
+	if pc := readCeiling(r.Context()); pc.Rank() < effective.Rank() {
+		effective = pc
+	}
+
 	arts, err := s.deps.Surface.Surface(r.Context(), surface.Options{
 		Limit:          limit,
 		Since:          since,
 		MinScore:       minScore,
-		PrivacyCeiling: kb.PrivacyTier(ceiling),
+		PrivacyCeiling: effective,
 	})
 	if err != nil {
 		s.serverError(w, "surface", err)

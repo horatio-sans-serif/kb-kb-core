@@ -25,6 +25,7 @@ import (
 	"kb/internal/search"
 	"kb/internal/store"
 	"kb/internal/storetest"
+	"kb/internal/surface"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -1030,6 +1031,63 @@ func TestReadToken_SearchEndToEndFiltersTiers(t *testing.T) {
 	}
 	if strings.Contains(body, sens) || strings.Contains(body, "secret") {
 		t.Errorf("sensitive artifact leaked into the read-token response: %s", body)
+	}
+}
+
+func TestReadToken_SurfaceClampsToCeiling(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	seedSurface := func(hash, title, tier string) string {
+		a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{
+			Type: "note", Title: title, ContentHash: &hash, PrivacyTier: kb.PrivacyTier(tier)})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		score, rdy := 0.9, kb.StatusReady
+		if err := st.Artifacts.Patch(ctx, a.ID, store.ArtifactPatch{Status: &rdy, RelevanceScore: &score}); err != nil {
+			t.Fatalf("score: %v", err)
+		}
+		return a.ID
+	}
+	pub := seedSurface("h1", "public note", "public")
+	sens := seedSurface("h2", "secret note", "sensitive")
+
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger(), Surface: surface.New(st)})
+	h := srv.Handler()
+
+	tiers := func(token string) (out []string, body string) {
+		// Request the highest ceiling; a read token must be clamped to its own.
+		rec := doGet(h, "/surface?privacy_ceiling=restricted", token)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("surface status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Surface []struct {
+				ArtifactID  string `json:"artifact_id"`
+				PrivacyTier string `json:"privacy_tier"`
+			} `json:"surface"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range resp.Surface {
+			out = append(out, s.ArtifactID)
+		}
+		return out, rec.Body.String()
+	}
+
+	// The owner, requesting restricted, sees both.
+	if got, _ := tiers("owner-token-xxxxxxxxxxxx"); len(got) != 2 {
+		t.Errorf("owner surface = %v, want both", got)
+	}
+	// The read token is clamped to public — only the public artifact, no sensitive leak.
+	got, body := tiers("read-token-yyyyyyyyyyyyyy")
+	if len(got) != 1 || got[0] != pub {
+		t.Errorf("read-token surface = %v, want only the public artifact %s", got, pub)
+	}
+	if strings.Contains(body, sens) || strings.Contains(body, "secret") {
+		t.Errorf("sensitive artifact leaked into the read-token surface: %s", body)
 	}
 }
 
