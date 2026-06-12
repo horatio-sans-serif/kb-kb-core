@@ -85,15 +85,17 @@ type TopicWithCount struct {
 
 // ListWithCounts returns topics that have at least one live member, largest first,
 // each with its live member count.
-func (r *TopicRepo) ListWithCounts(ctx context.Context, limit int) ([]TopicWithCount, error) {
+func (r *TopicRepo) ListWithCounts(ctx context.Context, limit int, ceiling kb.PrivacyTier) ([]TopicWithCount, error) {
 	if limit <= 0 {
 		limit = surfaceDefaultLimit
 	}
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
+	args := append(append([]any{}, tierArgs...), limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT t.id, t.label, COUNT(*) AS n FROM topics t
 		 JOIN artifact_topics at ON at.topic_id = t.id
-		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL
-		 GROUP BY t.id, t.label ORDER BY n DESC, t.id LIMIT ?`, limit)
+		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL AND `+tier+`
+		 GROUP BY t.id, t.label ORDER BY n DESC, t.id LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list topics with counts: %w", err)
 	}
@@ -139,14 +141,16 @@ type TopicMember struct {
 
 // Members returns up to limit of a topic's live member artifacts, highest
 // membership score first, with their title/url.
-func (r *TopicRepo) Members(ctx context.Context, topicID string, limit int) ([]TopicMember, error) {
+func (r *TopicRepo) Members(ctx context.Context, topicID string, limit int, ceiling kb.PrivacyTier) ([]TopicMember, error) {
 	if limit <= 0 {
 		limit = surfaceDefaultLimit
 	}
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
+	args := append(append([]any{}, tierArgs...), topicID, limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT at.artifact_id, a.title, a.canonical_url, at.score FROM artifact_topics at
-		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL
-		 WHERE at.topic_id = ? ORDER BY at.score DESC, at.artifact_id LIMIT ?`, topicID, limit)
+		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL AND `+tier+`
+		 WHERE at.topic_id = ? ORDER BY at.score DESC, at.artifact_id LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("members of topic %q: %w", topicID, err)
 	}

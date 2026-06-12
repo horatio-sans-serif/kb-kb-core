@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"kb/internal/kb"
 )
 
 // Claim and Conflict are defined in internal/kb (aliased in types.go).
@@ -295,18 +297,24 @@ func (r *ConflictRepo) DedupDuplicates(ctx context.Context) (int, error) {
 // ListByStatus returns conflicts in the given status (open|resolved|dismissed),
 // newest first. Conflicts whose either claim belongs to a tombstoned artifact are
 // excluded — a soft-deleted artifact's contradictions are no longer actionable.
-func (r *ConflictRepo) ListByStatus(ctx context.Context, status string, limit int) ([]*Conflict, error) {
+func (r *ConflictRepo) ListByStatus(ctx context.Context, status string, limit int, ceiling kb.PrivacyTier) ([]*Conflict, error) {
 	if limit <= 0 {
 		limit = surfaceDefaultLimit
 	}
+	// A conflict is visible only when BOTH contradicting claims sit on in-ceiling
+	// artifacts; otherwise it would reveal the existence (and gist) of an
+	// above-ceiling artifact to a lower-trust reader.
+	tierA, argsA := tierClause("aa.privacy_tier", ceiling)
+	tierB, argsB := tierClause("ab.privacy_tier", ceiling)
+	args := append(append(append(append([]any{}, argsA...), argsB...), status), limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT cf.id, cf.claim_a, cf.claim_b, cf.status, cf.rationale, cf.created_at FROM conflicts cf
 		 JOIN claims ca ON ca.id = cf.claim_a
-		 JOIN artifacts aa ON aa.id = ca.artifact_id AND aa.deleted_at IS NULL
+		 JOIN artifacts aa ON aa.id = ca.artifact_id AND aa.deleted_at IS NULL AND `+tierA+`
 		 JOIN claims cb ON cb.id = cf.claim_b
-		 JOIN artifacts ab ON ab.id = cb.artifact_id AND ab.deleted_at IS NULL
+		 JOIN artifacts ab ON ab.id = cb.artifact_id AND ab.deleted_at IS NULL AND `+tierB+`
 		 WHERE cf.status = ? ORDER BY cf.created_at DESC, cf.id DESC LIMIT ?`,
-		status, limit)
+		args...)
 	if err != nil {
 		return nil, fmt.Errorf("list %s conflicts: %w", status, err)
 	}

@@ -34,7 +34,7 @@ func seedConflict(t *testing.T, st *store.Store) (conflictID, claimAID string) {
 	if err := st.Conflicts.Create(ctx, cf); err != nil {
 		t.Fatalf("conflict: %v", err)
 	}
-	open, _ := st.Conflicts.ListByStatus(ctx, "open", 10)
+	open, _ := st.Conflicts.ListByStatus(ctx, "open", 10, kb.Restricted)
 	return open[0].ID, ca.ID
 }
 
@@ -77,10 +77,10 @@ func TestConflicts_Resolve(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	if open, _ := st.Conflicts.ListByStatus(context.Background(), "open", 10); len(open) != 0 {
+	if open, _ := st.Conflicts.ListByStatus(context.Background(), "open", 10, kb.Restricted); len(open) != 0 {
 		t.Errorf("resolved conflict should not be open, got %d", len(open))
 	}
-	resolved, _ := st.Conflicts.ListByStatus(context.Background(), "resolved", 10)
+	resolved, _ := st.Conflicts.ListByStatus(context.Background(), "resolved", 10, kb.Restricted)
 	if len(resolved) != 1 || resolved[0].Rationale != "A is correct" {
 		t.Errorf("resolved = %+v", resolved)
 	}

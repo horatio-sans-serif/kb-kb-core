@@ -128,7 +128,7 @@ const maxTopicFanout = 50
 // hub (more than maxTopicFanout members). Members are read before the caller
 // assigns artifactID, so it never self-edges.
 func (c *Clusterer) linkSharesTopic(ctx context.Context, tx *store.Store, artifactID, topicID string) error {
-	members, err := tx.Topics.Members(ctx, topicID, maxTopicFanout+1)
+	members, err := tx.Topics.Members(ctx, topicID, maxTopicFanout+1, kb.Restricted)
 	if err != nil {
 		return err
 	}

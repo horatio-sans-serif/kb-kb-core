@@ -1045,6 +1045,123 @@ func TestReadToken_SearchEndToEndFiltersTiers(t *testing.T) {
 	}
 }
 
+func TestReadToken_TopicsFilterTiers(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	pub := seedReady(t, st, "h1", "public note", kb.Public, 0.5)
+	sens := seedReady(t, st, "h2", "secret note", kb.Sensitive, 0.5)
+
+	// shared topic: a public and a sensitive member. secret topic: sensitive only.
+	shared := &kb.Topic{Label: "Shared"}
+	secret := &kb.Topic{Label: "SecretTopic"}
+	if err := st.Topics.Create(ctx, shared); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Topics.Create(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Topics.Assign(ctx, pub, shared.ID, 0.9)
+	_ = st.Topics.Assign(ctx, sens, shared.ID, 0.9)
+	_ = st.Topics.Assign(ctx, sens, secret.ID, 0.9)
+
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger()})
+	h := srv.Handler()
+
+	// /topics: owner sees both; read token sees only Shared, with a member count of 1.
+	var ownerT struct {
+		Topics []struct {
+			Label       string `json:"label"`
+			MemberCount int    `json:"member_count"`
+		} `json:"topics"`
+	}
+	mustJSON(t, doGet(h, "/topics", "owner-token-xxxxxxxxxxxx"), &ownerT)
+	if len(ownerT.Topics) != 2 {
+		t.Errorf("owner /topics = %+v, want both", ownerT.Topics)
+	}
+	rec := doGet(h, "/topics", "read-token-yyyyyyyyyyyyyy")
+	if strings.Contains(rec.Body.String(), "SecretTopic") {
+		t.Errorf("SecretTopic leaked to read token: %s", rec.Body.String())
+	}
+	var readT struct {
+		Topics []struct {
+			Label       string `json:"label"`
+			MemberCount int    `json:"member_count"`
+		} `json:"topics"`
+	}
+	mustJSON(t, rec, &readT)
+	if len(readT.Topics) != 1 || readT.Topics[0].Label != "Shared" || readT.Topics[0].MemberCount != 1 {
+		t.Errorf("read-token /topics = %+v, want only Shared(1)", readT.Topics)
+	}
+
+	// /topics/{secret}: hidden from the read token (404), visible to the owner.
+	if rec := doGet(h, "/topics/"+secret.ID, "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusNotFound {
+		t.Errorf("read-token GET SecretTopic = %d, want 404", rec.Code)
+	}
+	if rec := doGet(h, "/topics/"+secret.ID, "owner-token-xxxxxxxxxxxx"); rec.Code != http.StatusOK {
+		t.Errorf("owner GET SecretTopic = %d, want 200", rec.Code)
+	}
+
+	// /topics/{shared}: the read token sees the topic but only its public member.
+	rec = doGet(h, "/topics/"+shared.ID, "read-token-yyyyyyyyyyyyyy")
+	if strings.Contains(rec.Body.String(), sens) || strings.Contains(rec.Body.String(), "secret") {
+		t.Errorf("sensitive member leaked into shared topic: %s", rec.Body.String())
+	}
+	var detail struct {
+		Members []struct {
+			ArtifactID string `json:"artifact_id"`
+		} `json:"members"`
+	}
+	mustJSON(t, rec, &detail)
+	if len(detail.Members) != 1 || detail.Members[0].ArtifactID != pub {
+		t.Errorf("read-token topic members = %+v, want only the public member %s", detail.Members, pub)
+	}
+}
+
+func TestReadToken_ConflictsFilterTiers(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	mkConflict := func(tierA, tierB kb.PrivacyTier, h1, h2 string) {
+		a := seedReady(t, st, h1, "a", tierA, 0.5)
+		b := seedReady(t, st, h2, "b", tierB, 0.5)
+		ca := &kb.Claim{ArtifactID: a, Statement: "P"}
+		cb := &kb.Claim{ArtifactID: b, Statement: "not P"}
+		if err := st.Claims.Create(ctx, ca); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Claims.Create(ctx, cb); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Conflicts.Create(ctx, &kb.Conflict{ClaimA: ca.ID, ClaimB: cb.ID, Rationale: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkConflict(kb.Public, kb.Public, "p1", "p2")       // both public → visible to read token
+	mkConflict(kb.Public, kb.Sensitive, "p3", "s1")    // one sensitive claim → hidden
+	mkConflict(kb.Sensitive, kb.Sensitive, "s2", "s3") // both sensitive → hidden
+
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger()})
+	h := srv.Handler()
+
+	count := func(token string) int {
+		var out struct {
+			Conflicts []struct {
+				ID string `json:"id"`
+			} `json:"conflicts"`
+		}
+		mustJSON(t, doGet(h, "/conflicts", token), &out)
+		return len(out.Conflicts)
+	}
+	if got := count("owner-token-xxxxxxxxxxxx"); got != 3 {
+		t.Errorf("owner /conflicts = %d, want all 3", got)
+	}
+	// The read token sees only the fully-public conflict; no sensitive claim leaks.
+	if got := count("read-token-yyyyyyyyyyyyyy"); got != 1 {
+		t.Errorf("read-token /conflicts = %d, want only the all-public conflict", got)
+	}
+}
+
 func TestReadToken_GraphReadsFilterTiers(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()

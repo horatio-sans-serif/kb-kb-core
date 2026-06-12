@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"kb/internal/kb"
 )
 
 func TestClaimRepo_CreateAndListByArtifact(t *testing.T) {
@@ -112,7 +114,7 @@ func TestConflictRepo_CreateDedupListResolve(t *testing.T) {
 		t.Fatalf("create reversed: %v", err)
 	}
 
-	open, err := st.Conflicts.ListByStatus(ctx, "open", 10)
+	open, err := st.Conflicts.ListByStatus(ctx, "open", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -125,10 +127,10 @@ func TestConflictRepo_CreateDedupListResolve(t *testing.T) {
 	if err := st.Conflicts.SetStatus(ctx, id, "resolved", "A is correct"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if again, _ := st.Conflicts.ListByStatus(ctx, "open", 10); len(again) != 0 {
+	if again, _ := st.Conflicts.ListByStatus(ctx, "open", 10, kb.Restricted); len(again) != 0 {
 		t.Errorf("resolved conflict should not be open, got %d", len(again))
 	}
-	resolved, _ := st.Conflicts.ListByStatus(ctx, "resolved", 10)
+	resolved, _ := st.Conflicts.ListByStatus(ctx, "resolved", 10, kb.Restricted)
 	if len(resolved) != 1 || resolved[0].Rationale != "A is correct" {
 		t.Errorf("resolved = %+v", resolved)
 	}
@@ -164,7 +166,7 @@ func TestClaimRepo_DeleteByArtifactCascades(t *testing.T) {
 		t.Errorf("claims not deleted: %d", len(got))
 	}
 	// The dependent conflict was deleted too (no FK orphan).
-	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10); len(open) != 0 {
+	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10, kb.Restricted); len(open) != 0 {
 		t.Errorf("dependent conflict not cascaded: %d", len(open))
 	}
 }
@@ -179,13 +181,13 @@ func TestConflictRepo_ListExcludesTombstonedClaims(t *testing.T) {
 	_ = st.Claims.Create(ctx, cb)
 	_ = st.Conflicts.Create(ctx, &Conflict{ClaimA: ca.ID, ClaimB: cb.ID})
 
-	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10); len(open) != 1 {
+	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10, kb.Restricted); len(open) != 1 {
 		t.Fatalf("expected 1 open conflict before tombstone, got %d", len(open))
 	}
 	if err := st.Artifacts.SoftDelete(ctx, a); err != nil {
 		t.Fatalf("soft delete: %v", err)
 	}
-	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10); len(open) != 0 {
+	if open, _ := st.Conflicts.ListByStatus(ctx, "open", 10, kb.Restricted); len(open) != 0 {
 		t.Errorf("conflict referencing a tombstoned artifact must not be listed, got %d", len(open))
 	}
 }

@@ -138,10 +138,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /entities", s.requireRead(http.HandlerFunc(s.handleListEntities)))
 	mux.Handle("GET /entities/{id}", s.requireRead(http.HandlerFunc(s.handleGetEntity)))
 	mux.Handle("GET /artifacts/{id}/backlinks", s.requireRead(http.HandlerFunc(s.handleBacklinks)))
-	mux.Handle("GET /conflicts", s.requireAuth(http.HandlerFunc(s.handleListConflicts)))
+	mux.Handle("GET /conflicts", s.requireRead(http.HandlerFunc(s.handleListConflicts)))
 	mux.Handle("POST /conflicts/{id}", s.requireAuth(http.HandlerFunc(s.handleResolveConflict)))
-	mux.Handle("GET /topics", s.requireAuth(http.HandlerFunc(s.handleListTopics)))
-	mux.Handle("GET /topics/{id}", s.requireAuth(http.HandlerFunc(s.handleGetTopic)))
+	mux.Handle("GET /topics", s.requireRead(http.HandlerFunc(s.handleListTopics)))
+	mux.Handle("GET /topics/{id}", s.requireRead(http.HandlerFunc(s.handleGetTopic)))
 	mux.Handle("GET /lifecycle", s.requireAuth(http.HandlerFunc(s.handleLifecycle)))
 	return mux
 }
@@ -1056,7 +1056,7 @@ type topicJSON struct {
 
 // handleListTopics lists the emergent topics by size (§8.7), largest first.
 func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {
-	topics, err := s.deps.Store.Topics.ListWithCounts(r.Context(), maxSurfaceLimit)
+	topics, err := s.deps.Store.Topics.ListWithCounts(r.Context(), maxSurfaceLimit, readCeiling(r.Context()))
 	if err != nil {
 		s.serverError(w, "list topics", err)
 		return
@@ -1076,6 +1076,7 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	ceiling := readCeiling(ctx)
 	topic, err := s.deps.Store.Topics.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1085,9 +1086,15 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "get topic", err)
 		return
 	}
-	members, err := s.deps.Store.Topics.Members(ctx, id, maxSurfaceLimit)
+	members, err := s.deps.Store.Topics.Members(ctx, id, maxSurfaceLimit, ceiling)
 	if err != nil {
 		s.serverError(w, "topic members", err)
+		return
+	}
+	// Hide a topic with no in-ceiling member from a lower-trust reader: an empty
+	// topic is indistinguishable from a non-existent one (404).
+	if ceiling != kb.Restricted && len(members) == 0 {
+		http.Error(w, "unknown topic", http.StatusNotFound)
 		return
 	}
 	out := topicJSON{ID: topic.ID, Label: topic.Label, Members: make([]topicMemberJSON, 0, len(members))}
@@ -1123,10 +1130,10 @@ func validConflictStatus(s string) bool {
 }
 
 // handleListConflicts lists detected contradictions for human resolution (§8.13),
-// each with both claim statements. ?status defaults to open. Claim statements are
-// returned regardless of their artifacts' privacy tiers: this is a local,
-// token-authenticated, single-user API and the tiers gate cloud egress, not local
-// reads (the requireAuth boundary is the relevant control).
+// each with both claim statements. ?status defaults to open. The owner sees every
+// conflict; a lower-trust read token sees only those whose BOTH claims rest on
+// in-ceiling artifacts (ListByStatus enforces the per-principal ceiling), so a
+// conflict never leaks an above-ceiling artifact's existence or gist.
 func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	if status == "" {
@@ -1136,7 +1143,7 @@ func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	conflicts, err := s.deps.Store.Conflicts.ListByStatus(ctx, status, maxSurfaceLimit)
+	conflicts, err := s.deps.Store.Conflicts.ListByStatus(ctx, status, maxSurfaceLimit, readCeiling(ctx))
 	if err != nil {
 		s.serverError(w, "list conflicts", err)
 		return

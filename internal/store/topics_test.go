@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"kb/internal/kb"
 )
 
 func TestTopicRepo_CreateListAssign(t *testing.T) {
@@ -66,7 +68,7 @@ func TestTopicRepo_ListWithCountsGetMembers(t *testing.T) {
 	_ = st.Artifacts.SoftDelete(ctx, gone) // small now has 0 live members
 
 	// ListWithCounts: only topics with >=1 live member, biggest first.
-	list, err := st.Topics.ListWithCounts(ctx, 10)
+	list, err := st.Topics.ListWithCounts(ctx, 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -86,7 +88,7 @@ func TestTopicRepo_ListWithCountsGetMembers(t *testing.T) {
 	}
 
 	// Members: live members, highest score first; tombstoned excluded.
-	members, err := st.Topics.Members(ctx, big.ID, 10)
+	members, err := st.Topics.Members(ctx, big.ID, 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("members: %v", err)
 	}
