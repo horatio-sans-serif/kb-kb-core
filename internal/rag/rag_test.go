@@ -38,7 +38,7 @@ type fakeRetriever struct {
 	err  error
 }
 
-func (f fakeRetriever) Hybrid(_ context.Context, _ string, _ int) ([]search.Result, error) {
+func (f fakeRetriever) Hybrid(_ context.Context, _ string, _ int, _ kb.PrivacyTier) ([]search.Result, error) {
 	return f.hits, f.err
 }
 
@@ -74,7 +74,7 @@ func TestAnswer_SynthesizesWithSources(t *testing.T) {
 	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1, Score: 0.9}, {ArtifactID: a2, Score: 0.4}}},
 		st, llmc, nil, "model", "embed", true)
 
-	ans, err := e.Answer(context.Background(), "what is tokio", 5)
+	ans, err := e.Answer(context.Background(), "what is tokio", 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestAnswer_EmptyModelAnswerIsError(t *testing.T) {
 	st := storetest.New(t)
 	a1 := seed(t, st, "h1", "T", "some body text")
 	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}}}, st, &fakeLLM{resp: "   "}, nil, "model", "embed", true)
-	if _, err := e.Answer(context.Background(), "q", 5); err == nil {
+	if _, err := e.Answer(context.Background(), "q", 5, kb.Restricted); err == nil {
 		t.Error("an empty/whitespace model answer must be an error, not a 200 with sources and no text")
 	}
 }
@@ -109,7 +109,7 @@ func TestAnswer_SkipsTombstonedSource(t *testing.T) {
 	llmc := &fakeLLM{resp: "answer [1]"}
 	// Both ranked (a stale ranking), but the tombstoned one must not reach the prompt.
 	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}, {ArtifactID: gone}}}, st, llmc, nil, "model", "embed", true)
-	ans, err := e.Answer(context.Background(), "q", 5)
+	ans, err := e.Answer(context.Background(), "q", 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestAnswer_SkipsTombstonedSource(t *testing.T) {
 func TestAnswer_RemoteEndpointRefused(t *testing.T) {
 	st := storetest.New(t)
 	e := NewEngine(fakeRetriever{}, st, &fakeLLM{}, nil, "model", "embed", false) // not local
-	if _, err := e.Answer(context.Background(), "q", 5); !errors.Is(err, ErrLocalRequired) {
+	if _, err := e.Answer(context.Background(), "q", 5, kb.Restricted); !errors.Is(err, ErrLocalRequired) {
 		t.Errorf("err = %v, want ErrLocalRequired (bodies + query must stay on-device)", err)
 	}
 }
@@ -132,7 +132,7 @@ func TestAnswer_RemoteEndpointRefused(t *testing.T) {
 func TestAnswer_EmptyQueryIsError(t *testing.T) {
 	st := storetest.New(t)
 	e := NewEngine(fakeRetriever{}, st, &fakeLLM{}, nil, "model", "embed", true)
-	if _, err := e.Answer(context.Background(), "   ", 5); err == nil {
+	if _, err := e.Answer(context.Background(), "   ", 5, kb.Restricted); err == nil {
 		t.Error("an empty query should be an error")
 	}
 }
@@ -141,7 +141,7 @@ func TestAnswer_NoHitsSkipsLLM(t *testing.T) {
 	st := storetest.New(t)
 	llmc := &fakeLLM{resp: "should not be called"}
 	e := NewEngine(fakeRetriever{hits: nil}, st, llmc, nil, "model", "embed", true)
-	ans, err := e.Answer(context.Background(), "q", 5)
+	ans, err := e.Answer(context.Background(), "q", 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestAnswer_LLMErrorPropagates(t *testing.T) {
 	st := storetest.New(t)
 	a1 := seed(t, st, "h1", "T", "body")
 	e := NewEngine(fakeRetriever{hits: []search.Result{{ArtifactID: a1}}}, st, &fakeLLM{err: errors.New("model down")}, nil, "model", "embed", true)
-	if _, err := e.Answer(context.Background(), "q", 5); err == nil {
+	if _, err := e.Answer(context.Background(), "q", 5, kb.Restricted); err == nil {
 		t.Error("an LLM error must propagate")
 	}
 }
@@ -165,7 +165,7 @@ func TestAnswer_LLMErrorPropagates(t *testing.T) {
 func TestAnswer_RetrieverErrorPropagates(t *testing.T) {
 	st := storetest.New(t)
 	e := NewEngine(fakeRetriever{err: errors.New("search down")}, st, &fakeLLM{}, nil, "model", "embed", true)
-	if _, err := e.Answer(context.Background(), "q", 5); err == nil {
+	if _, err := e.Answer(context.Background(), "q", 5, kb.Restricted); err == nil {
 		t.Error("a retriever error must propagate")
 	}
 }
@@ -186,7 +186,7 @@ func TestAnswer_MMRRerankPrefersDiversity(t *testing.T) {
 		fakeRetriever{hits: []search.Result{{ArtifactID: a, Score: 0.9}, {ArtifactID: b, Score: 0.8}, {ArtifactID: c, Score: 0.7}}},
 		st, llmc, fakeEmbedder{vec: []float32{1, 1, 0}}, "model", "embed", true)
 
-	ans, err := e.Answer(context.Background(), "q", 2)
+	ans, err := e.Answer(context.Background(), "q", 2, kb.Restricted)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestAnswer_NilEmbedderKeepsRetrievalOrder(t *testing.T) {
 	e := NewEngine(
 		fakeRetriever{hits: []search.Result{{ArtifactID: a}, {ArtifactID: b}, {ArtifactID: c}}},
 		st, llmc, nil, "model", "embed", true)
-	ans, err := e.Answer(context.Background(), "q", 2)
+	ans, err := e.Answer(context.Background(), "q", 2, kb.Restricted)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestAnswer_CitationValidation(t *testing.T) {
 		fakeRetriever{hits: []search.Result{{ArtifactID: a}, {ArtifactID: b}}},
 		st, llmc, nil, "model", "embed", true)
 
-	ans, err := e.Answer(context.Background(), "q", 2)
+	ans, err := e.Answer(context.Background(), "q", 2, kb.Restricted)
 	if err != nil {
 		t.Fatalf("answer: %v", err)
 	}

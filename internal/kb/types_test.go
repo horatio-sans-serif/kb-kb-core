@@ -52,3 +52,31 @@ func TestMaxTier(t *testing.T) {
 		t.Errorf("MaxTier() of nothing = %q, want public", got)
 	}
 }
+
+func TestTiersAtMost(t *testing.T) {
+	cases := map[PrivacyTier]int{
+		Public:     1, // only public
+		Personal:   2,
+		Sensitive:  3,
+		Restricted: 4, // all
+	}
+	for ceiling, want := range cases {
+		got := TiersAtMost(ceiling)
+		if len(got) != want {
+			t.Errorf("TiersAtMost(%s) = %v (%d), want %d tiers", ceiling, got, len(got), want)
+		}
+		for _, tier := range got {
+			if !tier.AtMost(ceiling) {
+				t.Errorf("TiersAtMost(%s) included %s, which is above the ceiling", ceiling, tier)
+			}
+		}
+	}
+	// Public ceiling sees only public.
+	if got := TiersAtMost(Public); len(got) != 1 || got[0] != Public {
+		t.Errorf("TiersAtMost(Public) = %v, want [public]", got)
+	}
+	// An unknown ceiling fails closed (sees nothing).
+	if got := TiersAtMost(PrivacyTier("bogus")); got != nil {
+		t.Errorf("TiersAtMost(bogus) = %v, want nil (fail closed)", got)
+	}
+}

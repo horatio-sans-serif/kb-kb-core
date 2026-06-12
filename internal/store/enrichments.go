@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"kb/internal/kb"
 )
 
 // Enrichment is defined in internal/kb (aliased in types.go).
@@ -78,14 +80,24 @@ func (r *EnrichmentRepo) LatestByKind(ctx context.Context, artifactID, kind stri
 // single owner behind the bearer token, so all live tiers are searchable. A
 // future lower-trust read path (see KB_LISTEN_ADDR) must add a tier ceiling here.
 func (r *EnrichmentRepo) ForEachLatestEmbedding(ctx context.Context, fn func(artifactID, payload string) error) error {
+	// Unfiltered (owner ceiling): the vec0 index builds over every embedding; the read
+	// ceiling is applied at query time, not at index-build time.
+	return r.ForEachLatestEmbeddingWithin(ctx, kb.Restricted, fn)
+}
+
+// ForEachLatestEmbeddingWithin is ForEachLatestEmbedding scoped to a read ceiling:
+// only artifacts at or below ceiling are streamed (§8.17), so the brute-force
+// semantic search a lower-trust reader runs never scores content it may not see.
+func (r *EnrichmentRepo) ForEachLatestEmbeddingWithin(ctx context.Context, ceiling kb.PrivacyTier, fn func(artifactID, payload string) error) error {
+	tier, args := tierClause("a.privacy_tier", ceiling)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT artifact_id, payload FROM (
 		   SELECT e.artifact_id, e.payload,
 		          ROW_NUMBER() OVER (PARTITION BY e.artifact_id ORDER BY e.created_at DESC, e.id DESC) AS rn
 		   FROM enrichments e
-		   JOIN artifacts a ON a.id = e.artifact_id AND a.deleted_at IS NULL
+		   JOIN artifacts a ON a.id = e.artifact_id AND a.deleted_at IS NULL AND `+tier+`
 		   WHERE e.kind = 'embedding'
-		 ) WHERE rn = 1`)
+		 ) WHERE rn = 1`, args...)
 	if err != nil {
 		return fmt.Errorf("latest embeddings: %w", err)
 	}

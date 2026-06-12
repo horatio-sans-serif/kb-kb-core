@@ -921,17 +921,17 @@ type fakeSearcher struct {
 	gotMode string
 }
 
-func (f *fakeSearcher) Semantic(_ context.Context, query string, k int) ([]search.Result, error) {
+func (f *fakeSearcher) Semantic(_ context.Context, query string, k int, _ kb.PrivacyTier) ([]search.Result, error) {
 	f.gotQ, f.gotK, f.gotMode = query, k, "semantic"
 	return f.results, f.err
 }
 
-func (f *fakeSearcher) Keyword(_ context.Context, query string, k int) ([]search.Result, error) {
+func (f *fakeSearcher) Keyword(_ context.Context, query string, k int, _ kb.PrivacyTier) ([]search.Result, error) {
 	f.gotQ, f.gotK, f.gotMode = query, k, "keyword"
 	return f.results, f.err
 }
 
-func (f *fakeSearcher) Hybrid(_ context.Context, query string, k int) ([]search.Result, error) {
+func (f *fakeSearcher) Hybrid(_ context.Context, query string, k int, _ kb.PrivacyTier) ([]search.Result, error) {
 	f.gotQ, f.gotK, f.gotMode = query, k, "hybrid"
 	return f.results, f.err
 }
@@ -998,7 +998,7 @@ type fakeAsker struct {
 	err error
 }
 
-func (f fakeAsker) Answer(_ context.Context, _ string, _ int) (rag.Answer, error) {
+func (f fakeAsker) Answer(_ context.Context, _ string, _ int, _ kb.PrivacyTier) (rag.Answer, error) {
 	return f.ans, f.err
 }
 

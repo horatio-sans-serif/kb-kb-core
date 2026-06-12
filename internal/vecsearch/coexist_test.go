@@ -87,7 +87,7 @@ func TestVec0AndCrsqliteCoexist(t *testing.T) {
 	}
 
 	// vec0 KNN still works on the read pool.
-	hits, err := idx.Search(ctx, []float32{1, 0, 0}, 5)
+	hits, err := idx.Search(ctx, []float32{1, 0, 0}, 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("vec0 search: %v", err)
 	}

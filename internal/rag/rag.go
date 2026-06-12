@@ -63,9 +63,10 @@ const (
 // to 503.
 var ErrLocalRequired = errors.New("rag: question answering requires an on-device LLM endpoint")
 
-// Retriever returns ranked artifacts for a query (satisfied by *search.Searcher).
+// Retriever returns ranked artifacts for a query within a read ceiling (satisfied by
+// *search.Searcher).
 type Retriever interface {
-	Hybrid(ctx context.Context, query string, k int) ([]search.Result, error)
+	Hybrid(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) ([]search.Result, error)
 }
 
 // Source is one artifact the answer is grounded on; its position in Answer.Sources
@@ -121,7 +122,7 @@ func NewEngine(retriever Retriever, st *store.Store, client llm.Client, embedder
 // grounds the local LLM on those sources, and returns the synthesized answer with
 // its cited sources and any invalid citations. With no relevant sources it returns a
 // stock answer and never calls the model.
-func (e *Engine) Answer(ctx context.Context, query string, k int) (Answer, error) {
+func (e *Engine) Answer(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) (Answer, error) {
 	if !e.local {
 		return Answer{}, ErrLocalRequired
 	}
@@ -141,18 +142,19 @@ func (e *Engine) Answer(ctx context.Context, query string, k int) (Answer, error
 	if pool > maxK {
 		pool = maxK
 	}
-	hits, err := e.retriever.Hybrid(ctx, query, pool)
+	hits, err := e.retriever.Hybrid(ctx, query, pool, ceiling)
 	if err != nil {
 		return Answer{}, err
 	}
 
 	var candidates []candidate
 	for _, h := range hits {
-		// GetLive (not Get) so a delete racing ranking can't feed a tombstoned
-		// artifact's body into the prompt.
-		a, err := e.store.Artifacts.GetLive(ctx, h.ArtifactID)
+		// GetLiveWithin (not Get) so a delete racing ranking can't feed a tombstoned
+		// artifact's body into the prompt, and the read ceiling is re-checked at load
+		// time (defense in depth — the retriever already filtered).
+		a, err := e.store.Artifacts.GetLiveWithin(ctx, h.ArtifactID, ceiling)
 		if err != nil {
-			continue // artifact deleted/gone between ranking and load — drop it
+			continue // artifact deleted/gone/above-ceiling between ranking and load — drop it
 		}
 		c := candidate{id: a.ID, title: a.Title, body: a.BodyMarkdown, score: h.Score}
 		if a.CanonicalURL != nil {

@@ -47,7 +47,7 @@ func TestSemantic_RanksByCosine(t *testing.T) {
 
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
 
-	results, err := s.Semantic(ctx, "find aligned things", 10)
+	results, err := s.Semantic(ctx, "find aligned things", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestSemantic_RanksByCosine(t *testing.T) {
 func TestSemantic_RemoteEndpointRefuses(t *testing.T) {
 	st := storetest.New(t)
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", false) // not local
-	if _, err := s.Semantic(context.Background(), "secret query", 5); !errors.Is(err, ErrRemoteDisallowed) {
+	if _, err := s.Semantic(context.Background(), "secret query", 5, kb.Restricted); !errors.Is(err, ErrRemoteDisallowed) {
 		t.Errorf("err = %v, want ErrRemoteDisallowed (query must not leave the box)", err)
 	}
 }
@@ -81,7 +81,7 @@ func TestSemantic_SkipsNonFiniteScore(t *testing.T) {
 	_ = st.Enrichments.Create(ctx, &kb.Enrichment{ArtifactID: a.ID, Kind: "embedding", Payload: string(payload), Model: "m", PromptVersion: "v1"})
 
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
-	results, err := s.Semantic(ctx, "q", 10)
+	results, err := s.Semantic(ctx, "q", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestSemantic_SkipsDimMismatch(t *testing.T) {
 	_ = st.Enrichments.Create(ctx, &kb.Enrichment{ArtifactID: b.ID, Kind: "embedding", Payload: string(bp), Model: "old", PromptVersion: "v1"})
 
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
-	results, err := s.Semantic(ctx, "q", 10)
+	results, err := s.Semantic(ctx, "q", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestSemantic_SkipsDimMismatch(t *testing.T) {
 func TestSemantic_EmptyQueryIsError(t *testing.T) {
 	st := storetest.New(t)
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
-	if _, err := s.Semantic(context.Background(), "   ", 5); err == nil {
+	if _, err := s.Semantic(context.Background(), "   ", 5, kb.Restricted); err == nil {
 		t.Error("an empty query should be an error")
 	}
 }
@@ -125,7 +125,7 @@ func TestSemantic_EmptyQueryIsError(t *testing.T) {
 func TestSemantic_EmbedErrorPropagates(t *testing.T) {
 	st := storetest.New(t)
 	s := NewSearcher(st, queryEmbedder{err: errors.New("ollama down")}, "m", true)
-	if _, err := s.Semantic(context.Background(), "q", 5); err == nil {
+	if _, err := s.Semantic(context.Background(), "q", 5, kb.Restricted); err == nil {
 		t.Error("an embed error must propagate")
 	}
 }
@@ -146,7 +146,7 @@ func TestKeyword_FindsAndRanks(t *testing.T) {
 
 	// Keyword search needs no embedder and no locality (it never leaves SQLite).
 	s := NewSearcher(st, queryEmbedder{err: errors.New("must not be called")}, "m", false)
-	results, err := s.Keyword(context.Background(), "rust async", 10)
+	results, err := s.Keyword(context.Background(), "rust async", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("keyword: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestKeyword_SanitizesSpecialChars(t *testing.T) {
 	seedNote(t, st, "h1", "Rust async", "tokio")
 	s := NewSearcher(st, queryEmbedder{}, "m", true)
 	// FTS5 syntax metacharacters in raw input must not produce a query error.
-	if _, err := s.Keyword(context.Background(), `rust" OR (NEAR foo`, 10); err != nil {
+	if _, err := s.Keyword(context.Background(), `rust" OR (NEAR foo`, 10, kb.Restricted); err != nil {
 		t.Errorf("special characters must be sanitized, not error: %v", err)
 	}
 }
@@ -168,7 +168,7 @@ func TestKeyword_SanitizesSpecialChars(t *testing.T) {
 func TestKeyword_NoSearchableTerms(t *testing.T) {
 	st := storetest.New(t)
 	s := NewSearcher(st, queryEmbedder{}, "m", true)
-	results, err := s.Keyword(context.Background(), "!!! ??? ...", 10)
+	results, err := s.Keyword(context.Background(), "!!! ??? ...", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("keyword: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestKeyword_NoSearchableTerms(t *testing.T) {
 func TestKeyword_EmptyQueryIsError(t *testing.T) {
 	st := storetest.New(t)
 	s := NewSearcher(st, queryEmbedder{}, "m", true)
-	if _, err := s.Keyword(context.Background(), "  ", 10); err == nil {
+	if _, err := s.Keyword(context.Background(), "  ", 10, kb.Restricted); err == nil {
 		t.Error("an empty query should be an error")
 	}
 }
@@ -203,7 +203,7 @@ func TestHybrid_FusesSemanticAndKeyword(t *testing.T) {
 	b := seedNoteWithEmbedding(t, st, "h2", "Beta", "beta keyword text", []float32{0, 1})
 
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
-	results, err := s.Hybrid(context.Background(), "beta", 10)
+	results, err := s.Hybrid(context.Background(), "beta", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("hybrid: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestHybrid_DegradesToKeywordWhenSemanticUnavailable(t *testing.T) {
 
 	// local=false → Semantic refuses; Hybrid must still return keyword results.
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", false)
-	results, err := s.Hybrid(context.Background(), "beta", 10)
+	results, err := s.Hybrid(context.Background(), "beta", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("hybrid: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestHybrid_DegradesWhenEmbedModelDown(t *testing.T) {
 	// Local endpoint but the embed model errors (not a context error): degrade to
 	// keyword rather than failing the whole search.
 	s := NewSearcher(st, queryEmbedder{err: errors.New("model not loaded")}, "m", true)
-	results, err := s.Hybrid(context.Background(), "beta", 10)
+	results, err := s.Hybrid(context.Background(), "beta", 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("hybrid should degrade on a model error, got %v", err)
 	}
@@ -254,7 +254,7 @@ func TestHybrid_CancelledContextPropagates(t *testing.T) {
 	cancel() // dead request
 
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0}}, "m", true)
-	if _, err := s.Hybrid(ctx, "beta", 10); err == nil {
+	if _, err := s.Hybrid(ctx, "beta", 10, kb.Restricted); err == nil {
 		t.Error("a cancelled context must propagate as an error, not a degraded 200")
 	}
 }
@@ -265,7 +265,7 @@ type fakeIndex struct {
 	calls int
 }
 
-func (f *fakeIndex) Search(_ context.Context, _ []float32, _ int) ([]vecsearch.Hit, error) {
+func (f *fakeIndex) Search(_ context.Context, _ []float32, _ int, _ kb.PrivacyTier) ([]vecsearch.Hit, error) {
 	f.calls++
 	return f.hits, f.err
 }
@@ -279,7 +279,7 @@ func TestSemantic_UsesIndexWhenSet(t *testing.T) {
 	idx := &fakeIndex{hits: []vecsearch.Hit{{ArtifactID: "01A", Score: 0.95}, {ArtifactID: "01B", Score: 0.5}}}
 	s.SetIndex(idx)
 
-	res, err := s.Semantic(context.Background(), "q", 5)
+	res, err := s.Semantic(context.Background(), "q", 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestSemantic_FallsBackOnIndexError(t *testing.T) {
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0, 0}}, "m", true)
 	s.SetIndex(&fakeIndex{err: errors.New("index down")})
 
-	res, err := s.Semantic(context.Background(), "q", 5)
+	res, err := s.Semantic(context.Background(), "q", 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("an index error must fall back to brute force, not fail: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestSemantic_FallsBackOnEmptyIndex(t *testing.T) {
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0, 0}}, "m", true)
 	s.SetIndex(&fakeIndex{hits: nil}) // success, but no hits
 
-	res, err := s.Semantic(context.Background(), "q", 5)
+	res, err := s.Semantic(context.Background(), "q", 5, kb.Restricted)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}

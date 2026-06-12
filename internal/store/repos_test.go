@@ -7,6 +7,8 @@ import (
 	"sort"
 	"sync"
 	"testing"
+
+	"kb/internal/kb"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -737,7 +739,7 @@ func TestArtifact_KeywordSearch(t *testing.T) {
 		t.Fatalf("create go: %v", err)
 	}
 
-	hits, err := st.Artifacts.SearchKeyword(ctx, `"rust"`, 10)
+	hits, err := st.Artifacts.SearchKeyword(ctx, `"rust"`, 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -753,10 +755,10 @@ func TestArtifact_KeywordSearch(t *testing.T) {
 	if err := st.Artifacts.Patch(ctx, rust.ID, ArtifactPatch{BodyMarkdown: &body}); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
-	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"kubernetes"`, 10); len(hits) != 1 || hits[0].ArtifactID != rust.ID {
+	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"kubernetes"`, 10, kb.Restricted); len(hits) != 1 || hits[0].ArtifactID != rust.ID {
 		t.Errorf("patched body term should be searchable, got %+v", hits)
 	}
-	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"tokio"`, 10); len(hits) != 0 {
+	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"tokio"`, 10, kb.Restricted); len(hits) != 0 {
 		t.Errorf("old body term should not match after reindex, got %+v", hits)
 	}
 
@@ -764,7 +766,7 @@ func TestArtifact_KeywordSearch(t *testing.T) {
 	if err := st.Artifacts.SoftDelete(ctx, rust.ID); err != nil {
 		t.Fatalf("soft delete: %v", err)
 	}
-	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"kubernetes"`, 10); len(hits) != 0 {
+	if hits, _ := st.Artifacts.SearchKeyword(ctx, `"kubernetes"`, 10, kb.Restricted); len(hits) != 0 {
 		t.Errorf("tombstoned artifact must not appear in search, got %+v", hits)
 	}
 }

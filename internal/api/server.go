@@ -34,15 +34,15 @@ type BuildInfo struct {
 // the /search route reports 503. Semantic is meaning-based (embeds the query);
 // Keyword is full-text (FTS5); Hybrid blends both (the default).
 type Searcher interface {
-	Semantic(ctx context.Context, query string, k int) ([]search.Result, error)
-	Keyword(ctx context.Context, query string, k int) ([]search.Result, error)
-	Hybrid(ctx context.Context, query string, k int) ([]search.Result, error)
+	Semantic(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) ([]search.Result, error)
+	Keyword(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) ([]search.Result, error)
+	Hybrid(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) ([]search.Result, error)
 }
 
 // Asker answers a question over retrieved artifacts (satisfied by *rag.Engine).
 // When nil, the /ask route reports 503.
 type Asker interface {
-	Answer(ctx context.Context, query string, k int) (rag.Answer, error)
+	Answer(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) (rag.Answer, error)
 }
 
 // ConnectorRegistry reports which source connectors are available (satisfied by
@@ -158,6 +158,21 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// ceilingKey is the context key under which requireAuth records the authenticated
+// principal's privacy read ceiling (§8.17).
+type ceilingKey struct{}
+
+// readCeiling returns the request's read ceiling — the most sensitive tier the caller
+// may see. The owner's full token grants Restricted (everything); a lower-trust read
+// token a lower ceiling. Absent it defaults to Restricted, so a request that was not
+// tagged with a ceiling (single-owner deployments) sees everything, unchanged.
+func readCeiling(ctx context.Context) kb.PrivacyTier {
+	if c, ok := ctx.Value(ceilingKey{}).(kb.PrivacyTier); ok && c.Valid() {
+		return c
+	}
+	return kb.Restricted
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -1505,15 +1520,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	ceiling := readCeiling(ctx)
 	var hits []search.Result
 	var err error
 	switch mode := r.URL.Query().Get("mode"); mode {
 	case "", "hybrid":
-		hits, err = s.deps.Search.Hybrid(ctx, q, k)
+		hits, err = s.deps.Search.Hybrid(ctx, q, k, ceiling)
 	case "semantic":
-		hits, err = s.deps.Search.Semantic(ctx, q, k)
+		hits, err = s.deps.Search.Semantic(ctx, q, k, ceiling)
 	case "keyword":
-		hits, err = s.deps.Search.Keyword(ctx, q, k)
+		hits, err = s.deps.Search.Keyword(ctx, q, k, ceiling)
 	default:
 		http.Error(w, "mode must be 'hybrid', 'semantic', or 'keyword'", http.StatusBadRequest)
 		return
@@ -1529,9 +1545,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	out := searchResponse{Query: q, Results: make([]searchResultJSON, 0, len(hits))}
 	for _, h := range hits {
-		a, err := s.deps.Store.Artifacts.Get(ctx, h.ArtifactID)
+		// GetLiveWithin: live-scoped and re-checks the ceiling at load time (the hits
+		// are already ceiling-filtered; this is defense in depth and drops a tombstone
+		// that raced the ranking).
+		a, err := s.deps.Store.Artifacts.GetLiveWithin(ctx, h.ArtifactID, ceiling)
 		if err != nil {
-			continue // artifact hard-deleted / not found between ranking and load — drop
+			continue // hard-deleted / tombstoned / above-ceiling between ranking and load — drop
 		}
 		res := searchResultJSON{ArtifactID: h.ArtifactID, Title: a.Title, Score: h.Score}
 		if a.CanonicalURL != nil {
@@ -1553,7 +1572,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ans, err := s.deps.Ask.Answer(r.Context(), q, k)
+	ans, err := s.deps.Ask.Answer(r.Context(), q, k, readCeiling(r.Context()))
 	if err != nil {
 		if errors.Is(err, rag.ErrLocalRequired) {
 			http.Error(w, "question answering requires an on-device LLM endpoint", http.StatusServiceUnavailable)

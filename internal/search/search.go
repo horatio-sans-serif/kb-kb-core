@@ -84,7 +84,7 @@ func (s *Searcher) SetIndex(index vecsearch.Index) { s.index = index }
 // payloads, and non-finite or non-positive scores are skipped — a "find by
 // meaning" result set should not include unrelated or anti-correlated artifacts.
 // Memory is bounded to O(k): rows are streamed into a top-k heap, never all held.
-func (s *Searcher) Semantic(ctx context.Context, query string, k int) ([]Result, error) {
+func (s *Searcher) Semantic(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) ([]Result, error) {
 	if !s.local {
 		return nil, ErrRemoteDisallowed
 	}
@@ -109,7 +109,7 @@ func (s *Searcher) Semantic(ctx context.Context, query string, k int) ([]Result,
 	// matches the brute-force scan would find. A genuinely empty corpus makes both
 	// paths return nothing, so the fallback only costs a wasted scan in that rare case.
 	if s.index != nil {
-		if hits, err := s.index.Search(ctx, qvec, k); err == nil && len(hits) > 0 {
+		if hits, err := s.index.Search(ctx, qvec, k, ceiling); err == nil && len(hits) > 0 {
 			out := make([]Result, len(hits))
 			for i, h := range hits {
 				out[i] = Result{ArtifactID: h.ArtifactID, Score: h.Score}
@@ -119,7 +119,7 @@ func (s *Searcher) Semantic(ctx context.Context, query string, k int) ([]Result,
 	}
 
 	h := &resultHeap{}
-	err = s.st.Enrichments.ForEachLatestEmbedding(ctx, func(artifactID, payload string) error {
+	err = s.st.Enrichments.ForEachLatestEmbeddingWithin(ctx, ceiling, func(artifactID, payload string) error {
 		var ep kb.EmbeddingPayload
 		if json.Unmarshal([]byte(payload), &ep) != nil {
 			return nil // skip a corrupt payload rather than fail the whole query
@@ -159,7 +159,7 @@ var ftsTerm = regexp.MustCompile(`[\p{L}\p{N}]+`)
 // terms (implicit AND), which both defends against FTS5 syntax errors/injection
 // and makes the match a plain bag-of-words. A query with no word terms returns no
 // results (not an error); an empty query is an error.
-func (s *Searcher) Keyword(ctx context.Context, query string, k int) ([]Result, error) {
+func (s *Searcher) Keyword(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) ([]Result, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("search: empty query")
 	}
@@ -169,7 +169,7 @@ func (s *Searcher) Keyword(ctx context.Context, query string, k int) ([]Result, 
 	if match == "" {
 		return []Result{}, nil // no searchable terms
 	}
-	hits, err := s.st.Artifacts.SearchKeyword(ctx, match, k)
+	hits, err := s.st.Artifacts.SearchKeyword(ctx, match, k, ceiling)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +186,7 @@ func (s *Searcher) Keyword(ctx context.Context, query string, k int) ([]Result, 
 // degrades to keyword-only rather than failing, since the keyword half still
 // serves the user. RRF is rank-based, so it fuses the two incomparable score
 // scales (cosine vs bm25) without normalization.
-func (s *Searcher) Hybrid(ctx context.Context, query string, k int) ([]Result, error) {
+func (s *Searcher) Hybrid(ctx context.Context, query string, k int, ceiling kb.PrivacyTier) ([]Result, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("search: empty query")
 	}
@@ -196,11 +196,11 @@ func (s *Searcher) Hybrid(ctx context.Context, query string, k int) ([]Result, e
 		depth = fuseDepth // fuseDepth and k are both <= maxK, so depth needs no re-clamp
 	}
 
-	keyword, err := s.Keyword(ctx, query, depth)
+	keyword, err := s.Keyword(ctx, query, depth, ceiling)
 	if err != nil {
 		return nil, err
 	}
-	semantic, err := s.Semantic(ctx, query, depth)
+	semantic, err := s.Semantic(ctx, query, depth, ceiling)
 	if err != nil {
 		// Degrade to keyword-only only when semantic is legitimately unavailable
 		// (non-local endpoint, model down). A cancelled/expired context means the

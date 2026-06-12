@@ -7,12 +7,31 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 
 	"kb/internal/kb"
 )
+
+// tierClause builds a "privacy_tier IN (...)" read-ceiling filter and its args from
+// the pure kb.TiersAtMost primitive (§8.17). An invalid ceiling matches nothing
+// (fail closed). Kept local so vecsearch does not depend on the store package for a
+// string helper.
+func tierClause(col string, ceiling kb.PrivacyTier) (string, []any) {
+	tiers := kb.TiersAtMost(ceiling)
+	if len(tiers) == 0 {
+		return "1 = 0", nil
+	}
+	ph := make([]string, len(tiers))
+	args := make([]any, len(tiers))
+	for i, t := range tiers {
+		ph[i] = "?"
+		args[i] = string(t)
+	}
+	return col + " IN (" + strings.Join(ph, ", ") + ")", args
+}
 
 // liveBuffer is how many extra neighbors the KNN fetches beyond k, so tombstoned
 // artifacts filtered out by the live-join still leave k live results in the common
@@ -120,7 +139,7 @@ func (ix *vecIndex) Reconcile(ctx context.Context, src EmbeddingSource) (int, er
 	return indexed, nil
 }
 
-func (ix *vecIndex) Search(ctx context.Context, qvec []float32, k int) ([]Hit, error) {
+func (ix *vecIndex) Search(ctx context.Context, qvec []float32, k int, ceiling kb.PrivacyTier) ([]Hit, error) {
 	if k <= 0 {
 		return nil, nil
 	}
@@ -131,21 +150,26 @@ func (ix *vecIndex) Search(ctx context.Context, qvec []float32, k int) ([]Hit, e
 	if err != nil {
 		return nil, fmt.Errorf("vecsearch: serialize query: %w", err)
 	}
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
 	// The KNN runs in a subquery (pure vec0 scan of the nearest k+buffer), then the
-	// outer query joins to artifacts to drop tombstoned hits. The buffer compensates
-	// for those drops so k live results remain in the common case; under heavy
-	// un-reconciled deletion (>liveBuffer tombstoned among the nearest neighbors) this
-	// can return fewer than k — best-effort, and search.Semantic falls back to the
-	// exact brute-force scan when the index returns nothing.
+	// outer query joins to artifacts to drop tombstoned hits and any above the read
+	// ceiling. The buffer compensates for those drops so k live, in-ceiling results
+	// remain in the common case; under heavy un-reconciled deletion or many
+	// above-ceiling neighbors this can return fewer than k — best-effort, and
+	// search.Semantic falls back to the brute-force scan when the index returns nothing.
+	args := make([]any, 0, len(tierArgs)+2)
+	args = append(args, b, k+liveBuffer)
+	args = append(args, tierArgs...)
+	args = append(args, k)
 	rows, err := ix.read.QueryContext(ctx,
 		`SELECT knn.artifact_id, knn.distance
 		 FROM (
 		   SELECT artifact_id, distance FROM artifact_vectors
 		   WHERE embedding MATCH ? ORDER BY distance LIMIT ?
 		 ) AS knn
-		 JOIN artifacts a ON a.id = knn.artifact_id AND a.deleted_at IS NULL
+		 JOIN artifacts a ON a.id = knn.artifact_id AND a.deleted_at IS NULL AND `+tier+`
 		 ORDER BY knn.distance
-		 LIMIT ?`, b, k+liveBuffer, k)
+		 LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("vecsearch: knn query: %w", err)
 	}

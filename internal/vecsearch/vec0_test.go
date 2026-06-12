@@ -80,7 +80,7 @@ func TestVecIndex_ReconcileAndSearchNearestLiveFirst(t *testing.T) {
 		t.Errorf("indexed %d, want 3", n)
 	}
 
-	hits, err := ix.Search(ctx, []float32{1, 0, 0}, 2)
+	hits, err := ix.Search(ctx, []float32{1, 0, 0}, 2, kb.Restricted)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestVecIndex_ReconcileAndSearchNearestLiveFirst(t *testing.T) {
 	if _, err := w.ExecContext(ctx, `UPDATE artifacts SET deleted_at = 'now' WHERE id = '01A'`); err != nil {
 		t.Fatal(err)
 	}
-	hits, _ = ix.Search(ctx, []float32{1, 0, 0}, 2)
+	hits, _ = ix.Search(ctx, []float32{1, 0, 0}, 2, kb.Restricted)
 	for _, h := range hits {
 		if h.ArtifactID == "01A" {
 			t.Errorf("tombstoned 01A returned by search: %+v", hits)

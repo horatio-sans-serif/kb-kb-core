@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"kb/internal/kb"
 	"kb/internal/store"
 	"kb/internal/vecsearch"
 )
@@ -50,7 +51,7 @@ func TestSemantic_RealVec0Index(t *testing.T) {
 	s := NewSearcher(st, queryEmbedder{vec: []float32{1, 0, 0}}, "m", true)
 	s.SetIndex(idx)
 
-	res, err := s.Semantic(ctx, "q", 2)
+	res, err := s.Semantic(ctx, "q", 2, kb.Restricted)
 	if err != nil {
 		t.Fatalf("semantic: %v", err)
 	}

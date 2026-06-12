@@ -67,6 +67,26 @@ func MaxTier(tiers ...PrivacyTier) PrivacyTier {
 	return max
 }
 
+// allTiers is the tier set in ascending sensitivity — the basis for a read ceiling.
+var allTiers = []PrivacyTier{Public, Personal, Sensitive, Restricted}
+
+// TiersAtMost returns the tiers no more sensitive than ceiling, ascending — the
+// whitelist a read query applies so a lower-trust reader never sees content above
+// its ceiling (§8.17). An owner ceiling of Restricted returns all four; Public
+// returns only Public. An unknown ceiling returns nothing (fail closed).
+func TiersAtMost(ceiling PrivacyTier) []PrivacyTier {
+	if !ceiling.Valid() {
+		return nil // fail closed: an unknown ceiling sees nothing, never everything
+	}
+	out := make([]PrivacyTier, 0, len(allTiers))
+	for _, t := range allTiers {
+		if t.AtMost(ceiling) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // SourceKind is how a source delivers content (design §7).
 type SourceKind string
 

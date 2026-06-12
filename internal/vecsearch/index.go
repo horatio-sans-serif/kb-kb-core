@@ -13,6 +13,8 @@ package vecsearch
 import (
 	"context"
 	"errors"
+
+	"kb/internal/kb"
 )
 
 // ErrUnavailable means vec0 is not compiled into this binary (the default build).
@@ -36,8 +38,9 @@ type EmbeddingSource interface {
 // (vec0.go vs stub.go); search holds an Index that may be nil (no index — brute-force).
 type Index interface {
 	// Search returns up to k live artifacts nearest to qvec, best (most similar)
-	// first. Tombstoned artifacts are filtered out.
-	Search(ctx context.Context, qvec []float32, k int) ([]Hit, error)
+	// first. Tombstoned artifacts and those above the read ceiling (§8.17) are
+	// filtered out.
+	Search(ctx context.Context, qvec []float32, k int, ceiling kb.PrivacyTier) ([]Hit, error)
 	// Reconcile rebuilds the index from src, in one transaction, when the embedding
 	// population has changed since the last rebuild (a cheap count guard makes a
 	// no-change reconcile a single COUNT query). Returns how many vectors it indexed

@@ -6,7 +6,29 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"kb/internal/kb"
 )
+
+// tierClause builds a SQL predicate restricting a read to artifacts at or below a
+// privacy ceiling (§8.17), plus its bind args. col is the qualified privacy_tier
+// column (e.g. "a.privacy_tier"). An owner ceiling (Restricted) admits all four
+// tiers; a lower ceiling drops the more sensitive ones; an invalid ceiling yields a
+// predicate that matches nothing (fail closed), so a misconfigured ceiling can never
+// expose content.
+func tierClause(col string, ceiling kb.PrivacyTier) (string, []any) {
+	tiers := kb.TiersAtMost(ceiling)
+	if len(tiers) == 0 {
+		return "1 = 0", nil // fail closed
+	}
+	ph := make([]string, len(tiers))
+	args := make([]any, len(tiers))
+	for i, t := range tiers {
+		ph[i] = "?"
+		args[i] = string(t)
+	}
+	return col + " IN (" + strings.Join(ph, ", ") + ")", args
+}
 
 // Artifact is defined in internal/kb (aliased in types.go).
 type ArtifactRepo struct{ q, rq Querier } // q: write pool; rq: read pool
@@ -188,14 +210,19 @@ type KeywordHit struct {
 // layer builds a safe one from user input) and returns live artifacts ranked by
 // bm25, best first. The join to artifacts drops tombstoned rows whose stale FTS
 // entries may linger.
-func (r *ArtifactRepo) SearchKeyword(ctx context.Context, match string, limit int) ([]KeywordHit, error) {
+func (r *ArtifactRepo) SearchKeyword(ctx context.Context, match string, limit int, ceiling kb.PrivacyTier) ([]KeywordHit, error) {
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
+	// Placeholder order follows the SQL text: the JOIN's tier filter, then MATCH, then LIMIT.
+	args := make([]any, 0, len(tierArgs)+2)
+	args = append(args, tierArgs...)
+	args = append(args, match, limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT f.artifact_id, bm25(artifacts_fts) AS rank
 		 FROM artifacts_fts f
-		 JOIN artifacts a ON a.id = f.artifact_id AND a.deleted_at IS NULL
+		 JOIN artifacts a ON a.id = f.artifact_id AND a.deleted_at IS NULL AND `+tier+`
 		 WHERE artifacts_fts MATCH ?
 		 ORDER BY rank
-		 LIMIT ?`, match, limit)
+		 LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("fts search: %w", err)
 	}
@@ -235,6 +262,21 @@ func (r *ArtifactRepo) GetLive(ctx context.Context, id string) (*Artifact, error
 			return nil, fmt.Errorf("get live artifact %q: %w", id, ErrNotFound)
 		}
 		return nil, fmt.Errorf("get live artifact %q: %w", id, err)
+	}
+	return a, nil
+}
+
+// GetLiveWithin is GetLive scoped to a read ceiling: it returns ErrNotFound for an
+// artifact more sensitive than ceiling (§8.17), so a lower-trust reader can neither
+// read above-ceiling content nor distinguish "forbidden" from "does not exist" (no
+// existence leak). The owner (Restricted ceiling) sees every live artifact.
+func (r *ArtifactRepo) GetLiveWithin(ctx context.Context, id string, ceiling kb.PrivacyTier) (*Artifact, error) {
+	a, err := r.GetLive(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !a.PrivacyTier.AtMost(ceiling) {
+		return nil, fmt.Errorf("get artifact %q: %w", id, ErrNotFound)
 	}
 	return a, nil
 }
