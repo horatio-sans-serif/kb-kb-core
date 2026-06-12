@@ -914,6 +914,17 @@ func doGet(h http.Handler, path, token string) *httptest.ResponseRecorder {
 	return rec
 }
 
+// mustJSON decodes an OK response body into v, failing the test on a non-200 or a decode error.
+func mustJSON(t *testing.T, rec *httptest.ResponseRecorder, v any) {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), v); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
 type fakeSearcher struct {
 	results    []search.Result
 	err        error
@@ -1031,6 +1042,95 @@ func TestReadToken_SearchEndToEndFiltersTiers(t *testing.T) {
 	}
 	if strings.Contains(body, sens) || strings.Contains(body, "secret") {
 		t.Errorf("sensitive artifact leaked into the read-token response: %s", body)
+	}
+}
+
+func TestReadToken_GraphReadsFilterTiers(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	seed := func(hash, title, tier string) string {
+		a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{
+			Type: "note", Title: title, BodyMarkdown: title, ContentHash: &hash, PrivacyTier: kb.PrivacyTier(tier)})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		return a.ID
+	}
+	pub := seed("h1", "public note", "public")
+	sens := seed("h2", "secret note", "sensitive")
+
+	// "Shared" is mentioned by both tiers; "SecretOnly" only by the sensitive artifact.
+	shared, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "concept", Name: "Shared"})
+	secretOnly, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "concept", Name: "SecretOnly"})
+	_ = st.Graph.LinkArtifactEntity(ctx, pub, shared)
+	_ = st.Graph.LinkArtifactEntity(ctx, sens, shared)
+	_ = st.Graph.LinkArtifactEntity(ctx, sens, secretOnly)
+	// A public and a sensitive artifact both link to pub (its backlinks).
+	_ = st.Graph.AddLink(ctx, sens, pub, "references", 1.0)
+	srcPub := seed("h3", "another public", "public")
+	_ = st.Graph.AddLink(ctx, srcPub, pub, "references", 1.0)
+
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger()})
+	h := srv.Handler()
+
+	// /entities: owner sees both entities; read token sees only Shared (and its count
+	// drops to the single public mention). SecretOnly never appears.
+	var ownerEnts struct {
+		Entities []struct {
+			Name          string `json:"name"`
+			ArtifactCount int    `json:"artifact_count"`
+		} `json:"entities"`
+	}
+	rec := doGet(h, "/entities", "owner-token-xxxxxxxxxxxx")
+	mustJSON(t, rec, &ownerEnts)
+	if len(ownerEnts.Entities) != 2 {
+		t.Errorf("owner /entities = %+v, want both", ownerEnts.Entities)
+	}
+	rec = doGet(h, "/entities", "read-token-yyyyyyyyyyyyyy")
+	if strings.Contains(rec.Body.String(), "SecretOnly") {
+		t.Errorf("SecretOnly leaked to the read token: %s", rec.Body.String())
+	}
+	var readEnts struct {
+		Entities []struct {
+			Name          string `json:"name"`
+			ArtifactCount int    `json:"artifact_count"`
+		} `json:"entities"`
+	}
+	mustJSON(t, rec, &readEnts)
+	if len(readEnts.Entities) != 1 || readEnts.Entities[0].Name != "Shared" || readEnts.Entities[0].ArtifactCount != 1 {
+		t.Errorf("read-token /entities = %+v, want only Shared(1)", readEnts.Entities)
+	}
+
+	// /entities/{SecretOnly}: hidden from the read token (404), visible to the owner.
+	if rec := doGet(h, "/entities/"+secretOnly, "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusNotFound {
+		t.Errorf("read-token GET SecretOnly = %d, want 404", rec.Code)
+	}
+	if rec := doGet(h, "/entities/"+secretOnly, "owner-token-xxxxxxxxxxxx"); rec.Code != http.StatusOK {
+		t.Errorf("owner GET SecretOnly = %d, want 200", rec.Code)
+	}
+
+	// /artifacts/{pub}/backlinks: read token sees only the public source, not the sensitive one.
+	rec = doGet(h, "/artifacts/"+pub+"/backlinks", "read-token-yyyyyyyyyyyyyy")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read-token backlinks = %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), sens) || strings.Contains(rec.Body.String(), "secret") {
+		t.Errorf("sensitive backlink source leaked: %s", rec.Body.String())
+	}
+	var bl struct {
+		Backlinks []struct {
+			ArtifactID string `json:"artifact_id"`
+		} `json:"backlinks"`
+	}
+	mustJSON(t, rec, &bl)
+	if len(bl.Backlinks) != 1 || bl.Backlinks[0].ArtifactID != srcPub {
+		t.Errorf("read-token backlinks = %+v, want only the public source %s", bl.Backlinks, srcPub)
+	}
+
+	// /artifacts/{sens}/backlinks: the sensitive artifact is itself above the ceiling → 404.
+	if rec := doGet(h, "/artifacts/"+sens+"/backlinks", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusNotFound {
+		t.Errorf("read-token backlinks of sensitive artifact = %d, want 404", rec.Code)
 	}
 }
 

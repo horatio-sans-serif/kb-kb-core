@@ -23,7 +23,7 @@ func TestGraph_ListEntitiesByMentionCount(t *testing.T) {
 	_ = st.Graph.LinkArtifactEntity(ctx, b, orphan)
 	_ = st.Artifacts.SoftDelete(ctx, b) // orphan's only mention is now tombstoned
 
-	got, err := st.Graph.ListEntities(ctx, 10)
+	got, err := st.Graph.ListEntities(ctx, 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestGraph_Backlinks(t *testing.T) {
 	_ = st.Graph.AddLink(ctx, target, b, "references", 1.0)
 	_ = st.Artifacts.SoftDelete(ctx, gone)
 
-	back, err := st.Graph.Backlinks(ctx, target, 10)
+	back, err := st.Graph.Backlinks(ctx, target, 10, kb.Restricted)
 	if err != nil {
 		t.Fatalf("backlinks: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestGraph_EntityArtifactsLimit(t *testing.T) {
 		a := art(t, st, "h"+string(rune('a'+i)))
 		_ = st.Graph.LinkArtifactEntity(ctx, a, id)
 	}
-	refs, err := st.Graph.EntityArtifacts(ctx, id, 3)
+	refs, err := st.Graph.EntityArtifacts(ctx, id, 3, kb.Restricted)
 	if err != nil {
 		t.Fatalf("entity artifacts: %v", err)
 	}

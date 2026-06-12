@@ -220,15 +220,20 @@ type EntityWithCount struct {
 
 // ListEntities returns the entities mentioned by at least one live artifact, most-
 // mentioned first — the global entity index.
-func (r *GraphRepo) ListEntities(ctx context.Context, limit int) ([]EntityWithCount, error) {
+func (r *GraphRepo) ListEntities(ctx context.Context, limit int, ceiling kb.PrivacyTier) ([]EntityWithCount, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	// The count is over in-ceiling artifacts only, and an entity mentioned solely by
+	// above-ceiling artifacts drops out entirely (the JOIN yields no rows for it), so
+	// a lower-trust reader neither sees it nor infers its hidden mention count (§8.17).
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
+	args := append(append([]any{}, tierArgs...), limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT e.id, e.kind, e.name, e.aliases, COUNT(*) AS n FROM entities e
 		 JOIN artifact_entities ae ON ae.entity_id = e.id
-		 JOIN artifacts a ON a.id = ae.artifact_id AND a.deleted_at IS NULL
-		 GROUP BY e.id, e.kind, e.name, e.aliases ORDER BY n DESC, e.name LIMIT ?`, limit)
+		 JOIN artifacts a ON a.id = ae.artifact_id AND a.deleted_at IS NULL AND `+tier+`
+		 GROUP BY e.id, e.kind, e.name, e.aliases ORDER BY n DESC, e.name LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list entities: %w", err)
 	}
@@ -276,14 +281,16 @@ const graphDefaultLimit = 50
 
 // EntityArtifacts returns up to limit live artifacts that mention an entity, with
 // their display fields (id, title, url), oldest first.
-func (r *GraphRepo) EntityArtifacts(ctx context.Context, entityID string, limit int) ([]ArtifactRef, error) {
+func (r *GraphRepo) EntityArtifacts(ctx context.Context, entityID string, limit int, ceiling kb.PrivacyTier) ([]ArtifactRef, error) {
 	if limit <= 0 {
 		limit = graphDefaultLimit
 	}
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
+	args := append(append([]any{}, tierArgs...), entityID, limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT a.id, a.title, a.canonical_url FROM artifact_entities ae
-		 JOIN artifacts a ON a.id = ae.artifact_id AND a.deleted_at IS NULL
-		 WHERE ae.entity_id = ? ORDER BY a.id LIMIT ?`, entityID, limit)
+		 JOIN artifacts a ON a.id = ae.artifact_id AND a.deleted_at IS NULL AND `+tier+`
+		 WHERE ae.entity_id = ? ORDER BY a.id LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("artifacts for entity %q: %w", entityID, err)
 	}
@@ -301,14 +308,16 @@ type Backlink struct {
 
 // Backlinks returns up to limit live artifacts that link to artifactID (incoming
 // edges) with their display fields — the reverse-direction graph query (§8.7).
-func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string, limit int) ([]Backlink, error) {
+func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string, limit int, ceiling kb.PrivacyTier) ([]Backlink, error) {
 	if limit <= 0 {
 		limit = graphDefaultLimit
 	}
+	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
+	args := append(append([]any{}, tierArgs...), artifactID, limit)
 	rows, err := r.rq.QueryContext(ctx,
 		`SELECT DISTINCT l.src_id, a.title, a.canonical_url, l.relation FROM links l
-		 JOIN artifacts a ON a.id = l.src_id AND a.deleted_at IS NULL
-		 WHERE l.dst_id = ? ORDER BY l.src_id, l.relation LIMIT ?`, artifactID, limit)
+		 JOIN artifacts a ON a.id = l.src_id AND a.deleted_at IS NULL AND `+tier+`
+		 WHERE l.dst_id = ? ORDER BY l.src_id, l.relation LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("backlinks for %q: %w", artifactID, err)
 	}

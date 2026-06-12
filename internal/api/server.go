@@ -135,9 +135,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /review", s.requireAuth(http.HandlerFunc(s.handleReview)))
 	mux.Handle("GET /review/due", s.requireAuth(http.HandlerFunc(s.handleReviewDue)))
 	mux.Handle("GET /graph/{id}", s.requireAuth(http.HandlerFunc(s.handleGraph)))
-	mux.Handle("GET /entities", s.requireAuth(http.HandlerFunc(s.handleListEntities)))
-	mux.Handle("GET /entities/{id}", s.requireAuth(http.HandlerFunc(s.handleGetEntity)))
-	mux.Handle("GET /artifacts/{id}/backlinks", s.requireAuth(http.HandlerFunc(s.handleBacklinks)))
+	mux.Handle("GET /entities", s.requireRead(http.HandlerFunc(s.handleListEntities)))
+	mux.Handle("GET /entities/{id}", s.requireRead(http.HandlerFunc(s.handleGetEntity)))
+	mux.Handle("GET /artifacts/{id}/backlinks", s.requireRead(http.HandlerFunc(s.handleBacklinks)))
 	mux.Handle("GET /conflicts", s.requireAuth(http.HandlerFunc(s.handleListConflicts)))
 	mux.Handle("POST /conflicts/{id}", s.requireAuth(http.HandlerFunc(s.handleResolveConflict)))
 	mux.Handle("GET /topics", s.requireAuth(http.HandlerFunc(s.handleListTopics)))
@@ -1241,7 +1241,7 @@ type backlinkJSON struct {
 
 // handleListEntities lists the knowledge-graph entities by mention count (§8.7).
 func (s *Server) handleListEntities(w http.ResponseWriter, r *http.Request) {
-	ents, err := s.deps.Store.Graph.ListEntities(r.Context(), maxSurfaceLimit)
+	ents, err := s.deps.Store.Graph.ListEntities(r.Context(), maxSurfaceLimit, readCeiling(r.Context()))
 	if err != nil {
 		s.serverError(w, "list entities", err)
 		return
@@ -1264,6 +1264,7 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	ceiling := readCeiling(ctx)
 	e, err := s.deps.Store.Graph.GetEntity(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1273,9 +1274,15 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "get entity", err)
 		return
 	}
-	refs, err := s.deps.Store.Graph.EntityArtifacts(ctx, id, maxSurfaceLimit)
+	refs, err := s.deps.Store.Graph.EntityArtifacts(ctx, id, maxSurfaceLimit, ceiling)
 	if err != nil {
 		s.serverError(w, "entity artifacts", err)
+		return
+	}
+	// Hide an entity a lower-trust reader cannot see any artifact for: if no in-ceiling
+	// artifact mentions it, it is indistinguishable from a non-existent entity (404).
+	if ceiling != kb.Restricted && len(refs) == 0 {
+		http.Error(w, "unknown entity", http.StatusNotFound)
 		return
 	}
 	out := entityDetailJSON{ID: e.ID, Kind: e.Kind, Name: e.Name, Aliases: e.Aliases, Artifacts: make([]graphNodeJSON, 0, len(refs))}
@@ -1293,7 +1300,10 @@ func (s *Server) handleBacklinks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	if _, err := s.deps.Store.Artifacts.GetLive(ctx, id); err != nil {
+	ceiling := readCeiling(ctx)
+	// GetLiveWithin: a read token cannot query backlinks of an artifact above its
+	// ceiling (it gets 404, the same as a missing one).
+	if _, err := s.deps.Store.Artifacts.GetLiveWithin(ctx, id, ceiling); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "unknown artifact", http.StatusNotFound)
 			return
@@ -1301,7 +1311,7 @@ func (s *Server) handleBacklinks(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "backlinks artifact", err)
 		return
 	}
-	links, err := s.deps.Store.Graph.Backlinks(ctx, id, maxSurfaceLimit)
+	links, err := s.deps.Store.Graph.Backlinks(ctx, id, maxSurfaceLimit, ceiling)
 	if err != nil {
 		s.serverError(w, "backlinks", err)
 		return
