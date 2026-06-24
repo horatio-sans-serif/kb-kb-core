@@ -69,3 +69,8 @@ return `404` (indistinguishable from a missing one — no existence oracle), and
 `/ask` and `/search` over a ceiling-filtered corpus can still reveal whether a
 query matches above-ceiling content (an empty answer) — an inherent property of
 answering for a semi-trusted reader; no id, title, or body is exposed.
+
+Every read that surfaces a **sensitive or restricted** artifact (via `/search`,
+`/surface`, `/graph`, or `/ask`) is recorded in a local access audit log — actor
+(owner or read-token), action, artifact, and tier. `GET /audit` (owner-only)
+lists it newest-first, with `?artifact_id=` and `?limit=` filters.

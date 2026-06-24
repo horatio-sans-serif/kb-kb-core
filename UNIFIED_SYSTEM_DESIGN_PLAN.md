@@ -835,7 +835,7 @@ _Gap 11. New. From: shelf (AutoMerge / Tailscale)._
 
 ### 8.17 Privacy and Access Control
 
-_Implemented (Phase C). Audit log still deferred._
+_Implemented (Phase C read surface + Phase 18 audit log)._
 
 - Four tiers: public, personal, sensitive, restricted; default per source
   (`KB_DEFAULT_PRIVACY`); per-artifact override. `PrivacyTier.Rank`/`AtMost`
@@ -864,11 +864,20 @@ _Implemented (Phase C). Audit log still deferred._
   bounded existence oracle (empty answer) by construction; no id/title/body
   leaks.
 - Export/render filter enforces tiers on every rendered artifact (pre-Phase-C).
-- _Deferred:_ audit log of access to sensitive artifacts (schema stub exists in
-  migration 0001; no read/export path writes to it yet). The cross-tier
-  relevance-score influence (an engaged sensitive artifact shapes the score of
-  public ones) is a known limitation — acceptable because the score is never
-  serialized out to a read token.
+- **Access audit log (Phase 18).** Every read that surfaces a sensitive or
+  restricted artifact records one `audit_log` entry — actor (owner | read-token),
+  action (the endpoint), artifact id, and tier — across `/search`, `/surface`,
+  `/graph`, and `/ask`. The middleware tags the request with the actor; a
+  best-effort write never fails the read it describes. Public/personal accesses
+  are not logged (high-volume, low-signal). `audit_log` is local-only (never
+  synced; no FK to artifacts, so a row survives the artifact's compaction). `GET
+/audit` (owner-only — the log is itself sensitive) inspects it.
+- _Deferred:_ audit-log retention/GC (the log grows unbounded); auditing
+  list-only reads that expose titles without loading the full artifact
+  (entities/backlinks); exporting the audit log. The cross-tier relevance-score
+  influence (an engaged sensitive artifact shapes the score of public ones) is a
+  known limitation — acceptable because the score is never serialized out to a
+  read token.
 
 ---
 
