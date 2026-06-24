@@ -1117,6 +1117,111 @@ func TestReadCeiling_FailsClosedWhenUntagged(t *testing.T) {
 	}
 }
 
+func TestAudit_SensitiveReadsRecorded(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	seed := func(hash, title, tier string) string {
+		a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{
+			Type: "note", Title: title, BodyMarkdown: title, ContentHash: &hash, PrivacyTier: kb.PrivacyTier(tier)})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		return a.ID
+	}
+	pub := seed("h1", "apple public", "public")
+	sens := seed("h2", "apple secret", "sensitive")
+
+	searcher := search.NewSearcher(st, staticLLM{}, "m", false)
+	// The read token's ceiling is Sensitive, so it can read the sensitive artifact —
+	// and that access must be audited.
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Sensitive, Logger: discardLogger(), Search: searcher})
+	h := srv.Handler()
+
+	// The read token searches; both artifacts match. Only the sensitive one is audited.
+	if rec := doGet(h, "/search?mode=keyword&q=apple", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusOK {
+		t.Fatalf("read-token search = %d: %s", rec.Code, rec.Body.String())
+	}
+	rows, err := st.Audit.Recent(ctx, 10)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("audit rows after read-token search = %d, want 1 (only the sensitive artifact)", len(rows))
+	}
+	if rows[0].Actor != "read-token" || rows[0].Action != "search" || rows[0].ArtifactID != sens || rows[0].PrivacyTier != kb.Sensitive {
+		t.Errorf("audit row = %+v, want read-token/search/sensitive %s", rows[0], sens)
+	}
+
+	// The owner searches; the sensitive access is audited under actor=owner.
+	if rec := doGet(h, "/search?mode=keyword&q=apple", "owner-token-xxxxxxxxxxxx"); rec.Code != http.StatusOK {
+		t.Fatalf("owner search = %d: %s", rec.Code, rec.Body.String())
+	}
+	rows, _ = st.Audit.Recent(ctx, 10)
+	if len(rows) != 2 {
+		t.Fatalf("audit rows after owner search = %d, want 2", len(rows))
+	}
+	if rows[0].Actor != "owner" || rows[0].ArtifactID != sens {
+		t.Errorf("newest audit row = %+v, want owner accessing the sensitive artifact", rows[0])
+	}
+
+	// A search matching only the public artifact records nothing.
+	if rec := doGet(h, "/search?mode=keyword&q=public", "owner-token-xxxxxxxxxxxx"); rec.Code != http.StatusOK {
+		t.Fatalf("public-only search = %d: %s", rec.Code, rec.Body.String())
+	}
+	rows, _ = st.Audit.Recent(ctx, 10)
+	if len(rows) != 2 {
+		t.Errorf("public-only access added audit rows (%d), want still 2 — public is not audited", len(rows))
+	}
+	// Sanity: the public artifact never appears in the audit log.
+	if hist, _ := st.Audit.ByArtifact(ctx, pub, 10); len(hist) != 0 {
+		t.Errorf("public artifact %s was audited (%d rows), want 0", pub, len(hist))
+	}
+}
+
+func TestAudit_Endpoint(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	if err := st.Audit.Record(ctx,
+		store.AuditEntry{Actor: "read-token", Action: "search", ArtifactID: "01A", PrivacyTier: kb.Sensitive},
+		store.AuditEntry{Actor: "owner", Action: "graph", ArtifactID: "01B", PrivacyTier: kb.Restricted},
+	); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger()})
+	h := srv.Handler()
+
+	// The read token cannot see the audit log (owner-only): 401.
+	if rec := doGet(h, "/audit", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("read-token GET /audit = %d, want 401 (owner-only)", rec.Code)
+	}
+
+	// The owner lists all entries, newest first.
+	var out struct {
+		Audit []struct {
+			Actor      string `json:"actor"`
+			Action     string `json:"action"`
+			ArtifactID string `json:"artifact_id"`
+		} `json:"audit"`
+	}
+	mustJSON(t, doGet(h, "/audit", "owner-token-xxxxxxxxxxxx"), &out)
+	if len(out.Audit) != 2 || out.Audit[0].Action != "graph" {
+		t.Fatalf("owner /audit = %+v, want 2 entries newest-first", out.Audit)
+	}
+
+	// ?artifact_id filters to one artifact's history.
+	var filtered struct {
+		Audit []struct {
+			ArtifactID string `json:"artifact_id"`
+		} `json:"audit"`
+	}
+	mustJSON(t, doGet(h, "/audit?artifact_id=01A", "owner-token-xxxxxxxxxxxx"), &filtered)
+	if len(filtered.Audit) != 1 || filtered.Audit[0].ArtifactID != "01A" {
+		t.Errorf("filtered /audit = %+v, want only 01A", filtered.Audit)
+	}
+}
+
 func TestReadToken_PersonalCeilingMidLattice(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()

@@ -1804,3 +1804,64 @@ it; Semantic uses the index when present and falls back to the exact brute-force
 on any index error. Proven end to end against the real extension: the Searcher backed
 by a real vec0 index returns the nearest live artifact first; default, vec0, and
 vec0+crsqlite builds all compile and pass.
+
+---
+
+# Phase C — Privacy-ceiling read surface (§8.17)
+
+**Status: Complete.** A per-principal privacy read ceiling threads through every read
+path as a SQL filter (`kb.TierClause`: owner `1 = 1`, lower ceiling `IN (...)`, invalid
+`1 = 0` fail-closed). Two principals authenticate: the owner (`KB_API_TOKEN`,
+Restricted, sees everything) and an optional lower-trust read token (`KB_READ_TOKEN`,
+ceiling `KB_READ_TIER` ∈ {public,personal,sensitive}; `restricted` rejected).
+`requireRead` tags the request context with the ceiling; handlers read it via
+`readCeiling(ctx)` and pass it explicitly into the store. Read routes — `/search`,
+`/ask`, `/surface`, `/entities`, `/entities/{id}`, `/artifacts/{id}/backlinks`,
+`/topics`, `/topics/{id}`, `/conflicts`, `/graph/{id}` — moved to `requireRead`; writes
+stay owner-only. Above-ceiling artifacts/entities/topics/graph nodes return 404
+(identical to missing — no existence oracle); `/surface` clamps a requested
+`privacy_ceiling` down to the token's. Verified by two adversarial security reviews and
+a seven-dimension comprehensive review (no leak).
+
+**Deferred (now Phase 18):** the access audit log §8.17 calls for.
+
+# Phase 18 — Access audit log (§8.17)
+
+**Goal:** record every access that surfaces a sensitive or restricted artifact, so a
+read by the lower-trust token (or a compromised owner) to sensitive content is
+forensically traceable. The `audit_log` table exists since migration 0001 (local-only,
+never synced — each device logs its own accesses; no FK to artifacts, so rows survive
+compaction).
+
+## Stage 1: AuditRepo
+
+**Goal:** `store.AuditRepo` with `Record(ctx, ...AuditEntry)` (batched insert) and
+read methods `Recent(ctx, limit)` / `ByArtifact(ctx, id, limit)`. Migration 0015 adds
+indexes on `created_at` and `artifact_id`.
+**Tests:** record + Recent ordering (newest first); ByArtifact filter; empty Record
+is a no-op; nullable artifact_id/tier.
+
+## Stage 2: Audit the content-exposing reads
+
+**Goal:** tag the request context with the actor (owner | read-token) in
+requireRead/requireAuth (sibling of the ceiling). A `Server.audit` helper records every
+returned artifact whose tier ≥ sensitive, with the actor and the action (the endpoint).
+Wire `/search`, `/surface`, `/graph`, and `/ask` (rag.Source gains PrivacyTier so the
+handler sees it). Public/personal accesses are not logged (high-noise, low-signal).
+**Tests:** a read token (sensitive ceiling) reading a sensitive artifact writes one
+audit row with actor=read-token; an owner reading sensitive writes actor=owner; a
+public-only read writes nothing.
+
+## Stage 3: GET /audit (owner-only)
+
+**Goal:** `GET /audit` (requireAuth — audit data is itself sensitive) returns recent
+entries (and `?artifact_id=` filter). Makes the log inspectable.
+**Tests:** owner lists entries; read token gets 401; artifact_id filter.
+
+## Stage 4: Docs
+
+Update §8.17 (audit log no longer deferred) and the README API section.
+
+**Deferred:** audit-log retention/GC (the log grows unbounded); auditing list-only
+reads that expose titles without loading full artifacts (entities/backlinks); exporting
+the audit log.

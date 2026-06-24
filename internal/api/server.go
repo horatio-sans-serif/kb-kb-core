@@ -143,6 +143,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /topics", s.requireRead(http.HandlerFunc(s.handleListTopics)))
 	mux.Handle("GET /topics/{id}", s.requireRead(http.HandlerFunc(s.handleGetTopic)))
 	mux.Handle("GET /lifecycle", s.requireAuth(http.HandlerFunc(s.handleLifecycle)))
+	mux.Handle("GET /audit", s.requireAuth(http.HandlerFunc(s.handleAudit)))
 	return mux
 }
 
@@ -163,7 +164,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		}
 		// The owner sees everything; set the ceiling explicitly so any read handler on
 		// an owner route gets Restricted from context rather than the bare default.
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ceilingKey{}, kb.Restricted)))
+		ctx := context.WithValue(r.Context(), ceilingKey{}, kb.Restricted)
+		ctx = context.WithValue(ctx, actorKey{}, actorOwner)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -182,16 +185,19 @@ func (s *Server) requireRead(next http.Handler) http.Handler {
 		}
 		token := []byte(h[len(prefix):])
 		var ceiling kb.PrivacyTier
+		var actor string
 		switch {
 		case s.deps.Token != "" && subtle.ConstantTimeCompare(token, []byte(s.deps.Token)) == 1:
-			ceiling = kb.Restricted
+			ceiling, actor = kb.Restricted, actorOwner
 		case s.deps.ReadToken != "" && subtle.ConstantTimeCompare(token, []byte(s.deps.ReadToken)) == 1:
-			ceiling = s.deps.ReadCeiling
+			ceiling, actor = s.deps.ReadCeiling, actorReadToken
 		default:
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ceilingKey{}, ceiling)))
+		ctx := context.WithValue(r.Context(), ceilingKey{}, ceiling)
+		ctx = context.WithValue(ctx, actorKey{}, actor)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -216,6 +222,101 @@ func readCeiling(ctx context.Context) kb.PrivacyTier {
 		return c
 	}
 	return kb.Public
+}
+
+// actorKey is the context key under which the auth middleware records the
+// authenticated principal — the actor written to the audit log (§8.17).
+type actorKey struct{}
+
+const (
+	actorOwner     = "owner"
+	actorReadToken = "read-token"
+)
+
+// readActor returns the authenticated principal recorded by the middleware, or
+// "unknown" if absent (a handler reached without auth — a bug, but audit must never
+// drop the record silently).
+func readActor(ctx context.Context) string {
+	if a, ok := ctx.Value(actorKey{}).(string); ok && a != "" {
+		return a
+	}
+	return "unknown"
+}
+
+// auditSensitive records, for each accessed artifact whose tier is sensitive or
+// restricted, one audit-log entry (§8.17): who (the actor), what (action, typically
+// the endpoint), which artifact, and its tier. Public/personal accesses are not
+// logged — high-volume, low-signal. A best-effort write: an audit failure is logged
+// but never fails the read it describes.
+func (s *Server) auditSensitive(ctx context.Context, action string, arts ...*kb.Artifact) {
+	if s.deps.Store == nil {
+		return
+	}
+	actor := readActor(ctx)
+	var entries []store.AuditEntry
+	for _, a := range arts {
+		if a == nil || a.PrivacyTier.Rank() < kb.Sensitive.Rank() {
+			continue
+		}
+		entries = append(entries, store.AuditEntry{
+			Actor: actor, Action: action, ArtifactID: a.ID, PrivacyTier: a.PrivacyTier,
+		})
+	}
+	if len(entries) == 0 {
+		return
+	}
+	if err := s.deps.Store.Audit.Record(ctx, entries...); err != nil {
+		s.deps.Logger.Warn("audit record failed", "action", action, "err", err)
+	}
+}
+
+type auditEntryJSON struct {
+	Actor       string `json:"actor"`
+	Action      string `json:"action"`
+	ArtifactID  string `json:"artifact_id,omitempty"`
+	PrivacyTier string `json:"privacy_tier,omitempty"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// handleAudit returns the access audit log, newest first (§8.17). Owner-only
+// (requireAuth): the log itself is sensitive — it reveals what was read and when.
+// ?artifact_id filters to one artifact's history; ?limit caps the result.
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	limit := maxSurfaceLimit
+	if ls := r.URL.Query().Get("limit"); ls != "" {
+		n, err := strconv.Atoi(ls)
+		if err != nil || n < 1 || n > maxSurfaceLimit {
+			http.Error(w, fmt.Sprintf("limit must be between 1 and %d", maxSurfaceLimit), http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+
+	ctx := r.Context()
+	var entries []store.AuditEntry
+	var err error
+	if aid := r.URL.Query().Get("artifact_id"); aid != "" {
+		if len(aid) > maxSourceIDBytes || !ingest.ValidText(aid, false) {
+			http.Error(w, "invalid artifact_id", http.StatusBadRequest)
+			return
+		}
+		entries, err = s.deps.Store.Audit.ByArtifact(ctx, aid, limit)
+	} else {
+		entries, err = s.deps.Store.Audit.Recent(ctx, limit)
+	}
+	if err != nil {
+		s.serverError(w, "audit", err)
+		return
+	}
+
+	out := make([]auditEntryJSON, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, auditEntryJSON{
+			Actor: e.Actor, Action: e.Action, ArtifactID: e.ArtifactID,
+			PrivacyTier: string(e.PrivacyTier), CreatedAt: e.CreatedAt,
+		})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"audit": out})
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -874,6 +975,7 @@ func (s *Server) handleSurface(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "surface", err)
 		return
 	}
+	s.auditSensitive(r.Context(), "surface", arts...)
 
 	out := make([]surfaceItemJSON, 0, len(arts))
 	for _, a := range arts {
@@ -1419,17 +1521,20 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	for _, e := range ents {
 		out.Entities = append(out.Entities, entityJSON{Kind: e.Kind, Name: e.Name, Aliases: e.Aliases})
 	}
+	accessed := []*kb.Artifact{start}
 	for _, cid := range connectedIDs {
 		a, err := s.deps.Store.Artifacts.GetLiveWithin(ctx, cid, ceiling)
 		if err != nil {
 			continue // tombstoned or moved above ceiling between traversal and load — drop
 		}
+		accessed = append(accessed, a)
 		node := graphNodeJSON{ArtifactID: cid, Title: a.Title}
 		if a.CanonicalURL != nil {
 			node.URL = *a.CanonicalURL
 		}
 		out.Connected = append(out.Connected, node)
 	}
+	s.auditSensitive(ctx, "graph", accessed...)
 	s.writeJSON(w, http.StatusOK, out)
 }
 
@@ -1626,6 +1731,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := searchResponse{Query: q, Results: make([]searchResultJSON, 0, len(hits))}
+	accessed := make([]*kb.Artifact, 0, len(hits))
 	for _, h := range hits {
 		// GetLiveWithin: live-scoped and re-checks the ceiling at load time (the hits
 		// are already ceiling-filtered; this is defense in depth and drops a tombstone
@@ -1634,12 +1740,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue // hard-deleted / tombstoned / above-ceiling between ranking and load — drop
 		}
+		accessed = append(accessed, a)
 		res := searchResultJSON{ArtifactID: h.ArtifactID, Title: a.Title, Score: h.Score}
 		if a.CanonicalURL != nil {
 			res.URL = *a.CanonicalURL
 		}
 		out.Results = append(out.Results, res)
 	}
+	s.auditSensitive(ctx, "search", accessed...)
 	s.writeJSON(w, http.StatusOK, out)
 }
 
@@ -1663,6 +1771,13 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "ask", err)
 		return
 	}
+	// The answer's sources are the artifact bodies fed to the LLM — the most direct
+	// content exposure; audit the sensitive ones.
+	accessed := make([]*kb.Artifact, 0, len(ans.Sources))
+	for _, src := range ans.Sources {
+		accessed = append(accessed, &kb.Artifact{ID: src.ArtifactID, PrivacyTier: src.PrivacyTier})
+	}
+	s.auditSensitive(r.Context(), "ask", accessed...)
 	s.writeJSON(w, http.StatusOK, ans)
 }
 

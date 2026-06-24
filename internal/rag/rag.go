@@ -73,11 +73,12 @@ type Retriever interface {
 // (1-based) is the [n] the synthesized answer cites. Cited reports whether the answer
 // actually referenced that [n].
 type Source struct {
-	ArtifactID string  `json:"artifact_id"`
-	Title      string  `json:"title,omitempty"`
-	URL        string  `json:"url,omitempty"`
-	Score      float64 `json:"score"`
-	Cited      bool    `json:"cited"`
+	ArtifactID  string         `json:"artifact_id"`
+	Title       string         `json:"title,omitempty"`
+	URL         string         `json:"url,omitempty"`
+	Score       float64        `json:"score"`
+	Cited       bool           `json:"cited"`
+	PrivacyTier kb.PrivacyTier `json:"privacy_tier,omitempty"`
 }
 
 // Answer is a synthesized response plus the sources it cites. InvalidCitations holds
@@ -97,6 +98,7 @@ type candidate struct {
 	body  string
 	url   string
 	score float64
+	tier  kb.PrivacyTier
 }
 
 // Engine answers questions over retrieved artifacts.
@@ -156,7 +158,7 @@ func (e *Engine) Answer(ctx context.Context, query string, k int, ceiling kb.Pri
 		if err != nil {
 			continue // artifact deleted/gone/above-ceiling between ranking and load — drop it
 		}
-		c := candidate{id: a.ID, title: a.Title, body: a.BodyMarkdown, score: h.Score}
+		c := candidate{id: a.ID, title: a.Title, body: a.BodyMarkdown, score: h.Score, tier: a.PrivacyTier}
 		if a.CanonicalURL != nil {
 			c.url = *a.CanonicalURL
 		}
@@ -176,7 +178,7 @@ func (e *Engine) Answer(ctx context.Context, query string, k int, ceiling kb.Pri
 	sources := make([]Source, len(selected))
 	var prompt strings.Builder
 	for i, c := range selected {
-		sources[i] = Source{ArtifactID: c.id, Title: c.title, URL: c.url, Score: c.score}
+		sources[i] = Source{ArtifactID: c.id, Title: c.title, URL: c.url, Score: c.score, PrivacyTier: c.tier}
 		// Fence each source so injected text in a (possibly attacker-controlled)
 		// body can't impersonate the prompt scaffold.
 		fmt.Fprintf(&prompt, "<<<SOURCE %d: %s>>>\n%s\n<<<END SOURCE %d>>>\n\n",
