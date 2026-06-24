@@ -867,17 +867,21 @@ _Implemented (Phase C read surface + Phase 18 audit log)._
 - **Access audit log (Phase 18).** Every read that surfaces a sensitive or
   restricted artifact records one `audit_log` entry — actor (owner | read-token),
   action (the endpoint), artifact id, and tier — across `/search`, `/surface`,
-  `/graph`, and `/ask`. The middleware tags the request with the actor; a
-  best-effort write never fails the read it describes. Public/personal accesses
-  are not logged (high-volume, low-signal). `audit_log` is local-only (never
-  synced; no FK to artifacts, so a row survives the artifact's compaction). `GET
-/audit` (owner-only — the log is itself sensitive) inspects it.
-- _Deferred:_ audit-log retention/GC (the log grows unbounded); auditing
-  list-only reads that expose titles without loading the full artifact
-  (entities/backlinks); exporting the audit log. The cross-tier relevance-score
-  influence (an engaged sensitive artifact shapes the score of public ones) is a
-  known limitation — acceptable because the score is never serialized out to a
-  read token.
+  `/graph`, `/ask`, and the detail routes that disclose a sensitive title
+  (`/entities/{id}`, `/artifacts/{id}/backlinks`, `/topics/{id}`). The middleware
+  tags the request with the actor; a best-effort write logs at Error on failure
+  (alertable) but never fails the read it describes. Public/personal accesses are
+  not logged (high-volume, low-signal). `audit_log` is local-only (never synced;
+  no FK to artifacts, so a row survives the artifact's compaction). `GET /audit`
+  (owner-only — the log is itself sensitive) inspects it. A `/ask` synthesis error
+  does not record the sources the on-device LLM was already handed — no client
+  exposure occurs on that path.
+- _Deferred:_ audit-log retention/GC (the log grows unbounded); exporting the
+  audit log; auditing the bare `/entities` and `/topics` list endpoints (they
+  expose entity names / topic labels and counts, not artifact titles — lower
+  signal). The cross-tier relevance-score influence (an engaged sensitive
+  artifact shapes the score of public ones) is a known limitation — acceptable
+  because the score is never serialized out to a read token.
 
 ---
 

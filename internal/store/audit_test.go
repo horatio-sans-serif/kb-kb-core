@@ -53,6 +53,26 @@ func TestAuditRepo_RecordAndRecent(t *testing.T) {
 	}
 }
 
+func TestAuditRepo_NullableArtifactAndTier(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	// An entry not tied to a single artifact stores NULL artifact_id/privacy_tier and
+	// reads back as empty strings.
+	if err := st.Audit.Record(ctx, AuditEntry{Actor: "owner", Action: "export"}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	rows, err := st.Audit.Recent(ctx, 10)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("recent = %d, want 1", len(rows))
+	}
+	if rows[0].ArtifactID != "" || rows[0].PrivacyTier != "" {
+		t.Errorf("nullable round-trip = %+v, want empty artifact_id and tier", rows[0])
+	}
+}
+
 func TestAuditRepo_ByArtifact(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

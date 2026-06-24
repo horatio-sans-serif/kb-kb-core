@@ -1862,6 +1862,20 @@ entries (and `?artifact_id=` filter). Makes the log inspectable.
 
 Update §8.17 (audit log no longer deferred) and the README API section.
 
-**Deferred:** audit-log retention/GC (the log grows unbounded); auditing list-only
-reads that expose titles without loading full artifacts (entities/backlinks); exporting
-the audit log.
+## Stage 5: Review realization
+
+**Status: Complete.** An independent security + code review followed. The one
+actionable security finding — `/entities/{id}`, `/artifacts/{id}/backlinks`, and
+`/topics/{id}` disclosed sensitive artifact _titles_ to the read token unaudited — was
+realized: ArtifactRef/Backlink/TopicMember carry `PrivacyTier`, the audit helper was
+refactored to a ref-based core (`auditAccess`) plus an artifact wrapper
+(`auditArtifacts`, also removing the /ask throwaway-struct), and all three detail
+handlers now audit. The best-effort audit-write failure logs at Error (alertable).
+Tests added: nullable round-trip, /audit limit/artifact_id validation, and the three
+title-disclosure routes.
+
+**Deferred:** audit-log retention/GC (the log grows unbounded); exporting the audit
+log; auditing the bare `/entities` and `/topics` list endpoints (they expose entity
+names / topic labels and aggregate counts, not artifact titles — lower signal). A
+`/ask` synthesis _error_ does not record the sources the local LLM was already handed
+(no client exposure occurs on that path).

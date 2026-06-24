@@ -1222,6 +1222,76 @@ func TestAudit_Endpoint(t *testing.T) {
 	}
 }
 
+func TestAudit_TitleDisclosureRoutesRecorded(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	seed := func(hash, title, tier string) string {
+		a, err := st.Artifacts.UpsertByContentHash(ctx, &store.Artifact{
+			Type: "note", Title: title, BodyMarkdown: title, ContentHash: &hash, PrivacyTier: kb.PrivacyTier(tier)})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		return a.ID
+	}
+	// sens is mentioned by an entity and a topic; src (sensitive) links to sens (its
+	// backlink). A sensitive-ceiling read token can see all three — and each title
+	// disclosure must now leave an audit trail.
+	sens := seed("h1", "secret note", "sensitive")
+	src := seed("h2", "secret source", "sensitive")
+	ent, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "concept", Name: "Topic"})
+	_ = st.Graph.LinkArtifactEntity(ctx, sens, ent)
+	top := &store.Topic{Label: "T"}
+	if err := st.Topics.Create(ctx, top); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Topics.Assign(ctx, sens, top.ID, 0.9)
+	_ = st.Graph.AddLink(ctx, src, sens, "references", 1.0)
+
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Sensitive, Logger: discardLogger()})
+	h := srv.Handler()
+	const rt = "read-token-yyyyyyyyyyyyyy"
+
+	for _, p := range []string{"/entities/" + ent, "/topics/" + top.ID, "/artifacts/" + sens + "/backlinks"} {
+		if rec := doGet(h, p, rt); rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", p, rec.Code, rec.Body.String())
+		}
+	}
+
+	rows, err := st.Audit.Recent(ctx, 10)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	gotActions := map[string]bool{}
+	for _, r := range rows {
+		if r.Actor != "read-token" {
+			t.Errorf("audit row actor = %q, want read-token: %+v", r.Actor, r)
+		}
+		gotActions[r.Action] = true
+	}
+	for _, want := range []string{"entity", "topic", "backlinks"} {
+		if !gotActions[want] {
+			t.Errorf("no audit entry for action %q (title disclosure unaudited); rows=%+v", want, rows)
+		}
+	}
+}
+
+func TestAudit_EndpointValidation(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx", Logger: discardLogger()})
+	h := srv.Handler()
+	const owner = "owner-token-xxxxxxxxxxxx"
+	if rec := doGet(h, "/audit?limit=0", owner); rec.Code != http.StatusBadRequest {
+		t.Errorf("limit=0 = %d, want 400", rec.Code)
+	}
+	if rec := doGet(h, "/audit?limit=99999", owner); rec.Code != http.StatusBadRequest {
+		t.Errorf("limit over cap = %d, want 400", rec.Code)
+	}
+	if rec := doGet(h, "/audit?artifact_id=bad%0Aid", owner); rec.Code != http.StatusBadRequest {
+		t.Errorf("invalid artifact_id (control char) = %d, want 400", rec.Code)
+	}
+}
+
 func TestReadToken_PersonalCeilingMidLattice(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()

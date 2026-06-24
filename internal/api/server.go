@@ -243,31 +243,52 @@ func readActor(ctx context.Context) string {
 	return "unknown"
 }
 
-// auditSensitive records, for each accessed artifact whose tier is sensitive or
+// auditRef is the minimal access fact the audit log needs: which artifact, at what
+// tier. It lets a handler audit lightweight projections (entity/backlink/topic refs)
+// without a full *kb.Artifact.
+type auditRef struct {
+	id   string
+	tier kb.PrivacyTier
+}
+
+// auditAccess records, for each accessed artifact whose tier is sensitive or
 // restricted, one audit-log entry (§8.17): who (the actor), what (action, typically
 // the endpoint), which artifact, and its tier. Public/personal accesses are not
 // logged — high-volume, low-signal. A best-effort write: an audit failure is logged
-// but never fails the read it describes.
-func (s *Server) auditSensitive(ctx context.Context, action string, arts ...*kb.Artifact) {
+// (at Error level, so a missing-audit condition is alertable) but never fails the
+// read it describes.
+func (s *Server) auditAccess(ctx context.Context, action string, refs ...auditRef) {
 	if s.deps.Store == nil {
 		return
 	}
 	actor := readActor(ctx)
 	var entries []store.AuditEntry
-	for _, a := range arts {
-		if a == nil || a.PrivacyTier.Rank() < kb.Sensitive.Rank() {
+	for _, r := range refs {
+		if r.id == "" || r.tier.Rank() < kb.Sensitive.Rank() {
 			continue
 		}
 		entries = append(entries, store.AuditEntry{
-			Actor: actor, Action: action, ArtifactID: a.ID, PrivacyTier: a.PrivacyTier,
+			Actor: actor, Action: action, ArtifactID: r.id, PrivacyTier: r.tier,
 		})
 	}
 	if len(entries) == 0 {
 		return
 	}
 	if err := s.deps.Store.Audit.Record(ctx, entries...); err != nil {
-		s.deps.Logger.Warn("audit record failed", "action", action, "err", err)
+		s.deps.Logger.Error("audit record failed", "action", action, "err", err)
 	}
+}
+
+// auditArtifacts audits accessed full artifacts (search/surface/graph have these in
+// hand). A nil artifact is skipped.
+func (s *Server) auditArtifacts(ctx context.Context, action string, arts ...*kb.Artifact) {
+	refs := make([]auditRef, 0, len(arts))
+	for _, a := range arts {
+		if a != nil {
+			refs = append(refs, auditRef{id: a.ID, tier: a.PrivacyTier})
+		}
+	}
+	s.auditAccess(ctx, action, refs...)
 }
 
 type auditEntryJSON struct {
@@ -975,7 +996,7 @@ func (s *Server) handleSurface(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, "surface", err)
 		return
 	}
-	s.auditSensitive(r.Context(), "surface", arts...)
+	s.auditArtifacts(r.Context(), "surface", arts...)
 
 	out := make([]surfaceItemJSON, 0, len(arts))
 	for _, a := range arts {
@@ -1217,11 +1238,14 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := topicJSON{ID: topic.ID, Label: topic.Label, Members: make([]topicMemberJSON, 0, len(members))}
+	access := make([]auditRef, 0, len(members))
 	for _, m := range members {
 		out.Members = append(out.Members, topicMemberJSON{
 			ArtifactID: m.ArtifactID, Title: m.Title, URL: m.URL, Score: m.Score,
 		})
+		access = append(access, auditRef{id: m.ArtifactID, tier: m.PrivacyTier})
 	}
+	s.auditAccess(ctx, "topic", access...)
 	s.writeJSON(w, http.StatusOK, out)
 }
 
@@ -1412,9 +1436,12 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := entityDetailJSON{ID: e.ID, Kind: e.Kind, Name: e.Name, Aliases: e.Aliases, Artifacts: make([]graphNodeJSON, 0, len(refs))}
+	access := make([]auditRef, 0, len(refs))
 	for _, ref := range refs {
 		out.Artifacts = append(out.Artifacts, graphNodeJSON{ArtifactID: ref.ID, Title: ref.Title, URL: ref.URL})
+		access = append(access, auditRef{id: ref.ID, tier: ref.PrivacyTier})
 	}
+	s.auditAccess(ctx, "entity", access...)
 	s.writeJSON(w, http.StatusOK, out)
 }
 
@@ -1443,9 +1470,12 @@ func (s *Server) handleBacklinks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]backlinkJSON, 0, len(links))
+	access := make([]auditRef, 0, len(links))
 	for _, l := range links {
 		out = append(out, backlinkJSON{ArtifactID: l.ID, Title: l.Title, URL: l.URL, Relation: l.Relation})
+		access = append(access, auditRef{id: l.ID, tier: l.PrivacyTier})
 	}
+	s.auditAccess(ctx, "backlinks", access...)
 	s.writeJSON(w, http.StatusOK, map[string]any{"backlinks": out})
 }
 
@@ -1534,7 +1564,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Connected = append(out.Connected, node)
 	}
-	s.auditSensitive(ctx, "graph", accessed...)
+	s.auditArtifacts(ctx, "graph", accessed...)
 	s.writeJSON(w, http.StatusOK, out)
 }
 
@@ -1747,7 +1777,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Results = append(out.Results, res)
 	}
-	s.auditSensitive(ctx, "search", accessed...)
+	s.auditArtifacts(ctx, "search", accessed...)
 	s.writeJSON(w, http.StatusOK, out)
 }
 
@@ -1773,11 +1803,11 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 	// The answer's sources are the artifact bodies fed to the LLM — the most direct
 	// content exposure; audit the sensitive ones.
-	accessed := make([]*kb.Artifact, 0, len(ans.Sources))
+	refs := make([]auditRef, 0, len(ans.Sources))
 	for _, src := range ans.Sources {
-		accessed = append(accessed, &kb.Artifact{ID: src.ArtifactID, PrivacyTier: src.PrivacyTier})
+		refs = append(refs, auditRef{id: src.ArtifactID, tier: src.PrivacyTier})
 	}
-	s.auditSensitive(r.Context(), "ask", accessed...)
+	s.auditAccess(r.Context(), "ask", refs...)
 	s.writeJSON(w, http.StatusOK, ans)
 }
 

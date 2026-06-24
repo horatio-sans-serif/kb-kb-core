@@ -133,10 +133,11 @@ func (r *TopicRepo) Get(ctx context.Context, id string) (*Topic, error) {
 // TopicMember is one artifact's membership in a topic, with its display fields
 // (joined here so the caller needs no per-member lookup).
 type TopicMember struct {
-	ArtifactID string
-	Title      string
-	URL        string
-	Score      float64
+	ArtifactID  string
+	Title       string
+	URL         string
+	Score       float64
+	PrivacyTier kb.PrivacyTier
 }
 
 // Members returns up to limit of a topic's live member artifacts, highest
@@ -148,7 +149,7 @@ func (r *TopicRepo) Members(ctx context.Context, topicID string, limit int, ceil
 	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
 	args := append(append([]any{}, tierArgs...), topicID, limit)
 	rows, err := r.rq.QueryContext(ctx,
-		`SELECT at.artifact_id, a.title, a.canonical_url, at.score FROM artifact_topics at
+		`SELECT at.artifact_id, a.title, a.canonical_url, at.score, a.privacy_tier FROM artifact_topics at
 		 JOIN artifacts a ON a.id = at.artifact_id AND a.deleted_at IS NULL AND `+tier+`
 		 WHERE at.topic_id = ? ORDER BY at.score DESC, at.artifact_id LIMIT ?`, args...)
 	if err != nil {
@@ -160,7 +161,7 @@ func (r *TopicRepo) Members(ctx context.Context, topicID string, limit int, ceil
 	for rows.Next() {
 		var m TopicMember
 		var title, url sql.NullString
-		if err := rows.Scan(&m.ArtifactID, &title, &url, &m.Score); err != nil {
+		if err := rows.Scan(&m.ArtifactID, &title, &url, &m.Score, &m.PrivacyTier); err != nil {
 			return nil, fmt.Errorf("scan topic member: %w", err)
 		}
 		m.Title, m.URL = title.String, url.String

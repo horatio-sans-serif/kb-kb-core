@@ -272,9 +272,10 @@ func (r *GraphRepo) GetEntity(ctx context.Context, id string) (*kb.Entity, error
 // ArtifactRef is an artifact's display fields, joined into a graph query so the
 // caller needs no per-row lookup.
 type ArtifactRef struct {
-	ID    string
-	Title string
-	URL   string
+	ID          string
+	Title       string
+	URL         string
+	PrivacyTier kb.PrivacyTier
 }
 
 const graphDefaultLimit = 50
@@ -288,7 +289,7 @@ func (r *GraphRepo) EntityArtifacts(ctx context.Context, entityID string, limit 
 	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
 	args := append(append([]any{}, tierArgs...), entityID, limit)
 	rows, err := r.rq.QueryContext(ctx,
-		`SELECT a.id, a.title, a.canonical_url FROM artifact_entities ae
+		`SELECT a.id, a.title, a.canonical_url, a.privacy_tier FROM artifact_entities ae
 		 JOIN artifacts a ON a.id = ae.artifact_id AND a.deleted_at IS NULL AND `+tier+`
 		 WHERE ae.entity_id = ? ORDER BY a.id LIMIT ?`, args...)
 	if err != nil {
@@ -315,7 +316,7 @@ func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string, limit int,
 	tier, tierArgs := tierClause("a.privacy_tier", ceiling)
 	args := append(append([]any{}, tierArgs...), artifactID, limit)
 	rows, err := r.rq.QueryContext(ctx,
-		`SELECT DISTINCT l.src_id, a.title, a.canonical_url, l.relation FROM links l
+		`SELECT DISTINCT l.src_id, a.title, a.canonical_url, a.privacy_tier, l.relation FROM links l
 		 JOIN artifacts a ON a.id = l.src_id AND a.deleted_at IS NULL AND `+tier+`
 		 WHERE l.dst_id = ? ORDER BY l.src_id, l.relation LIMIT ?`, args...)
 	if err != nil {
@@ -327,7 +328,7 @@ func (r *GraphRepo) Backlinks(ctx context.Context, artifactID string, limit int,
 	for rows.Next() {
 		var b Backlink
 		var title, u sql.NullString
-		if err := rows.Scan(&b.ID, &title, &u, &b.Relation); err != nil {
+		if err := rows.Scan(&b.ID, &title, &u, &b.PrivacyTier, &b.Relation); err != nil {
 			return nil, fmt.Errorf("scan backlink: %w", err)
 		}
 		b.Title, b.URL = title.String, u.String
@@ -341,7 +342,7 @@ func scanArtifactRefs(rows *sql.Rows) ([]ArtifactRef, error) {
 	for rows.Next() {
 		var ref ArtifactRef
 		var title, u sql.NullString
-		if err := rows.Scan(&ref.ID, &title, &u); err != nil {
+		if err := rows.Scan(&ref.ID, &title, &u, &ref.PrivacyTier); err != nil {
 			return nil, fmt.Errorf("scan artifact ref: %w", err)
 		}
 		ref.Title, ref.URL = title.String, u.String
