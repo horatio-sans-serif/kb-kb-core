@@ -24,16 +24,17 @@ a runtime SQLite extension.
 The daemon is configured by environment variables (it fails fast, naming any
 missing required value):
 
-| Env var              | Required | Default          | Description                                                                                                                               |
-| -------------------- | -------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `KB_DB`              | yes      | —                | Path to the SQLite database file                                                                                                          |
-| `KB_API_TOKEN`       | yes      | —                | Bearer token for the HTTP API                                                                                                             |
-| `KB_LISTEN_ADDR`     | no       | `127.0.0.1:8087` | TCP listen address (binding beyond loopback exposes the API)                                                                              |
-| `KB_DEFAULT_PRIVACY` | no       | `personal`       | Default tier: `public` / `personal` / `sensitive` / `restricted`                                                                          |
-| `KB_READ_TOKEN`      | no       | —                | Optional lower-trust read-only token (≥16 chars, must differ from `KB_API_TOKEN`); grants ceiling-limited read access on read routes only |
-| `KB_READ_TIER`       | no       | `public`         | Privacy ceiling for `KB_READ_TOKEN`: `public` / `personal` / `sensitive` (`restricted` is rejected — it is the owner's ceiling)           |
-| `KB_CLOUD_LLM`       | no       | `false`          | Allow cloud LLMs for non-sensitive tiers (Phase 2)                                                                                        |
-| `KB_LOG_LEVEL`       | no       | `info`           | `debug` / `info` / `warn` / `error`                                                                                                       |
+| Env var                   | Required | Default          | Description                                                                                                                               |
+| ------------------------- | -------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `KB_DB`                   | yes      | —                | Path to the SQLite database file                                                                                                          |
+| `KB_API_TOKEN`            | yes      | —                | Bearer token for the HTTP API                                                                                                             |
+| `KB_LISTEN_ADDR`          | no       | `127.0.0.1:8087` | TCP listen address (binding beyond loopback exposes the API)                                                                              |
+| `KB_DEFAULT_PRIVACY`      | no       | `personal`       | Default tier: `public` / `personal` / `sensitive` / `restricted`                                                                          |
+| `KB_READ_TOKEN`           | no       | —                | Optional lower-trust read-only token (≥16 chars, must differ from `KB_API_TOKEN`); grants ceiling-limited read access on read routes only |
+| `KB_READ_TIER`            | no       | `public`         | Privacy ceiling for `KB_READ_TOKEN`: `public` / `personal` / `sensitive` (`restricted` is rejected — it is the owner's ceiling)           |
+| `KB_AUDIT_RETENTION_DAYS` | no       | `365`            | Days a local audit-log entry is kept before the lifecycle sweep prunes it (`0` = never)                                                   |
+| `KB_CLOUD_LLM`            | no       | `false`          | Allow cloud LLMs for non-sensitive tiers (Phase 2)                                                                                        |
+| `KB_LOG_LEVEL`            | no       | `info`           | `debug` / `info` / `warn` / `error`                                                                                                       |
 
 ## Run
 
@@ -45,6 +46,13 @@ missing required value):
 - `GET /events` — Server-Sent Events stream of lifecycle events (bearer auth).
 - `POST /ingest` — bearer auth; JSON `{ "source_id", "url" | "body", "title"?,
 "privacy"? }`. Returns `{ "artifact_id" }`.
+- `POST /entities/{id}/merge` — owner-only; JSON `{ "loser_id" }` folds the loser
+  entity into `{id}` (re-points mentions, unions aliases, deletes the loser).
+- `PUT /entities/{id}/aliases` — owner-only; JSON `{ "aliases": [...] }` replaces
+  an entity's alias set.
+
+PULL connectors: `rss`, `hackernews`, `github` (a configured user's starred
+repos, source config `{ "user": "..." }`).
 
 ```bash
 TOKEN=...; A=127.0.0.1:8087

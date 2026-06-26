@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -124,7 +125,9 @@ func (c *Connector) HealthCheck(ctx context.Context, src *kb.Source) (kb.Health,
 }
 
 func (c *Connector) starred(ctx context.Context, user string) ([]repo, error) {
-	reqURL := c.base + "/users/" + user + "/starred?per_page=" + strconv.Itoa(maxRepos)
+	// PathEscape the owner-supplied username so a stray character can't reshape the
+	// request path (the base host is fixed, but defense in depth).
+	reqURL := c.base + "/users/" + url.PathEscape(user) + "/starred?per_page=" + strconv.Itoa(maxRepos)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("github: build request: %w", err)

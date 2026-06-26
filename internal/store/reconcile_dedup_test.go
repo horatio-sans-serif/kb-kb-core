@@ -272,6 +272,40 @@ func TestGraphRepo_ReconcileEntities(t *testing.T) {
 	}
 }
 
+func TestGraphRepo_ReconcileEntities_UnionsAliases(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	survivor := rawEntity(t, st, "01E0000000000000000000000A", "technology", "Go")
+	loser := rawEntity(t, st, "01E0000000000000000000000B", "technology", "Go")
+	// Each replica's copy carries different aliases; the auto-dedup must end with the
+	// deduped union on the survivor (the mergeEntity helper shared with MergeEntities).
+	setRawAliases(t, st, survivor, `["Golang"]`)
+	setRawAliases(t, st, loser, `["Go-lang","Golang"]`)
+
+	if _, err := st.Graph.ReconcileDuplicates(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	e, err := st.Graph.GetEntity(ctx, survivor)
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	got := map[string]bool{}
+	for _, a := range e.Aliases {
+		got[a] = true
+	}
+	if len(e.Aliases) != 2 || !got["Golang"] || !got["Go-lang"] {
+		t.Errorf("survivor aliases = %v, want the deduped union {Golang, Go-lang}", e.Aliases)
+	}
+}
+
+func setRawAliases(t *testing.T, st *Store, id, aliasesJSON string) {
+	t.Helper()
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entities SET aliases = ? WHERE id = ?`, aliasesJSON, id); err != nil {
+		t.Fatalf("set aliases %s: %v", id, err)
+	}
+}
+
 // rawEntity inserts an entity with an explicit id, bypassing dedup — to simulate the
 // cross-replica duplicates the reconcile sweep merges.
 func rawEntity(t *testing.T, st *Store, id, kind, name string) string {

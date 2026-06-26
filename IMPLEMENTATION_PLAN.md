@@ -1879,3 +1879,46 @@ log; auditing the bare `/entities` and `/topics` list endpoints (they expose ent
 names / topic labels and aggregate counts, not artifact titles — lower signal). A
 `/ask` synthesis _error_ does not record the sources the local LLM was already handed
 (no client exposure occurs on that path).
+
+---
+
+# Phase 19 — Backlog batch (parallel)
+
+Four independent backlog items, built concurrently in isolated worktrees and merged.
+
+## GitHub connector (§8.1)
+
+**Status: Complete.** `internal/sources/github` — a PULL connector fetching a
+configured user's starred repositories (`GET api.github.com/users/{user}/starred`),
+one artifact per repo (title = full_name, body = description/url/language/stars,
+canonical_url = html_url). Per-source config `{"user":"..."}`, SSRF-safe client,
+descriptive User-Agent, defensive parsing, capped per fetch; the username is
+PathEscaped. Registered as `github` in main.go.
+
+## Entity merge + alias curation (§8.7)
+
+**Status: Complete.** `GraphRepo.MergeEntities(survivor, loser)` (the manual
+counterpart to `ReconcileDuplicates`): re-points artifact_entities, unions aliases,
+deletes the loser, atomic + idempotent, refuses self-merge. The shared `mergeEntity`
+helper now unions aliases on BOTH the manual and the auto-dedup paths.
+`GraphRepo.SetAliases` replaces an entity's alias set. Owner-only routes
+`POST /entities/{id}/merge` and `PUT /entities/{id}/aliases`.
+
+## LLM-derived topic labels (§8.7)
+
+**Status: Complete.** `topics.Labeler` derives a concise label from a freshly
+founded topic's member titles via the on-device LLM, replacing the title-derived
+fallback (`TopicRepo.SetLabel`). Gated local-only (mirrors summarize/rag — no member
+text leaves the box on a non-local endpoint); best-effort with the title fallback on
+nil/absent/erroring LLM. Runs post-commit so a slow model never holds the write lock.
+Attached via `Clusterer.WithLabeler`; a nil labeler is a no-op.
+
+## Audit-log retention/GC (§8.17)
+
+**Status: Complete.** `AuditRepo.PurgeBefore(cutoff)`; the lifecycle `Sweeper` prunes
+audit_log entries older than `Policy.AuditRetention` (config `KB_AUDIT_RETENTION_DAYS`,
+default 365, 0 = never), recording the count in `Stats.AuditPruned`. Cutoff uses the
+sweeper's injected clock + `store.FormatTime`, identical to artifact compaction.
+
+**Deferred:** Reddit / Mastodon connectors; auth-bearing connectors; DICTATOR
+audio/video transcription (Gap 13); audit-log export.

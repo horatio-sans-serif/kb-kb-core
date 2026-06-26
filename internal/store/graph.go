@@ -86,8 +86,10 @@ func (r *GraphRepo) UpsertEntity(ctx context.Context, e *kb.Entity) (string, err
 // ReconcileDuplicates merges cross-replica duplicate entities — rows sharing
 // (kind, name) — into the lowest-id survivor (deterministic across replicas): it
 // re-points the loser's artifact_entities to the survivor (UPDATE OR IGNORE +
-// drop-leftover, since (artifact_id, entity_id) is the PK) and deletes the loser
-// entity. Returns how many losers it merged. Each merge runs in its own transaction.
+// drop-leftover, since (artifact_id, entity_id) is the PK), unions the loser's
+// aliases into the survivor, and deletes the loser entity (it shares the mergeEntity
+// helper with the manual MergeEntities). Returns how many losers it merged. Each
+// merge runs in its own transaction.
 func (r *GraphRepo) ReconcileDuplicates(ctx context.Context) (int, error) {
 	groups, err := r.duplicateEntityGroups(ctx)
 	if err != nil {
