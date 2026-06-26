@@ -35,11 +35,19 @@ const (
 	maxLabelLen = 80
 )
 
+// TopicLabeler derives and stores a human-readable label for a freshly founded
+// topic, given the title-derived fallback already on it. Implemented by *Labeler;
+// best-effort, so a nil labeler simply leaves the fallback label in place.
+type TopicLabeler interface {
+	Label(ctx context.Context, topicID, fallback string) error
+}
+
 // Clusterer assigns ready, embedded artifacts to topics over the store.
 type Clusterer struct {
 	st        *store.Store
 	threshold float64
 	batch     int
+	labeler   TopicLabeler // optional; nil keeps the title-derived label
 }
 
 // New returns a Clusterer with default tuning.
@@ -51,6 +59,14 @@ func NewWithThreshold(st *store.Store, threshold float64, batch int) *Clusterer 
 		batch = defaultBatch
 	}
 	return &Clusterer{st: st, threshold: threshold, batch: batch}
+}
+
+// WithLabeler attaches an LLM topic labeler invoked best-effort when a new topic
+// is founded (design §8.7). Returns the Clusterer for chaining. A nil labeler
+// (the default) keeps the founding artifact's title-derived label.
+func (c *Clusterer) WithLabeler(l TopicLabeler) *Clusterer {
+	c.labeler = l
+	return c
 }
 
 // Sweep clusters the unclustered artifacts and returns how many it assigned. A
@@ -83,7 +99,8 @@ func (c *Clusterer) Sweep(ctx context.Context) (int, error) {
 // candidate that somehow appears in two overlapping sweeps cannot double-count the
 // centroid (the INSERT-OR-IGNORE membership alone would not prevent that).
 func (c *Clusterer) assign(ctx context.Context, cand store.ClusterCandidate) error {
-	return c.st.Tx(ctx, func(tx *store.Store) error {
+	var foundedID, foundedLabel string // set when this candidate founds a new topic
+	err := c.st.Tx(ctx, func(tx *store.Store) error {
 		if existing, err := tx.Topics.TopicsForArtifact(ctx, cand.ArtifactID); err != nil {
 			return err
 		} else if len(existing) > 0 {
@@ -113,8 +130,25 @@ func (c *Clusterer) assign(ctx context.Context, cand store.ClusterCandidate) err
 		if err := tx.Topics.Create(ctx, topic); err != nil {
 			return err
 		}
-		return tx.Topics.Assign(ctx, cand.ArtifactID, topic.ID, 1.0)
+		if err := tx.Topics.Assign(ctx, cand.ArtifactID, topic.ID, 1.0); err != nil {
+			return err
+		}
+		foundedID, foundedLabel = topic.ID, topic.Label
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// A new topic was founded: best-effort, replace its title-derived label with an
+	// LLM-derived one. Run after the centroid transaction commits so a slow local
+	// model never holds the write lock; the labeler keeps the fallback label on any
+	// error or when no/non-local LLM is configured. A nil labeler is a no-op.
+	if foundedID != "" && c.labeler != nil {
+		if lerr := c.labeler.Label(ctx, foundedID, foundedLabel); lerr != nil && ctx.Err() == nil {
+			return fmt.Errorf("label topic %q: %w", foundedID, lerr)
+		}
+	}
+	return nil
 }
 
 // maxTopicFanout caps the shares_topic edges a single assignment creates. Past it
