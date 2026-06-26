@@ -53,6 +53,15 @@ func (r *TopicRepo) SetCentroid(ctx context.Context, topicID string, centroid []
 	return nil
 }
 
+// SetLabel replaces a topic's human-readable label (e.g. an LLM-derived label
+// supplanting the founding artifact's title).
+func (r *TopicRepo) SetLabel(ctx context.Context, topicID, label string) error {
+	if _, err := r.q.ExecContext(ctx, `UPDATE topics SET label = ? WHERE id = ?`, label, topicID); err != nil {
+		return fmt.Errorf("set topic %q label: %w", topicID, err)
+	}
+	return nil
+}
+
 // Assign links an artifact to a topic with a membership score. Idempotent.
 func (r *TopicRepo) Assign(ctx context.Context, artifactID, topicID string, score float64) error {
 	if _, err := r.q.ExecContext(ctx,

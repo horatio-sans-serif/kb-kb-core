@@ -97,6 +97,23 @@ func TestTopicRepo_ListWithCountsGetMembers(t *testing.T) {
 	}
 }
 
+func TestTopicRepo_SetLabel(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	tp := &Topic{Label: "founding title", Centroid: []float32{1}}
+	_ = st.Topics.Create(ctx, tp)
+	if err := st.Topics.SetLabel(ctx, tp.ID, "Concise Topic Label"); err != nil {
+		t.Fatalf("set label: %v", err)
+	}
+	got, err := st.Topics.Get(ctx, tp.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Label != "Concise Topic Label" {
+		t.Errorf("label = %q, want %q", got.Label, "Concise Topic Label")
+	}
+}
+
 func TestTopicRepo_SetCentroid(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

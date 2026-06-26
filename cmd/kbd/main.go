@@ -366,7 +366,11 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// Topic clustering: periodically group ready, embedded artifacts into topics by
 	// embedding similarity (incremental leader clustering). Runs more often than the
 	// decay sweep — a freshly-enriched artifact should be clustered promptly.
-	clusterer := topics.New(st)
+	// LLM-derived topic labels (§8.7): when a topic is founded, replace its
+	// title-derived label with a concise model-generated one. Best-effort and
+	// privacy-gated — skipped entirely when the endpoint is not on-device.
+	clusterer := topics.New(st).WithLabeler(
+		topics.NewLabeler(st, llmClient, cfg.SummarizeModel, cfg.OllamaIsLocal))
 	runCluster := func() {
 		switch n, err := clusterer.Sweep(ctx); {
 		case err != nil && ctx.Err() == nil:
