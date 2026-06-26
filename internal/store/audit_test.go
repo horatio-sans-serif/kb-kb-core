@@ -73,6 +73,46 @@ func TestAuditRepo_NullableArtifactAndTier(t *testing.T) {
 	}
 }
 
+func TestAuditRepo_PurgeBefore(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	// Three entries with explicit, ordered timestamps so the cutoff is deterministic.
+	old1 := "2025-01-01T00:00:00.000000000Z"
+	old2 := "2025-02-01T00:00:00.000000000Z"
+	newish := "2025-06-01T00:00:00.000000000Z"
+	if err := st.Audit.Record(ctx,
+		AuditEntry{Actor: "owner", Action: "search", CreatedAt: old1},
+		AuditEntry{Actor: "owner", Action: "ask", CreatedAt: old2},
+		AuditEntry{Actor: "owner", Action: "graph", CreatedAt: newish},
+	); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	// Cutoff between old2 and newish: the two old rows go, the newer one stays.
+	cutoff := "2025-03-01T00:00:00.000000000Z"
+	n, err := st.Audit.PurgeBefore(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("purge before: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("purged %d, want 2 (the two rows older than the cutoff)", n)
+	}
+
+	rows, err := st.Audit.Recent(ctx, 10)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Action != "graph" {
+		t.Errorf("after purge = %+v, want only the newer 'graph' entry kept", rows)
+	}
+
+	// A cutoff older than everything remaining deletes nothing.
+	if n2, err := st.Audit.PurgeBefore(ctx, "2024-01-01T00:00:00.000000000Z"); err != nil || n2 != 0 {
+		t.Errorf("purge below all = (%d, %v), want (0, nil)", n2, err)
+	}
+}
+
 func TestAuditRepo_ByArtifact(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

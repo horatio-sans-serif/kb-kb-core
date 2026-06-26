@@ -203,6 +203,71 @@ func TestSweeper_TransitionsTiers(t *testing.T) {
 	}
 }
 
+func TestSweeper_PrunesAuditLog(t *testing.T) {
+	ctx := context.Background()
+	st := storetest.New(t)
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	// Three audit entries: two older than the retention window, one within it.
+	old1 := store.FormatTime(now.AddDate(0, 0, -400))
+	old2 := store.FormatTime(now.AddDate(0, 0, -380))
+	fresh := store.FormatTime(now.AddDate(0, 0, -10))
+	if err := st.Audit.Record(ctx,
+		store.AuditEntry{Actor: "owner", Action: "search", CreatedAt: old1},
+		store.AuditEntry{Actor: "owner", Action: "ask", CreatedAt: old2},
+		store.AuditEntry{Actor: "owner", Action: "graph", CreatedAt: fresh},
+	); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	policy := DefaultPolicy()
+	policy.AuditRetention = 365 * 24 * time.Hour
+	sw := NewWithPolicy(st, policy, func() time.Time { return now })
+
+	stats, err := sw.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if stats.AuditPruned != 2 {
+		t.Errorf("AuditPruned = %d, want 2 (the two entries older than retention)", stats.AuditPruned)
+	}
+	rows, err := st.Audit.Recent(ctx, 10)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Action != "graph" {
+		t.Errorf("after prune = %+v, want only the fresh 'graph' entry kept", rows)
+	}
+}
+
+func TestSweeper_AuditRetentionZeroNeverPrunes(t *testing.T) {
+	ctx := context.Background()
+	st := storetest.New(t)
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	old := store.FormatTime(now.AddDate(0, 0, -1000)) // ancient, but never pruned with zero retention
+	if err := st.Audit.Record(ctx,
+		store.AuditEntry{Actor: "owner", Action: "search", CreatedAt: old},
+	); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	policy := DefaultPolicy()
+	policy.AuditRetention = 0 // disabled
+	sw := NewWithPolicy(st, policy, func() time.Time { return now })
+
+	stats, err := sw.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if stats.AuditPruned != 0 {
+		t.Errorf("AuditPruned = %d, want 0 (zero retention disables pruning)", stats.AuditPruned)
+	}
+	if rows, _ := st.Audit.Recent(ctx, 10); len(rows) != 1 {
+		t.Errorf("audit rows after disabled prune = %d, want 1 (kept)", len(rows))
+	}
+}
+
 func TestSweeper_Compact(t *testing.T) {
 	ctx := context.Background()
 	st, db := storetest.NewWithDB(t)

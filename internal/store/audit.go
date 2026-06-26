@@ -88,6 +88,23 @@ func (r *AuditRepo) ByArtifact(ctx context.Context, artifactID string, limit int
 	return scanAuditEntries(rows)
 }
 
+// PurgeBefore deletes audit entries recorded before cutoff (a TimeFormat string),
+// returning how many rows it removed. This is the time-based retention/GC for the
+// local-only audit_log, which otherwise grows unbounded (§8.17). Because created_at
+// is a TimeFormat timestamp whose lexical order matches chronological order, a plain
+// string comparison is a correct age filter.
+func (r *AuditRepo) PurgeBefore(ctx context.Context, cutoff string) (int, error) {
+	res, err := r.q.ExecContext(ctx, `DELETE FROM audit_log WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("purge audit before %q: %w", cutoff, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("purge audit before %q: rows affected: %w", cutoff, err)
+	}
+	return int(n), nil
+}
+
 func scanAuditEntries(rows *sql.Rows) ([]AuditEntry, error) {
 	var out []AuditEntry
 	for rows.Next() {
