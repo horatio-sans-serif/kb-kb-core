@@ -150,8 +150,28 @@ func (r *GraphRepo) duplicateEntityGroups(ctx context.Context) ([][]string, erro
 	return out, rows.Err()
 }
 
+// MergeEntities folds the loser entity into the survivor — the manual counterpart
+// to ReconcileDuplicates' automatic dedup (§8.7: entity merge / alias curation). It
+// re-points the loser's artifact_entities to the survivor (UPDATE OR IGNORE +
+// drop-leftover, since (artifact_id, entity_id) is the PK), unions the loser's
+// aliases into the survivor, and deletes the loser. Unlike ReconcileDuplicates it
+// does not require the two to share a (kind, name): the caller asserts the identity.
+// Refuses merging an entity into itself. Idempotent (a gone loser is a no-op) and
+// atomic via withTx.
+func (r *GraphRepo) MergeEntities(ctx context.Context, survivorID, loserID string) error {
+	if survivorID == loserID {
+		return nil
+	}
+	return withTx(ctx, r.q, func(q Querier) error {
+		return (&GraphRepo{q: q, rq: q}).mergeEntity(ctx, survivorID, loserID)
+	})
+}
+
 // mergeEntity folds the loser entity into the survivor; r must be transaction-bound.
 func (r *GraphRepo) mergeEntity(ctx context.Context, survivor, loser string) error {
+	if err := r.unionAliases(ctx, survivor, loser); err != nil {
+		return err
+	}
 	if _, err := r.q.ExecContext(ctx,
 		`UPDATE OR IGNORE artifact_entities SET entity_id = ? WHERE entity_id = ?`, survivor, loser); err != nil {
 		return fmt.Errorf("re-point artifact_entities: %w", err)
@@ -164,6 +184,94 @@ func (r *GraphRepo) mergeEntity(ctx context.Context, survivor, loser string) err
 		return fmt.Errorf("delete loser entity %q: %w", loser, err)
 	}
 	return nil
+}
+
+// unionAliases folds the loser's aliases into the survivor's stored set, deduping.
+// A gone survivor or loser is a no-op — keeps the containing merge idempotent. r
+// must be transaction-bound.
+func (r *GraphRepo) unionAliases(ctx context.Context, survivor, loser string) error {
+	read := func(id string) (aliases []string, ok bool, err error) {
+		var al sql.NullString
+		qerr := r.q.QueryRowContext(ctx,
+			`SELECT aliases FROM entities WHERE id = ?`, id).Scan(&al)
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		if qerr != nil {
+			return nil, false, fmt.Errorf("read entity %q for alias union: %w", id, qerr)
+		}
+		var out []string
+		if al.Valid && al.String != "" {
+			if uerr := json.Unmarshal([]byte(al.String), &out); uerr != nil {
+				return nil, false, fmt.Errorf("unmarshal aliases for %q: %w", id, uerr)
+			}
+		}
+		return out, true, nil
+	}
+	survivorAliases, sOK, err := read(survivor)
+	if err != nil {
+		return err
+	}
+	loserAliases, lOK, err := read(loser)
+	if err != nil {
+		return err
+	}
+	if !sOK || !lOK {
+		return nil
+	}
+	merged := dedupStrings(append(survivorAliases, loserAliases...))
+	return r.writeAliases(ctx, survivor, merged)
+}
+
+// SetAliases replaces an entity's stored alias set with the given one (an empty or
+// nil set clears it) — the alias-curation write (§8.7). Returns ErrNotFound for a
+// missing entity. Atomic via withTx.
+func (r *GraphRepo) SetAliases(ctx context.Context, entityID string, aliases []string) error {
+	return withTx(ctx, r.q, func(q Querier) error {
+		tr := &GraphRepo{q: q, rq: q}
+		var exists bool
+		if err := q.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM entities WHERE id = ?)`, entityID).Scan(&exists); err != nil {
+			return fmt.Errorf("find entity %q: %w", entityID, err)
+		}
+		if !exists {
+			return fmt.Errorf("set aliases %q: %w", entityID, ErrNotFound)
+		}
+		return tr.writeAliases(ctx, entityID, dedupStrings(aliases))
+	})
+}
+
+// writeAliases stores aliases as a JSON array (NULL when empty), replacing whatever
+// was there. r must be transaction-bound.
+func (r *GraphRepo) writeAliases(ctx context.Context, entityID string, aliases []string) error {
+	var stored any
+	if len(aliases) > 0 {
+		b, err := json.Marshal(aliases)
+		if err != nil {
+			return fmt.Errorf("marshal aliases for %q: %w", entityID, err)
+		}
+		stored = string(b)
+	}
+	if _, err := r.q.ExecContext(ctx,
+		`UPDATE entities SET aliases = ? WHERE id = ?`, stored, entityID); err != nil {
+		return fmt.Errorf("set aliases %q: %w", entityID, err)
+	}
+	return nil
+}
+
+// dedupStrings returns the distinct non-empty strings of xs, preserving first-seen
+// order. Used to keep alias sets free of duplicates and blanks.
+func dedupStrings(xs []string) []string {
+	seen := make(map[string]bool, len(xs))
+	var out []string
+	for _, x := range xs {
+		if x == "" || seen[x] {
+			continue
+		}
+		seen[x] = true
+		out = append(out, x)
+	}
+	return out
 }
 
 // LinkArtifactEntity records that an artifact mentions an entity. Idempotent.

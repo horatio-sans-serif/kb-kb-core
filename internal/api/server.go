@@ -137,6 +137,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /graph/{id}", s.requireRead(http.HandlerFunc(s.handleGraph)))
 	mux.Handle("GET /entities", s.requireRead(http.HandlerFunc(s.handleListEntities)))
 	mux.Handle("GET /entities/{id}", s.requireRead(http.HandlerFunc(s.handleGetEntity)))
+	mux.Handle("POST /entities/{id}/merge", s.requireAuth(http.HandlerFunc(s.handleMergeEntity)))
+	mux.Handle("PUT /entities/{id}/aliases", s.requireAuth(http.HandlerFunc(s.handleSetEntityAliases)))
 	mux.Handle("GET /artifacts/{id}/backlinks", s.requireRead(http.HandlerFunc(s.handleBacklinks)))
 	mux.Handle("GET /conflicts", s.requireRead(http.HandlerFunc(s.handleListConflicts)))
 	mux.Handle("POST /conflicts/{id}", s.requireAuth(http.HandlerFunc(s.handleResolveConflict)))
@@ -1443,6 +1445,111 @@ func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auditAccess(ctx, "entity", access...)
 	s.writeJSON(w, http.StatusOK, out)
+}
+
+type mergeEntityRequest struct {
+	LoserID string `json:"loser_id"`
+}
+
+// maxAliases bounds an alias-curation write so one entity cannot accrue an unbounded
+// alias list.
+const maxAliases = 64
+
+type setAliasesRequest struct {
+	Aliases []string `json:"aliases"`
+}
+
+// handleMergeEntity folds loser_id INTO the path entity, re-pointing its artifact
+// mentions and unioning its aliases, then deletes the loser (§8.7 entity merge).
+// Owner-only. Both ids must exist; merging an entity into itself is rejected.
+func (s *Server) handleMergeEntity(w http.ResponseWriter, r *http.Request) {
+	survivorID := r.PathValue("id")
+	if survivorID == "" || len(survivorID) > maxSourceIDBytes || !ingest.ValidText(survivorID, false) {
+		http.Error(w, "invalid entity id", http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req mergeEntityRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.LoserID == "" || len(req.LoserID) > maxSourceIDBytes || !ingest.ValidText(req.LoserID, false) {
+		http.Error(w, "invalid loser_id", http.StatusBadRequest)
+		return
+	}
+	if req.LoserID == survivorID {
+		http.Error(w, "cannot merge an entity into itself", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	if _, err := s.deps.Store.Graph.GetEntity(ctx, survivorID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown entity", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "merge entity survivor", err)
+		return
+	}
+	if _, err := s.deps.Store.Graph.GetEntity(ctx, req.LoserID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown entity", http.StatusNotFound)
+			return
+		}
+		s.serverError(w, "merge entity loser", err)
+		return
+	}
+	if err := s.deps.Store.Graph.MergeEntities(ctx, survivorID, req.LoserID); err != nil {
+		s.serverError(w, "merge entity", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleSetEntityAliases replaces an entity's alias set (§8.7 alias curation).
+// Owner-only. An empty list clears the aliases.
+func (s *Server) handleSetEntityAliases(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > maxSourceIDBytes || !ingest.ValidText(id, false) {
+		http.Error(w, "invalid entity id", http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req setAliasesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if len(req.Aliases) > maxAliases {
+		http.Error(w, fmt.Sprintf("at most %d aliases", maxAliases), http.StatusBadRequest)
+		return
+	}
+	for _, a := range req.Aliases {
+		if a == "" || len(a) > maxTitleBytes || !ingest.ValidText(a, false) {
+			http.Error(w, "invalid alias", http.StatusBadRequest)
+			return
+		}
+	}
+	err := s.deps.Store.Graph.SetAliases(r.Context(), id, req.Aliases)
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "unknown entity", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.serverError(w, "set entity aliases", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleBacklinks returns the live artifacts that link to the given artifact.
