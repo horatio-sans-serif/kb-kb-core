@@ -40,6 +40,7 @@ import (
 	"kb/internal/review"
 	"kb/internal/search"
 	"kb/internal/sources"
+	"kb/internal/sources/github"
 	"kb/internal/sources/hn"
 	"kb/internal/sources/rss"
 	"kb/internal/ssrf"
@@ -476,6 +477,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	registry := sources.NewRegistry()
 	registry.Register("rss", rss.New(ssrf.HTTPClient(30*time.Second)))
 	registry.Register("hackernews", hn.New(ssrf.HTTPClient(30*time.Second)))
+	registry.Register("github", github.New(ssrf.HTTPClient(30*time.Second)))
 	ingester := ingest.New(st, enrichment, rescore, bus)
 	scheduler := sources.NewScheduler(st, registry, ingester, bus, logger)
 	go scheduler.Run(ctx, sourcePollInterval)
