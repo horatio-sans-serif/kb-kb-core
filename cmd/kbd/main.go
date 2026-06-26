@@ -436,6 +436,7 @@ func serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *slo
 	// cleanly under cr-sqlite (§8.16).
 	lifePolicy := lifecycle.DefaultPolicy()
 	lifePolicy.CompactAfter = time.Duration(cfg.PurgeRetention) * 24 * time.Hour
+	lifePolicy.AuditRetention = time.Duration(cfg.AuditRetention) * 24 * time.Hour
 	lifeSweeper := lifecycle.NewWithPolicy(st, lifePolicy, time.Now)
 	runLifecycle := func() {
 		switch stats, err := lifeSweeper.Sweep(ctx); {

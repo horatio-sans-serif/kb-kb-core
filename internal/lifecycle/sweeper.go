@@ -24,16 +24,19 @@ type Policy struct {
 	ArchiveBelow float64       // score below which (and old enough) an artifact archives
 	PurgeBelow   float64       // score below which (and old enough) an artifact purges
 	CompactAfter time.Duration // retention after a purge before physical hard-delete (0 = never compact)
+
+	AuditRetention time.Duration // age after which a local audit_log entry is pruned (0 = never prune)
 }
 
 // DefaultPolicy is the shipped lifecycle policy.
 func DefaultPolicy() Policy {
 	return Policy{
-		ArchiveAfter: 30 * 24 * time.Hour,
-		PurgeAfter:   180 * 24 * time.Hour,
-		ArchiveBelow: 0.2,
-		PurgeBelow:   0.05,
-		CompactAfter: 90 * 24 * time.Hour,
+		ArchiveAfter:   30 * 24 * time.Hour,
+		PurgeAfter:     180 * 24 * time.Hour,
+		ArchiveBelow:   0.2,
+		PurgeBelow:     0.05,
+		CompactAfter:   90 * 24 * time.Hour,
+		AuditRetention: 365 * 24 * time.Hour,
 	}
 }
 
@@ -52,8 +55,9 @@ func classify(score float64, age time.Duration, p Policy) kb.LifecycleTier {
 
 // Stats reports what one sweep changed.
 type Stats struct {
-	Archived int
-	Purged   int
+	Archived    int
+	Purged      int
+	AuditPruned int // local audit_log entries deleted by retention (§8.17)
 }
 
 // tierRank orders the lifecycle tiers so the sweep can demote (rank increases)
@@ -124,6 +128,18 @@ func (s *Sweeper) Sweep(ctx context.Context) (Stats, error) {
 			stats.Archived++
 		case kb.Purged:
 			stats.Purged++
+		}
+	}
+	// Prune the local audit_log by retention age. Like Compact, a zero retention
+	// disables it (entries are kept indefinitely). The cutoff is computed from the
+	// same injected clock the rest of the sweep uses (§8.17).
+	if s.policy.AuditRetention > 0 {
+		cutoff := store.FormatTime(now.Add(-s.policy.AuditRetention))
+		switch pruned, err := s.st.Audit.PurgeBefore(ctx, cutoff); {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("prune audit log: %w", err))
+		default:
+			stats.AuditPruned = pruned
 		}
 	}
 	return stats, errors.Join(errs...)

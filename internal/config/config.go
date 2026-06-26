@@ -27,6 +27,7 @@ type Config struct {
 	CRSqlitePath    string   // KB_CRSQLITE_PATH (path to the cr-sqlite extension; empty = single-node)
 	SyncPeers       []string // KB_SYNC_PEERS (semicolon-separated peer base URLs, e.g. http://host:8087)
 	PurgeRetention  int      // KB_PURGE_RETENTION_DAYS (days a purged artifact is kept before physical compaction; 0 = never; default 90)
+	AuditRetention  int      // KB_AUDIT_RETENTION_DAYS (days a local audit_log entry is kept before pruning; 0 = never; default 365)
 	EmbedDim        int      // KB_EMBED_DIM (embedding dimension for the vec0 ANN index; must match the embed model; default 768)
 	ReadToken       string   // KB_READ_TOKEN (optional lower-trust read-only token; empty = single-owner)
 	ReadTier        string   // KB_READ_TIER (the privacy ceiling for the read token; default public)
@@ -50,6 +51,7 @@ func Load(getenv func(string) string) (*Config, error) {
 		CRSqlitePath:    getenv("KB_CRSQLITE_PATH"),
 		SyncPeers:       splitList(getenv("KB_SYNC_PEERS")),
 		PurgeRetention:  90,
+		AuditRetention:  365,
 	}
 	if v := strings.TrimSpace(getenv("KB_PURGE_RETENTION_DAYS")); v != "" {
 		n, err := strconv.Atoi(v)
@@ -57,6 +59,13 @@ func Load(getenv func(string) string) (*Config, error) {
 			return nil, fmt.Errorf("invalid KB_PURGE_RETENTION_DAYS %q (want a non-negative integer; 0 disables compaction)", v)
 		}
 		cfg.PurgeRetention = n
+	}
+	if v := strings.TrimSpace(getenv("KB_AUDIT_RETENTION_DAYS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid KB_AUDIT_RETENTION_DAYS %q (want a non-negative integer; 0 disables audit pruning)", v)
+		}
+		cfg.AuditRetention = n
 	}
 
 	cfg.EmbedDim = 768

@@ -75,6 +75,9 @@ func TestConfig_SyncDefaultsOff(t *testing.T) {
 	if cfg.PurgeRetention != 90 {
 		t.Errorf("PurgeRetention = %d, want 90 days by default", cfg.PurgeRetention)
 	}
+	if cfg.AuditRetention != 365 {
+		t.Errorf("AuditRetention = %d, want 365 days by default", cfg.AuditRetention)
+	}
 	if cfg.EmbedDim != 768 {
 		t.Errorf("EmbedDim = %d, want 768 by default", cfg.EmbedDim)
 	}
@@ -164,6 +167,30 @@ func TestConfig_PurgeRetention(t *testing.T) {
 	}
 	if _, err := Load(envFunc(with("notanumber"))); err == nil {
 		t.Error("non-numeric retention should fail")
+	}
+}
+
+func TestConfig_AuditRetention(t *testing.T) {
+	base := map[string]string{"KB_DB": "/tmp/kb.db", "KB_API_TOKEN": "0123456789abcdef0123456789abcdef"}
+	with := func(v string) map[string]string {
+		m := map[string]string{}
+		for k, val := range base {
+			m[k] = val
+		}
+		m["KB_AUDIT_RETENTION_DAYS"] = v
+		return m
+	}
+	if cfg, err := Load(envFunc(with("0"))); err != nil || cfg.AuditRetention != 0 {
+		t.Errorf("retention 0 = %v (err %v), want 0 (audit pruning disabled)", cfg, err)
+	}
+	if cfg, err := Load(envFunc(with("30"))); err != nil || cfg.AuditRetention != 30 {
+		t.Errorf("retention 30 = %v (err %v), want 30", cfg, err)
+	}
+	if _, err := Load(envFunc(with("-5"))); err == nil {
+		t.Error("negative audit retention should fail")
+	}
+	if _, err := Load(envFunc(with("notanumber"))); err == nil {
+		t.Error("non-numeric audit retention should fail")
 	}
 }
 
