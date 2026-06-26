@@ -189,6 +189,109 @@ func TestGraph_RejectsInvalidVocabulary(t *testing.T) {
 	}
 }
 
+func TestGraph_MergeEntities(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a, b, c := art(t, st, "ha"), art(t, st, "hb"), art(t, st, "hc")
+
+	// Survivor "Go" mentioned by a, b; loser "Golang" mentioned by b, c (b shared).
+	survivor, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "technology", Name: "Go", Aliases: []string{"Go lang"}})
+	loser, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "technology", Name: "Golang", Aliases: []string{"Go lang", "golang.org"}})
+	_ = st.Graph.LinkArtifactEntity(ctx, a, survivor)
+	_ = st.Graph.LinkArtifactEntity(ctx, b, survivor)
+	_ = st.Graph.LinkArtifactEntity(ctx, b, loser)
+	_ = st.Graph.LinkArtifactEntity(ctx, c, loser)
+
+	if err := st.Graph.MergeEntities(ctx, survivor, loser); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	// Loser is gone.
+	if _, err := st.Graph.GetEntity(ctx, loser); !errors.Is(err, ErrNotFound) {
+		t.Errorf("loser should be deleted, GetEntity err = %v", err)
+	}
+
+	// artifact_entities re-pointed and deduped: survivor now mentioned by a, b, c.
+	arts, err := st.Graph.ArtifactsForEntity(ctx, survivor)
+	if err != nil {
+		t.Fatalf("artifacts-for-entity: %v", err)
+	}
+	if len(arts) != 3 || !contains(arts, a) || !contains(arts, b) || !contains(arts, c) {
+		t.Errorf("survivor should mention a,b,c (deduped), got %v", arts)
+	}
+
+	// Aliases are the union (deduped): "Go lang", "golang.org".
+	e, err := st.Graph.GetEntity(ctx, survivor)
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	if len(e.Aliases) != 2 || !contains(e.Aliases, "Go lang") || !contains(e.Aliases, "golang.org") {
+		t.Errorf("survivor aliases = %v, want union {Go lang, golang.org}", e.Aliases)
+	}
+}
+
+func TestGraph_MergeEntitiesIdempotentAndSelfRefused(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a := art(t, st, "ha")
+	survivor, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "person", Name: "Ada"})
+	loser, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "person", Name: "Lovelace"})
+	_ = st.Graph.LinkArtifactEntity(ctx, a, loser)
+
+	// Self-merge is a no-op (refused), survivor untouched.
+	if err := st.Graph.MergeEntities(ctx, survivor, survivor); err != nil {
+		t.Fatalf("self-merge should be a no-op, got %v", err)
+	}
+	if _, err := st.Graph.GetEntity(ctx, survivor); err != nil {
+		t.Errorf("survivor should survive a self-merge: %v", err)
+	}
+
+	if err := st.Graph.MergeEntities(ctx, survivor, loser); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	// Re-running with a now-gone loser is idempotent (no error).
+	if err := st.Graph.MergeEntities(ctx, survivor, loser); err != nil {
+		t.Fatalf("re-merge of an already-merged loser should be a no-op, got %v", err)
+	}
+	arts, _ := st.Graph.ArtifactsForEntity(ctx, survivor)
+	if len(arts) != 1 || arts[0] != a {
+		t.Errorf("survivor should mention a after merge, got %v", arts)
+	}
+}
+
+func TestGraph_SetAliases(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	a := art(t, st, "ha")
+	id, _ := st.Graph.UpsertEntity(ctx, &kb.Entity{Kind: "org", Name: "Acme", Aliases: []string{"old"}})
+	_ = st.Graph.LinkArtifactEntity(ctx, a, id)
+
+	if err := st.Graph.SetAliases(ctx, id, []string{"Acme Inc", "ACME"}); err != nil {
+		t.Fatalf("set aliases: %v", err)
+	}
+	e, _ := st.Graph.GetEntity(ctx, id)
+	if len(e.Aliases) != 2 || !contains(e.Aliases, "Acme Inc") || !contains(e.Aliases, "ACME") {
+		t.Errorf("aliases = %v, want {Acme Inc, ACME} (replaced)", e.Aliases)
+	}
+
+	// Empty set clears the aliases.
+	if err := st.Graph.SetAliases(ctx, id, nil); err != nil {
+		t.Fatalf("clear aliases: %v", err)
+	}
+	e, _ = st.Graph.GetEntity(ctx, id)
+	if len(e.Aliases) != 0 {
+		t.Errorf("aliases after clear = %v, want empty", e.Aliases)
+	}
+}
+
+func TestGraph_SetAliasesUnknownIs404(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Graph.SetAliases(ctx, "01HMISSING", []string{"x"}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("set aliases on missing entity = %v, want ErrNotFound", err)
+	}
+}
+
 func contains(xs []string, x string) bool {
 	for _, v := range xs {
 		if v == x {
