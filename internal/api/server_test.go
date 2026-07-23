@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -1289,6 +1290,120 @@ func TestAudit_EndpointValidation(t *testing.T) {
 	}
 	if rec := doGet(h, "/audit?artifact_id=bad%0Aid", owner); rec.Code != http.StatusBadRequest {
 		t.Errorf("invalid artifact_id (control char) = %d, want 400", rec.Code)
+	}
+}
+
+func TestAudit_EndpointCSV(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	if err := st.Audit.Record(ctx,
+		store.AuditEntry{Actor: "read-token", Action: "search", ArtifactID: "01A", PrivacyTier: kb.Sensitive},
+		store.AuditEntry{Actor: "owner", Action: "graph", ArtifactID: "01B", PrivacyTier: kb.Restricted},
+	); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx",
+		ReadToken: "read-token-yyyyyyyyyyyyyy", ReadCeiling: kb.Public, Logger: discardLogger()})
+	h := srv.Handler()
+	const owner = "owner-token-xxxxxxxxxxxx"
+
+	// Owner-only: the read token still cannot export the audit log.
+	if rec := doGet(h, "/audit?format=csv", "read-token-yyyyyyyyyyyyyy"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("read-token CSV export = %d, want 401 (owner-only)", rec.Code)
+	}
+
+	rec := doGet(h, "/audit?format=csv", owner)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CSV export = %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/csv; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/csv; charset=utf-8", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); cd != `attachment; filename="audit.csv"` {
+		t.Errorf("Content-Disposition = %q, want attachment; filename=\"audit.csv\"", cd)
+	}
+
+	recs, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse CSV: %v", err)
+	}
+	// Header row + one row per entry (2 entries), newest first.
+	if len(recs) != 3 {
+		t.Fatalf("CSV rows = %d, want 3 (header + 2 entries): %v", len(recs), recs)
+	}
+	wantHeader := []string{"actor", "action", "artifact_id", "privacy_tier", "created_at"}
+	if strings.Join(recs[0], ",") != strings.Join(wantHeader, ",") {
+		t.Errorf("CSV header = %v, want %v", recs[0], wantHeader)
+	}
+	if recs[1][1] != "graph" || recs[1][2] != "01B" {
+		t.Errorf("first data row = %v, want graph/01B newest-first", recs[1])
+	}
+	if recs[2][1] != "search" || recs[2][2] != "01A" {
+		t.Errorf("second data row = %v, want search/01A", recs[2])
+	}
+}
+
+func TestAudit_EndpointCSVArtifactFilter(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	if err := st.Audit.Record(ctx,
+		store.AuditEntry{Actor: "read-token", Action: "search", ArtifactID: "01A", PrivacyTier: kb.Sensitive},
+		store.AuditEntry{Actor: "owner", Action: "graph", ArtifactID: "01B", PrivacyTier: kb.Restricted},
+	); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx", Logger: discardLogger()})
+	h := srv.Handler()
+
+	rec := doGet(h, "/audit?format=csv&artifact_id=01A", "owner-token-xxxxxxxxxxxx")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CSV filtered export = %d: %s", rec.Code, rec.Body.String())
+	}
+	recs, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse CSV: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("filtered CSV rows = %d, want 2 (header + 01A only): %v", len(recs), recs)
+	}
+	if recs[1][2] != "01A" {
+		t.Errorf("filtered data row artifact_id = %q, want 01A", recs[1][2])
+	}
+}
+
+func TestAudit_EndpointUnknownFormat(t *testing.T) {
+	st := newStore(t)
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx", Logger: discardLogger()})
+	h := srv.Handler()
+	if rec := doGet(h, "/audit?format=xml", "owner-token-xxxxxxxxxxxx"); rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown format = %d, want 400", rec.Code)
+	}
+}
+
+func TestAudit_EndpointFormatJSONExplicit(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	if err := st.Audit.Record(ctx,
+		store.AuditEntry{Actor: "owner", Action: "graph", ArtifactID: "01B", PrivacyTier: kb.Restricted},
+	); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(Deps{Store: st, Bus: events.NewBus(), Token: "owner-token-xxxxxxxxxxxx", Logger: discardLogger()})
+	h := srv.Handler()
+
+	// format=json is the explicit form of the default: unchanged JSON shape.
+	rec := doGet(h, "/audit?format=json", "owner-token-xxxxxxxxxxxx")
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("format=json Content-Type = %q, want application/json", ct)
+	}
+	var out struct {
+		Audit []struct {
+			Action string `json:"action"`
+		} `json:"audit"`
+	}
+	mustJSON(t, rec, &out)
+	if len(out.Audit) != 1 || out.Audit[0].Action != "graph" {
+		t.Fatalf("format=json = %+v, want unchanged JSON shape", out.Audit)
 	}
 }
 

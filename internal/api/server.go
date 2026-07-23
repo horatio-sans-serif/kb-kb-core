@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -304,7 +305,16 @@ type auditEntryJSON struct {
 // handleAudit returns the access audit log, newest first (§8.17). Owner-only
 // (requireAuth): the log itself is sensitive — it reveals what was read and when.
 // ?artifact_id filters to one artifact's history; ?limit caps the result.
+// ?format selects the encoding: json (default) or csv (RFC 4180 download).
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format")
+	switch format {
+	case "", "json", "csv":
+	default:
+		http.Error(w, `format must be "json" or "csv"`, http.StatusBadRequest)
+		return
+	}
+
 	limit := maxSurfaceLimit
 	if ls := r.URL.Query().Get("limit"); ls != "" {
 		n, err := strconv.Atoi(ls)
@@ -332,6 +342,11 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if format == "csv" {
+		s.writeAuditCSV(w, entries)
+		return
+	}
+
 	out := make([]auditEntryJSON, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, auditEntryJSON{
@@ -340,6 +355,32 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"audit": out})
+}
+
+// writeAuditCSV streams the audit entries as an RFC 4180 CSV download. The columns
+// mirror the JSON shape exactly (auditEntryJSON): actor, action, artifact_id,
+// privacy_tier, created_at. Headers are set before any body is written.
+func (s *Server) writeAuditCSV(w http.ResponseWriter, entries []store.AuditEntry) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="audit.csv"`)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{"actor", "action", "artifact_id", "privacy_tier", "created_at"}); err != nil {
+		s.deps.Logger.Error("api: write audit csv header", "err", err)
+		return
+	}
+	for _, e := range entries {
+		if err := cw.Write([]string{e.Actor, e.Action, e.ArtifactID, string(e.PrivacyTier), e.CreatedAt}); err != nil {
+			s.deps.Logger.Error("api: write audit csv row", "err", err)
+			return
+		}
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		s.deps.Logger.Error("api: flush audit csv", "err", err)
+	}
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
