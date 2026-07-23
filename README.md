@@ -51,8 +51,9 @@ missing required value):
 - `PUT /entities/{id}/aliases` — owner-only; JSON `{ "aliases": [...] }` replaces
   an entity's alias set.
 
-PULL connectors: `rss`, `hackernews`, `github` (a configured user's starred
-repos, source config `{ "user": "..." }`).
+PULL connectors: `rss`, `hackernews`, `github` (starred repos, `{ "user": "..." }`),
+`reddit` (a subreddit's new posts, `{ "subreddit": "..." }`), `mastodon` (an
+account's public posts, `{ "instance": "...", "acct": "..." }`).
 
 ```bash
 TOKEN=...; A=127.0.0.1:8087
@@ -81,4 +82,5 @@ answering for a semi-trusted reader; no id, title, or body is exposed.
 Every read that surfaces a **sensitive or restricted** artifact (via `/search`,
 `/surface`, `/graph`, or `/ask`) is recorded in a local access audit log — actor
 (owner or read-token), action, artifact, and tier. `GET /audit` (owner-only)
-lists it newest-first, with `?artifact_id=` and `?limit=` filters.
+lists it newest-first, with `?artifact_id=` and `?limit=` filters and a
+`?format=csv` export.

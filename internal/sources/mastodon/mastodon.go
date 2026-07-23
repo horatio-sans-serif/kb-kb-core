@@ -195,41 +195,76 @@ func deriveTitle(body string) string {
 		line = line[:i]
 	}
 	line = strings.TrimSpace(line)
-	if len(line) > maxTitleLen {
-		line = strings.TrimSpace(line[:maxTitleLen])
+	if r := []rune(line); len(r) > maxTitleLen {
+		line = strings.TrimSpace(string(r[:maxTitleLen]))
 	}
 	return line
 }
 
-// stripHTML reduces a fragment of HTML to plain text: block-ish tags (</p>, <br>)
-// become newlines, all other tags are dropped, and character entities are
-// decoded. This is a minimal, dependency-free stripper for Mastodon status
-// content (short, well-formed fragments) — not a general HTML sanitizer.
+// stripHTML reduces Mastodon status HTML to plain text. It is a single pass, NOT a
+// general sanitizer: tags are dropped (br/p/div become newlines), the CONTENT of
+// script/style elements is dropped entirely, and entity references are decoded
+// per-text-run — decoding only the runs OUTSIDE tags, never with a final global
+// UnescapeString, so an entity-encoded "&lt;script&gt;" in the visible text becomes
+// the literal characters "<script>" and is never re-interpreted as a live tag.
 func stripHTML(s string) string {
 	var b strings.Builder
-	inTag := false
-	tagStart := 0
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch {
-		case ch == '<':
-			inTag = true
-			tagStart = i
-		case ch == '>' && inTag:
-			inTag = false
-			if isBreakTag(s[tagStart : i+1]) {
+	for i := 0; i < len(s); {
+		if s[i] == '<' {
+			j := strings.IndexByte(s[i:], '>')
+			if j < 0 {
+				break // unclosed tag: drop the remainder
+			}
+			name := tagNameOf(s[i : i+j+1])
+			if name == "script" || name == "style" {
+				// Drop the element's content up to its close tag (or the end).
+				rest := s[i+j+1:]
+				if k := indexFold(rest, "</"+name); k >= 0 {
+					if end := strings.IndexByte(rest[k:], '>'); end >= 0 {
+						i = i + j + 1 + k + end + 1
+						continue
+					}
+				}
+				i = len(s)
+				continue
+			}
+			if isBreakTag(s[i : i+j+1]) {
 				b.WriteByte('\n')
 			}
-		case !inTag:
-			b.WriteByte(ch)
+			i += j + 1
+			continue
 		}
+		// Text run up to the next tag; decode entities within this run only.
+		run := s[i:]
+		if next := strings.IndexByte(s[i:], '<'); next >= 0 {
+			run = s[i : i+next]
+			i += next
+		} else {
+			i = len(s)
+		}
+		b.WriteString(html.UnescapeString(run))
 	}
-	text := html.UnescapeString(b.String())
+	text := b.String()
 	// Collapse runs of 3+ newlines to a paragraph break and trim edges.
 	for strings.Contains(text, "\n\n\n") {
 		text = strings.ReplaceAll(text, "\n\n\n", "\n\n")
 	}
 	return strings.TrimSpace(text)
+}
+
+// tagNameOf returns the lowercased element name of a "<...>" tag, without the
+// leading slash or any attributes.
+func tagNameOf(tag string) string {
+	t := strings.ToLower(strings.Trim(tag, "<>/ \t\r\n"))
+	if i := strings.IndexAny(t, " \t\r\n/"); i >= 0 {
+		t = t[:i]
+	}
+	return t
+}
+
+// indexFold is strings.Index with an ASCII-case-insensitive needle.
+func indexFold(haystack, needle string) int {
+	return strings.Index(strings.ToLower(haystack), strings.ToLower(needle))
 }
 
 // isBreakTag reports whether a tag (including the angle brackets) introduces a
@@ -260,6 +295,13 @@ func parseConfig(raw string) (config, error) {
 	cfg.Acct = strings.TrimSpace(cfg.Acct)
 	if cfg.Instance == "" {
 		return config{}, fmt.Errorf("mastodon: config missing \"instance\"")
+	}
+	// Instance is concatenated into the base URL as the host, so it must be a bare
+	// host — no scheme, path, query, credentials, or spaces — or it could reshape the
+	// request (e.g. "host/x?y=" or "good@evil"). SSRF is still caught at dial time,
+	// but reject a malformed instance up front rather than send a wrong request.
+	if strings.ContainsAny(cfg.Instance, "/?#@ \t") || strings.Contains(cfg.Instance, "://") {
+		return config{}, fmt.Errorf("mastodon: \"instance\" must be a bare host (got %q)", cfg.Instance)
 	}
 	if cfg.Acct == "" {
 		return config{}, fmt.Errorf("mastodon: config missing \"acct\"")

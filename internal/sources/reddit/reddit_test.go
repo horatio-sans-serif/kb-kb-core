@@ -82,6 +82,31 @@ func TestReddit_FetchEmitsArtifacts(t *testing.T) {
 	}
 }
 
+func TestReddit_SkipsHostEscapingPermalink(t *testing.T) {
+	// A hostile/compromised response whose permalink would escape the reddit host
+	// (userinfo "@evil" or protocol-relative "//evil") must be skipped, not turned
+	// into a canonical URL pointing off-site.
+	listing := `{"data":{"children":[
+	  {"kind":"t3","data":{"title":"userinfo","permalink":"@evil.com/x","stickied":false}},
+	  {"kind":"t3","data":{"title":"proto-rel","permalink":"//evil.com/x","stickied":false}},
+	  {"kind":"t3","data":{"title":"absolute","permalink":"https://evil.com","stickied":false}},
+	  {"kind":"t3","data":{"title":"good","selftext":"ok","url":"","permalink":"/r/golang/comments/z/good/","stickied":false}}
+	]}}`
+	c := testConnector(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(listing))
+	})
+	items, _, err := c.Fetch(context.Background(), &kb.Source{Config: `{"subreddit":"golang"}`}, "")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(items) != 1 || items[0].Title != "good" {
+		t.Fatalf("items = %+v, want only the host-relative-permalink post", items)
+	}
+	if items[0].URL != "https://www.reddit.com/r/golang/comments/z/good/" {
+		t.Errorf("url = %q, want the reddit-hosted permalink", items[0].URL)
+	}
+}
+
 func TestReddit_MissingSubredditErrors(t *testing.T) {
 	c := testConnector(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"data":{"children":[]}}`))

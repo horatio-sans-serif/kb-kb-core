@@ -89,16 +89,20 @@ func (c *Connector) Fetch(ctx context.Context, src *kb.Source, since kb.Cursor) 
 		if p.Stickied {
 			continue // pinned announcement, not a real new post
 		}
-		// Skip a malformed post (no title/permalink) rather than failing the fetch.
+		// Skip a malformed post rather than failing the fetch. The permalink must be a
+		// host-relative path ("/r/..."); reject "//x" or "@x", which would escape the
+		// reddit host when concatenated onto apiBase and let a hostile response point
+		// the canonical URL elsewhere.
 		title := strings.TrimSpace(p.Title)
 		permalink := strings.TrimSpace(p.Permalink)
-		if title == "" || permalink == "" {
+		if title == "" || !strings.HasPrefix(permalink, "/") || strings.HasPrefix(permalink, "//") {
 			continue
 		}
+		permalinkURL := apiBase + permalink
 		out = append(out, kb.RawItem{
 			Title: title,
-			URL:   apiBase + permalink,
-			Body:  postBody(p),
+			URL:   permalinkURL,
+			Body:  postBody(p, permalinkURL),
 		})
 		if len(out) >= maxPosts {
 			break
@@ -108,8 +112,9 @@ func (c *Connector) Fetch(ctx context.Context, src *kb.Source, since kb.Cursor) 
 	return out, kb.Cursor(strconv.Itoa(len(out))), nil
 }
 
-// postBody renders the post as a small Markdown card.
-func postBody(p post) string {
+// postBody renders the post as a small Markdown card. permalinkURL is the already-
+// validated canonical URL (built once by the caller).
+func postBody(p post, permalinkURL string) string {
 	var b strings.Builder
 	if s := strings.TrimSpace(p.Selftext); s != "" {
 		b.WriteString(s)
@@ -121,7 +126,7 @@ func postBody(p post) string {
 		b.WriteString("\n")
 	}
 	b.WriteString("Permalink: ")
-	b.WriteString(apiBase + strings.TrimSpace(p.Permalink))
+	b.WriteString(permalinkURL)
 	return b.String()
 }
 

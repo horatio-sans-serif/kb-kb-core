@@ -1922,3 +1922,38 @@ sweeper's injected clock + `store.FormatTime`, identical to artifact compaction.
 
 **Deferred:** Reddit / Mastodon connectors; auth-bearing connectors; DICTATOR
 audio/video transcription (Gap 13); audit-log export.
+
+---
+
+# Phase 20 — Backlog batch 2 (parallel)
+
+Three more backlog items, built concurrently in isolated worktrees and merged.
+
+## Reddit connector (§8.1)
+
+**Status: Complete.** `internal/sources/reddit` — a PULL connector fetching a
+subreddit's new posts via the public `reddit.com/r/{subreddit}/new.json`, one artifact
+per non-stickied post (title, selftext + external URL + permalink, canonical = the
+permalink). Config `{"subreddit":"..."}`. The permalink must be host-relative
+(rejects `//x` / `@x` that would escape the reddit host); PathEscaped subreddit,
+descriptive User-Agent, size + per-fetch caps.
+
+## Mastodon connector (§8.1)
+
+**Status: Complete.** `internal/sources/mastodon` — a PULL connector fetching a public
+account's posts via the two-step `accounts/lookup` → `accounts/{id}/statuses` flow.
+Config `{"instance":"...","acct":"..."}` (instance validated as a bare host). Status
+HTML is reduced to text by a dependency-free single-pass `stripHTML` that drops
+script/style element content and decodes entities per text-run (never a global
+re-unescape, so encoded brackets can't re-form a live tag). Rune-safe title
+truncation.
+
+## Audit-log CSV export (§8.17)
+
+**Status: Complete.** `GET /audit?format=csv` returns the log as RFC 4180 CSV
+(encoding/csv) with an attachment disposition; owner-only, filters (`?limit`,
+`?artifact_id`) apply, unknown format is 400, the JSON path is unchanged.
+
+**Deferred:** auth-bearing connectors (per-source credentials / OAuth, which would
+unlock Reddit-saved, GitHub-private, Mastodon-home); DICTATOR audio/video
+transcription (Gap 13 — needs a transcription-backend decision).

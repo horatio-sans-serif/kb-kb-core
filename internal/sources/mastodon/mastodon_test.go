@@ -174,10 +174,33 @@ func TestMastodon_StripHTML(t *testing.T) {
 		{"line<br>break", "line\nbreak"},
 		{"&amp;&lt;&gt;", "&<>"},
 		{"no tags", "no tags"},
+		// script/style element CONTENT is dropped, not emitted (P1-2).
+		{"<script>alert(1)</script>hi", "hi"},
+		{"<style>.a{color:red}</style>text", "text"},
+		{"<SCRIPT>x</SCRIPT>y", "y"},
+		// An entity-encoded angle bracket in visible text decodes to a literal char and
+		// is never re-interpreted as a live tag (per-run unescape, no global re-pass).
+		{"&lt;script&gt;x&lt;/script&gt;", "<script>x</script>"},
+		{"<p>a &lt;b&gt; c</p>", "a <b> c"},
+		{"unclosed <b", "unclosed"},
 	}
 	for _, tc := range cases {
 		if got := stripHTML(tc.in); got != tc.want {
 			t.Errorf("stripHTML(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestMastodon_RejectsMalformedInstance(t *testing.T) {
+	for _, inst := range []string{"evil.com/api/v1", "good.com@127.0.0.1", "http://evil.com", "evil.com?a=b", "has space"} {
+		if _, err := parseConfig(`{"instance":"` + inst + `","acct":"x"}`); err == nil {
+			t.Errorf("parseConfig(instance=%q) succeeded, want a bare-host rejection", inst)
+		}
+	}
+	// A bare host (optionally with a port) is accepted.
+	for _, inst := range []string{"mastodon.social", "127.0.0.1:8443"} {
+		if _, err := parseConfig(`{"instance":"` + inst + `","acct":"Gargron"}`); err != nil {
+			t.Errorf("bare host %q rejected: %v", inst, err)
 		}
 	}
 }
